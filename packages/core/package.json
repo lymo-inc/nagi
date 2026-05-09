@@ -1,0 +1,33 @@
+{
+  "name": "@nagi-js/core",
+  "version": "0.0.0",
+  "description": "Type-safe declarative workflow engine. Edge-compliant. Zero runtime deps.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:types": "vitest run --typecheck",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lymo-inc/nagi.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/lymo-inc/nagi#readme",
+  "bugs": {
+    "url": "https://github.com/lymo-inc/nagi/issues"
+  }
+}

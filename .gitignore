@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# testing
+coverage/
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+.mcp.json
+.claude
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# env
+.env
+.env.*
+!.env.example

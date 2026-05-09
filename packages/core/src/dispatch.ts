@@ -1,0 +1,571 @@
+import { makeIdempotencyKey, makeOnce } from "./idempotency";
+import {
+  getDef,
+  type MatchDef,
+  resolveNeeds,
+  type StepDef,
+  selectArm,
+} from "./internal";
+import {
+  aggregateMatch,
+  extractInput,
+  flowTermination,
+  nextRunnable,
+} from "./scheduler";
+import type {
+  Clock,
+  Fact,
+  Flow,
+  FlowHooks,
+  Json,
+  Logger,
+  Millis,
+  Queue,
+  QueueMessage,
+  RetryPolicy,
+  RunId,
+  RunState,
+  SerializedError,
+  StepCtx,
+  Store,
+  Tx,
+} from "./types";
+
+export interface DispatchDeps {
+  /**
+   * Resolves the flow for a given run. The runtime supplies a closure over its
+   * flow registry; adapters may override to load flows lazily. Called once at
+   * the top of `dispatchMessage` and `advance` — per-step lookups reuse the
+   * resolved value.
+   */
+  readonly flowFor: (runId: RunId) => Promise<Flow>;
+  readonly store: Store;
+  readonly queue: Queue;
+  readonly clock: Clock;
+  readonly hooks?: FlowHooks;
+  readonly logger?: Logger;
+  readonly defaultRetry?: RetryPolicy;
+}
+
+const DEFAULT_RETRY: RetryPolicy = {
+  maxAttempts: 3,
+  backoff: "exponential",
+  initialDelayMs: 1_000,
+  maxDelayMs: 60_000,
+};
+
+export async function dispatchMessage(
+  deps: DispatchDeps,
+  message: QueueMessage,
+): Promise<void> {
+  const { store, queue, clock } = deps;
+  const { runId, stepId, attempt } = message;
+  const flow = await deps.flowFor(runId);
+
+  const step = flow.steps[stepId];
+  if (!step) {
+    deps.logger?.warn(
+      `dispatch: step "${stepId}" not in flow "${flow.id}"; ack and skip`,
+    );
+    await queue.ack(message.receipt);
+    return;
+  }
+  const def = getDef(step);
+
+  const preState = await store.loadRunState(runId);
+  const preStep = preState.steps[stepId];
+  if (
+    preStep &&
+    (preStep.status === "completed" ||
+      preStep.status === "failed" ||
+      preStep.status === "skipped")
+  ) {
+    await queue.ack(message.receipt);
+    return;
+  }
+
+  const claim = await store.claimStep(runId, stepId, attempt);
+  if (claim === null) {
+    await queue.ack(message.receipt);
+    return;
+  }
+
+  await store.appendFact(runId, {
+    kind: "step.started",
+    runId,
+    stepId,
+    attempt,
+    at: clock.now(),
+  });
+  await deps.hooks?.onStepStart?.({
+    runId,
+    flowId: flow.id,
+    stepId,
+    attempt,
+    kind: def.kind,
+    at: clock.now(),
+  });
+
+  const startedAt = Date.now();
+
+  try {
+    if (def.kind === "task") {
+      const output = await executeTask({
+        deps,
+        message,
+        def,
+        runId,
+        stepId,
+        attempt,
+      });
+      await deps.hooks?.onStepComplete?.({
+        runId,
+        flowId: flow.id,
+        stepId,
+        attempt,
+        kind: "task",
+        output,
+        durationMs: Date.now() - startedAt,
+        at: clock.now(),
+      });
+      await advance(deps, runId);
+    } else if (def.kind === "signal") {
+      // Signals don't run; they wait. Mark `started` (already done above) and ack.
+      // Completion arrives via `wf.signal()`.
+      await queue.ack(message.receipt);
+      return;
+    } else if (def.kind === "match") {
+      await executeMatch({ deps, message, def, runId, stepId, attempt });
+      await advance(deps, runId);
+    }
+  } catch (err) {
+    await handleStepError({
+      deps,
+      flow,
+      message,
+      def,
+      runId,
+      stepId,
+      attempt,
+      err,
+    });
+  }
+}
+
+async function executeTask(args: {
+  deps: DispatchDeps;
+  message: QueueMessage;
+  def: StepDef;
+  runId: RunId;
+  stepId: string;
+  attempt: number;
+}): Promise<Json> {
+  const { deps, message, def, runId, stepId, attempt } = args;
+  if (def.kind !== "task") {
+    throw new Error(`executeTask called with non-task def (kind: ${def.kind})`);
+  }
+
+  const { store, queue, clock } = deps;
+  const runState = await store.loadRunState(runId);
+  const input = extractInput(runState);
+  const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
+
+  const ctx = makeStepCtx({
+    runId,
+    stepId,
+    attempt,
+    input,
+    store,
+    clock,
+    ...(deps.logger !== undefined ? { logger: deps.logger } : {}),
+  });
+
+  const output = (await def.run({ input, needs, ctx })) as Json;
+
+  const fact: Fact = {
+    kind: "step.completed",
+    runId,
+    stepId,
+    attempt,
+    output,
+    at: clock.now(),
+  };
+  await store.completeStep(runId, stepId, output, fact);
+  await queue.ack(message.receipt);
+  return output;
+}
+
+/**
+ * Match dispatch: select an arm, persist the `match.arm-selected` fact, ack
+ * the message. The match step stays in `running` status — it transitions to
+ * `completed` (or `failed`) inside `advance()` once the chosen arm's nested
+ * steps are terminal. Throws if `selectArm` throws so `handleStepError`
+ * applies the match's retry policy / surfaces the failure.
+ */
+async function executeMatch(args: {
+  deps: DispatchDeps;
+  message: QueueMessage;
+  def: MatchDef;
+  runId: RunId;
+  stepId: string;
+  attempt: number;
+}): Promise<void> {
+  const { deps, message, def, runId, stepId } = args;
+  const { store, queue, clock } = deps;
+
+  const runState = await store.loadRunState(runId);
+  const input = extractInput(runState);
+  const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
+
+  const armId = selectArm(def, { input, needs });
+
+  await store.appendFact(runId, {
+    kind: "match.arm-selected",
+    runId,
+    stepId,
+    arm: armId,
+    at: clock.now(),
+  });
+  await queue.ack(message.receipt);
+}
+
+async function handleStepError(args: {
+  deps: DispatchDeps;
+  flow: Flow;
+  message: QueueMessage;
+  def: StepDef;
+  runId: RunId;
+  stepId: string;
+  attempt: number;
+  err: unknown;
+}): Promise<void> {
+  const { deps, flow, message, def, runId, stepId, attempt, err } = args;
+  const { store, queue, clock } = deps;
+  const error = serializeError(err);
+
+  const policy =
+    def.kind === "task" && def.retry
+      ? def.retry
+      : (deps.defaultRetry ?? DEFAULT_RETRY);
+  const shouldRetry = attempt < policy.maxAttempts && retryAllows(policy, err);
+
+  if (shouldRetry) {
+    const delayMs = computeBackoff(policy, attempt);
+    await store.appendFact(runId, {
+      kind: "step.retried",
+      runId,
+      stepId,
+      attempt,
+      nextAttemptAt: new Date(Date.now() + delayMs),
+      at: clock.now(),
+    });
+    await deps.hooks?.onStepRetry?.({
+      runId,
+      flowId: flow.id,
+      stepId,
+      attempt,
+      kind: def.kind,
+      error,
+      nextAttemptAt: new Date(Date.now() + delayMs),
+      at: clock.now(),
+    });
+    await queue.enqueue(runId, stepId, { attempt: attempt + 1, delayMs });
+    await queue.ack(message.receipt);
+    return;
+  }
+
+  const fact: Fact = {
+    kind: "step.failed",
+    runId,
+    stepId,
+    attempt,
+    error,
+    at: clock.now(),
+  };
+  await store.failStep(runId, stepId, error, fact);
+  await deps.hooks?.onStepError?.({
+    runId,
+    flowId: flow.id,
+    stepId,
+    attempt,
+    kind: def.kind,
+    error,
+    at: clock.now(),
+  });
+  await queue.ack(message.receipt);
+  await advance(deps, runId);
+}
+
+const MAX_ADVANCE_ITERS = 1024;
+
+export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
+  const { store, queue, clock } = deps;
+  const flow = await deps.flowFor(runId);
+
+  for (let iter = 0; iter < MAX_ADVANCE_ITERS; iter++) {
+    const runState = await store.loadRunState(runId);
+
+    // Promote any `running` match whose chosen arm has reached a terminal
+    // state. This must precede termination + scheduling: a match that just
+    // completed releases its downstream needs in the same iteration.
+    const promoted = await promoteMatches({ deps, flow, runState });
+    if (promoted) continue;
+
+    const termination = flowTermination(flow, runState);
+
+    if (termination.done) {
+      const last = runState.facts[runState.facts.length - 1];
+      const flowAlreadyTerminal =
+        last !== undefined &&
+        (last.kind === "flow.completed" || last.kind === "flow.failed");
+      if (!flowAlreadyTerminal) {
+        if (termination.failed) {
+          const failedStep = Object.values(runState.steps).find(
+            (s) => s.status === "failed",
+          );
+          await store.appendFact(runId, {
+            kind: "flow.failed",
+            runId,
+            error: failedStep?.error ?? {
+              name: "Error",
+              message: "step failed",
+            },
+            at: clock.now(),
+          });
+          await deps.hooks?.onFlowError?.({
+            runId,
+            flowId: flow.id,
+            error: failedStep?.error ?? {
+              name: "Error",
+              message: "step failed",
+            },
+            at: clock.now(),
+          });
+        } else {
+          let flowOutput: Json = null;
+          if (flow.output !== undefined) {
+            const stepOutputs: Record<string, Json> = {};
+            for (const [sid, sstate] of Object.entries(runState.steps)) {
+              if (sstate.output !== undefined) stepOutputs[sid] = sstate.output;
+            }
+            flowOutput = flow.output(stepOutputs as never) as Json;
+          }
+          await store.appendFact(runId, {
+            kind: "flow.completed",
+            runId,
+            output: flowOutput,
+            at: clock.now(),
+          });
+          await deps.hooks?.onFlowComplete?.({
+            runId,
+            flowId: flow.id,
+            output: flowOutput,
+            at: clock.now(),
+          });
+        }
+      }
+      return;
+    }
+
+    const input = extractInput(runState);
+    const decision = nextRunnable({ flow, runState, input });
+
+    if (decision.skip.length === 0 && decision.runnable.length === 0) return;
+
+    for (const { stepId, reason } of decision.skip) {
+      await store.appendFact(runId, {
+        kind: "step.skipped",
+        runId,
+        stepId,
+        reason,
+        at: clock.now(),
+      });
+    }
+
+    for (const stepId of decision.runnable) {
+      await queue.enqueue(runId, stepId);
+    }
+
+    if (decision.runnable.length > 0) {
+      // Workers will pick up these messages; advance loop exits and resumes
+      // when those steps complete.
+      return;
+    }
+    // Only skips happened; loop to recompute.
+  }
+
+  // Cycle guard: rather than crash the worker, mark the flow as failed with a
+  // structured error so callers can query the terminal state.
+  const cycleError: SerializedError = {
+    name: "NagiCycleError",
+    message: `advance exceeded ${MAX_ADVANCE_ITERS} iterations — likely a cycle or infinite skip loop in flow "${flow.id}"`,
+  };
+  const last = (await store.loadRunState(runId)).facts.slice(-1)[0];
+  const alreadyTerminal =
+    last !== undefined &&
+    (last.kind === "flow.completed" || last.kind === "flow.failed");
+  if (!alreadyTerminal) {
+    await store.appendFact(runId, {
+      kind: "flow.failed",
+      runId,
+      error: cycleError,
+      at: clock.now(),
+    });
+    await deps.hooks?.onFlowError?.({
+      runId,
+      flowId: flow.id,
+      error: cycleError,
+      at: clock.now(),
+    });
+  }
+}
+
+/**
+ * Walk every match step in `running` status and promote any whose chosen arm
+ * has reached a terminal state.
+ *
+ *   fail-fast — a chosen-arm step terminally failed. Mark the match `failed`
+ *               with an error that points back to the failing nested step.
+ *               Sibling running arm steps will still complete on their workers,
+ *               but the match is already terminal — downstream cascades skip.
+ *   complete  — every chosen-arm step terminated cleanly. Mark the match
+ *               `completed` with the assembled `{ stepKey: stepOutput }` map.
+ *
+ * Returns true if any match was promoted (caller should reload + re-loop).
+ */
+async function promoteMatches(args: {
+  deps: DispatchDeps;
+  flow: Flow;
+  runState: RunState;
+}): Promise<boolean> {
+  const { deps, flow, runState } = args;
+  const { store, clock } = deps;
+  let promoted = false;
+
+  for (const [matchId, step] of Object.entries(flow.steps)) {
+    const def = getDef(step);
+    if (def.kind !== "match") continue;
+    const state = runState.steps[matchId];
+    if (state?.status !== "running") continue;
+
+    const agg = aggregateMatch(matchId, flow, runState);
+    if (agg.kind === "pending") continue;
+
+    const attempt = state.attempts > 0 ? state.attempts : 1;
+
+    if (agg.kind === "fail-fast") {
+      const failedNested = runState.steps[agg.failedStepId];
+      const error: SerializedError = failedNested?.error ?? {
+        name: "Error",
+        message: `match "${matchId}": chosen-arm step "${agg.failedStepId}" failed`,
+      };
+      const fact: Fact = {
+        kind: "step.failed",
+        runId: runState.runId,
+        stepId: matchId,
+        attempt,
+        error,
+        at: clock.now(),
+      };
+      await store.failStep(runState.runId, matchId, error, fact);
+      await deps.hooks?.onStepError?.({
+        runId: runState.runId,
+        flowId: flow.id,
+        stepId: matchId,
+        attempt,
+        kind: "match",
+        error,
+        at: clock.now(),
+      });
+      promoted = true;
+      continue;
+    }
+
+    const fact: Fact = {
+      kind: "step.completed",
+      runId: runState.runId,
+      stepId: matchId,
+      attempt,
+      output: agg.output,
+      at: clock.now(),
+    };
+    await store.completeStep(runState.runId, matchId, agg.output, fact);
+    await deps.hooks?.onStepComplete?.({
+      runId: runState.runId,
+      flowId: flow.id,
+      stepId: matchId,
+      attempt,
+      kind: "match",
+      output: agg.output,
+      durationMs: 0,
+      at: clock.now(),
+    });
+    promoted = true;
+  }
+
+  return promoted;
+}
+
+function makeStepCtx(args: {
+  runId: RunId;
+  stepId: string;
+  attempt: number;
+  input: unknown;
+  store: Store;
+  clock: Clock;
+  logger?: Logger;
+}): StepCtx<unknown> {
+  const { runId, stepId, attempt, input, store, clock } = args;
+  const ac = new AbortController();
+
+  return {
+    input,
+    runId,
+    stepId,
+    attempt,
+    signal: ac.signal,
+    now: () => clock.now(),
+    tx: undefined as unknown as Tx,
+    logger: args.logger ?? consoleLogger(),
+    once: makeOnce({ runId, stepId, store }),
+    idempotencyKey: makeIdempotencyKey(runId, stepId),
+  };
+}
+
+function consoleLogger(): Logger {
+  return {
+    debug: (m, a) => console.debug(m, a),
+    info: (m, a) => console.info(m, a),
+    warn: (m, a) => console.warn(m, a),
+    error: (m, a) => console.error(m, a),
+  };
+}
+
+export function computeBackoff(policy: RetryPolicy, attempt: number): Millis {
+  const initial = policy.initialDelayMs ?? 1_000;
+  const max = policy.maxDelayMs ?? 60_000;
+  switch (policy.backoff) {
+    case "exponential":
+      return Math.min(initial * 2 ** Math.max(0, attempt - 1), max);
+    case "linear":
+      return Math.min(initial * Math.max(1, attempt), max);
+    case "fixed":
+      return Math.min(initial, max);
+  }
+}
+
+function retryAllows(policy: RetryPolicy, err: unknown): boolean {
+  if (!policy.retryOn) return true;
+  return policy.retryOn(err);
+}
+
+function serializeError(err: unknown): SerializedError {
+  if (err instanceof Error) {
+    return {
+      name: err.name,
+      message: err.message,
+      ...(err.stack !== undefined ? { stack: err.stack } : {}),
+    };
+  }
+  return { name: "Error", message: String(err) };
+}

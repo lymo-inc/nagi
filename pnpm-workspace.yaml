@@ -1,0 +1,15 @@
+packages:
+  - "packages/*"
+allowBuilds:
+  esbuild: true
+
+# Bypass the pnpm 10 false-positive purge prompt that fires when switching install cwd
+# between workspace root and a sub-package. See pnpm/pnpm#8654.
+# confirmModulesPurge: false
+
+# サプライチェーン攻撃対策
+# https://blog.flatt.tech/entry/axios_compromise
+# minimumReleaseAge: 20160 # 10 days in minutes
+
+# git worktree間のインストール競合を防ぐ (APFSのreflinkでCoW、共有store経由の整合性破壊を回避)
+# packageImportMethod: clone-or-copy
