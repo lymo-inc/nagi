@@ -1,4 +1,3 @@
-/** JSON-serializable value. Crosses persistence + queue boundaries. */
 export type Json =
   | string
   | number
@@ -7,23 +6,10 @@ export type Json =
   | Json[]
   | { [key: string]: Json };
 
-/** Integer milliseconds. The library represents every duration as integer ms — no duration strings. */
 export type Millis = number;
-
-/** ULID/UUID. Branded so a raw string can't be passed where a `RunId` is expected. */
 export type RunId = string & { readonly __brand: "RunId" };
-
-/** Stable per-flow step identifier. Survives renames in code (locked). */
 export type StepId = string;
-
 export type AttemptNumber = number;
-
-// CHOICE: Library-agnostic schema interface. Zod 3.24+, Valibot, ArkType,
-// and Effect Schema all implement Standard Schema natively. Users can pass
-// any Standard Schema-compatible value to `input:` or `signal({ schema })`.
-// Inlined here (rather than peer-depped on `@standard-schema/spec`) to keep
-// core dep-free; the contract is small and frozen.
-// Reference: https://standardschema.dev
 
 export interface StandardSchemaV1<Input = unknown, Output = Input> {
   readonly "~standard": StandardSchemaV1.Props<Input, Output>;
@@ -70,46 +56,22 @@ export type InferSchemaInput<S> =
 export type InferSchemaOutput<S> =
   S extends StandardSchemaV1<unknown, infer O> ? O : never;
 
-// CHOICE: Drizzle / NextAuth pattern. Core does not import any DB driver.
-// Users augment `Register` to set the transaction type their adapter hands to
-// `ctx.tx`:
-//
-//   declare module "@nagi-js/core" {
-//     interface Register {
-//       tx: Kysely.Transaction<MyDB>;
-//     }
-//   }
-//
-// Without augmentation, `Tx` defaults to `unknown` — handlers can still write
-// `ctx.tx` but lose end-to-end type safety on the transaction object.
-
 export type Register = {};
 
 export type Tx = Register extends { tx: infer T } ? T : unknown;
 
 export type StepKind = "task" | "signal" | "match";
 
-/**
- * A step in a flow. Returned by `b.task()` / `b.signal()` / `b.match()` and
- * passed by reference into downstream `needs:` maps. The `Output` type
- * parameter is phantom — never present at runtime; carries the handler's
- * return type forward for inference.
- */
 export interface Step<Output = unknown> {
   readonly kind: StepKind;
   readonly id: StepId;
-  /** Phantom — read via `StepOutput<S>`, not by direct access. */
   readonly __output?: Output;
 }
 
 export type StepOutput<S> = S extends Step<infer O> ? O : never;
-
-/** A bag of named steps — the value of `needs:` and the return shape of `build:`. */
 export type StepMap = Readonly<Record<string, Step<unknown>>>;
 
 export type NeedsMap = StepMap;
-
-/** Inside a handler, `needs.x` is typed as the upstream step's `Output`. */
 export type NeedsOutputs<N extends NeedsMap> = {
   readonly [K in keyof N]: StepOutput<N[K]>;
 };
@@ -121,17 +83,12 @@ export interface Logger {
   error(message: string, attrs?: Record<string, unknown>): void;
 }
 
-/**
- * Handed to every handler. Carries the run's identity, the abort signal for
- * graceful drain, the durable transaction, and the idempotency primitives.
- */
 export interface StepCtx<Input = unknown> {
   readonly input: Input;
   readonly tx: Tx;
   readonly runId: RunId;
   readonly stepId: StepId;
   readonly attempt: AttemptNumber;
-  /** Aborts when the worker is draining (SIGTERM) or the lease is being relinquished. */
   readonly signal: AbortSignal;
   readonly now: () => Date;
   readonly logger: Logger;
@@ -139,7 +96,7 @@ export interface StepCtx<Input = unknown> {
   /**
    * Durable per-effect memoization. The first successful call for `(runId, stepId, scope)`
    * persists its return value; subsequent calls (including post-crash retries) return the
-   * cached value without re-invoking `fn`. See boundary.md "Idempotency model".
+   * cached value without re-invoking `fn`.
    */
   once<T extends Json>(scope: string, fn: () => Promise<T>): Promise<T>;
 
@@ -158,7 +115,6 @@ export interface RetryPolicy {
   readonly backoff: BackoffStrategy;
   readonly initialDelayMs?: Millis;
   readonly maxDelayMs?: Millis;
-  /** Errors this policy applies to. Defaults to all. */
   readonly retryOn?: (error: unknown) => boolean;
 }
 
@@ -171,8 +127,8 @@ interface StepConfigBase<Input, N extends NeedsMap> {
    * not `Output | undefined`.
    */
   readonly when?: (args: {
-    readonly input: Input;
-    readonly needs: NeedsOutputs<N>;
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<NeedsOutputs<N>>;
   }) => boolean;
   readonly timeout?: Millis;
 }
@@ -181,9 +137,9 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
   extends StepConfigBase<Input, N> {
   readonly retry?: RetryPolicy;
   readonly run: (args: {
-    readonly input: Input;
-    readonly needs: NeedsOutputs<N>;
-    readonly ctx: StepCtx<Input>;
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<NeedsOutputs<N>>;
+    readonly ctx: StepCtx<NoInfer<Input>>;
   }) => Promise<Output>;
 }
 
@@ -208,16 +164,16 @@ export interface MatchDiscriminatorConfig<
 > {
   readonly needs?: N;
   readonly on: (args: {
-    readonly input: Input;
-    readonly needs: NeedsOutputs<N>;
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<NeedsOutputs<N>>;
   }) => D;
   readonly cases: { readonly [K in D]: (b: Builder<Input>) => M[K] };
 }
 
 export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {
   readonly when: (args: {
-    readonly input: Input;
-    readonly needs: NeedsOutputs<N>;
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<NeedsOutputs<N>>;
   }) => boolean;
   readonly otherwise?: never;
   readonly build: (b: Builder<Input>) => M;
@@ -242,8 +198,8 @@ export type MatchArm<Input, N extends NeedsMap, M extends StepMap> =
 export type MatchArmShape<Input, N extends NeedsMap> =
   | {
       readonly when: (args: {
-        readonly input: Input;
-        readonly needs: NeedsOutputs<N>;
+        readonly input: NoInfer<Input>;
+        readonly needs: NoInfer<NeedsOutputs<N>>;
       }) => boolean;
       readonly otherwise?: never;
       readonly build: (b: Builder<Input>) => StepMap;
@@ -265,10 +221,6 @@ export interface MatchGuardConfig<
   M extends StepMap,
 > {
   readonly needs?: N;
-  // CHOICE: type-level enforcement of "last arm has otherwise" via tuple
-  // shape (`readonly [...MatchArmGuard[], MatchArmOtherwise]`) is achievable
-  // but adds inference cost. Starting with a runtime-validated array; tighten
-  // to tuple shape later if it proves common to forget.
   readonly arms: ReadonlyArray<MatchArm<Input, N, M>>;
 }
 
@@ -308,8 +260,8 @@ export interface Builder<Input = unknown> {
   >(config: {
     readonly needs?: N;
     readonly on: (args: {
-      readonly input: Input;
-      readonly needs: NeedsOutputs<N>;
+      readonly input: NoInfer<Input>;
+      readonly needs: NoInfer<NeedsOutputs<N>>;
     }) => D;
     readonly cases: Cases;
   }): Step<
@@ -331,12 +283,13 @@ export interface Builder<Input = unknown> {
 }
 
 export interface FlowConfig<
+  Id extends string,
   InputSchema extends StandardSchemaV1,
   M extends StepMap,
   Output = unknown,
 > {
   /** Stable persistence handle. TanStack-key shaped (kebab or snake). */
-  readonly id: string;
+  readonly id: Id;
   readonly input: InputSchema;
   readonly build: (b: Builder<InferSchemaOutput<InputSchema>>) => M;
   /**
@@ -344,28 +297,31 @@ export interface FlowConfig<
    * `flow.completed` and persisted on the fact + `onFlowComplete` event.
    * Skipped steps land as `null` in the input record at runtime even though
    * the type claims otherwise (consistent with the "skip is transitive" lock).
-   * Method-shorthand syntax keeps `M` bivariant so `Flow<S, M, O>` remains
-   * assignable to `Flow<S, StepMap, O>` in fixture/test code.
+   * Method-shorthand syntax keeps `M` bivariant so `Flow<Id, S, M, O>` remains
+   * assignable to `Flow<string, S, StepMap, O>` in fixture/test code.
    */
   output?(steps: NeedsOutputs<M>): Output;
 }
 
 export interface Flow<
+  Id extends string = string,
   InputSchema extends StandardSchemaV1 = StandardSchemaV1,
   M extends StepMap = StepMap,
   Output = unknown,
 > {
-  readonly id: string;
+  readonly id: Id;
   readonly input: InputSchema;
   readonly steps: M;
   output?(steps: NeedsOutputs<M>): Output;
 }
 
 export type FlowInput<F> =
-  F extends Flow<infer S, StepMap, unknown> ? InferSchemaOutput<S> : never;
+  F extends Flow<string, infer S, StepMap, unknown>
+    ? InferSchemaOutput<S>
+    : never;
 
 export type FlowOutput<F> =
-  F extends Flow<StandardSchemaV1, StepMap, infer O> ? O : never;
+  F extends Flow<string, StandardSchemaV1, StepMap, infer O> ? O : never;
 
 export interface FlowEvent {
   readonly runId: RunId;
@@ -519,6 +475,38 @@ export interface Store {
     value: Json,
   ): Promise<void>;
   getOnce(runId: RunId, stepId: StepId, scope: string): Promise<Json | null>;
+
+  /**
+   * Run a task step's handler inside an adapter-owned transaction.
+   *
+   * Implementations open a transaction (or equivalent atomic scope), invoke
+   * `body(tx)`, and on a successful return persist the returned fact
+   * atomically with any writes the handler made via `ctx.tx`. The output is
+   * returned to the caller; for `step.failed` facts the output is ignored
+   * (callers should still return the placeholder shape the type requires).
+   *
+   * Contract:
+   * - If `body` throws, the transaction is rolled back and the error
+   *   propagates. The caller (dispatcher) is responsible for recording the
+   *   failure via `failStep` in a separate scope so the failure survives
+   *   even when domain writes do not.
+   * - On a returned `step.completed` fact, the same atomic scope must also
+   *   record the step output (such that `getStepOutput` reflects it) and
+   *   release any worker lease held for `(runId, stepId, attempt)`.
+   *
+   * For adapters with no real transaction (in-memory, sqlite without WAL),
+   * `tx` is passed as `undefined as Tx` and the write is non-atomic — those
+   * adapters are not used with `ctx.tx` writes.
+   */
+  runStep<T extends Json>(
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+    body: (tx: Tx) => Promise<{
+      readonly output: T;
+      readonly fact: StepCompletedFact | StepFailedFact;
+    }>,
+  ): Promise<T>;
 }
 
 export interface QueueMessage {
@@ -567,10 +555,6 @@ export interface Clock {
 export interface Trigger {
   subscribe(handler: (runId: RunId) => void): () => void;
 }
-
-// CHOICE: Append-only fact stream. Adapters persist these in a single
-// `fact` table; the scheduler projects them into `RunState`. Discriminated
-// union by `kind` so adapters can do exhaustive switches.
 
 export type FactKind =
   | "flow.started"

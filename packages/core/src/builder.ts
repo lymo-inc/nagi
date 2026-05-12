@@ -143,12 +143,13 @@ function makeBuilder<Input>(): Builder<Input> {
  *    IDs of the arm's nested steps), then drop `_nested`.
  */
 export function flow<
+  const Id extends string,
   InputSchema extends StandardSchemaV1,
   M extends StepMap,
   Output = unknown,
 >(
-  config: FlowConfig<InputSchema, M, Output>,
-): Flow<InputSchema, M, Output> {
+  config: FlowConfig<Id, InputSchema, M, Output>,
+): Flow<Id, InputSchema, M, Output> {
   const builder = makeBuilder<InferSchemaOutput<InputSchema>>();
   const built = config.build(builder);
 

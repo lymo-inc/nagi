@@ -1,11 +1,3 @@
-// In-memory implementations of the four plugin contracts.
-//
-// Edge-compliant: only Web Standards (`Map`, `crypto.randomUUID`, `setTimeout`,
-// `Date`, `AbortSignal`). No `node:*` imports.
-//
-// Functional enough to run trivial flows in tests / examples / dev with zero
-// infra. Real-world durability still requires the adapter packages.
-
 import type {
   AttemptNumber,
   ClaimToken,
@@ -21,10 +13,13 @@ import type {
   RunState,
   RunStatus,
   SerializedError,
+  StepCompletedFact,
+  StepFailedFact,
   StepId,
   StepState,
   Store,
   Trigger,
+  Tx,
 } from "./types";
 
 interface MemoryLease {
@@ -95,9 +90,32 @@ export class InMemoryStore implements Store {
   async getOnce(runId: RunId, stepId: StepId, scope: string): Promise<Json | null> {
     return this.onces.get(`${runId}::${stepId}::${scope}`) ?? null;
   }
+
+  async runStep<T extends Json>(
+    runId: RunId,
+    stepId: StepId,
+    _attempt: AttemptNumber,
+    body: (tx: Tx) => Promise<{
+      readonly output: T;
+      readonly fact: StepCompletedFact | StepFailedFact;
+    }>,
+  ): Promise<T> {
+    const result = await body(undefined as unknown as Tx);
+    if (result.fact.kind === "step.completed") {
+      await this.completeStep(runId, stepId, result.output, result.fact);
+    } else {
+      await this.failStep(runId, stepId, result.fact.error, result.fact);
+    }
+    return result.output;
+  }
 }
 
-function projectRunState(runId: RunId, facts: readonly Fact[]): RunState {
+/**
+ * Project an append-only fact stream into a `RunState`. Public so adapters
+ * (e.g. `@nagi-js/postgres`) can re-use the same projection rules — keeping
+ * one canonical definition of "what does the fact log mean".
+ */
+export function projectRunState(runId: RunId, facts: readonly Fact[]): RunState {
   let flowId = "";
   let status: RunStatus = "pending";
   const steps: Record<string, StepState> = {};

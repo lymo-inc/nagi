@@ -170,27 +170,36 @@ async function executeTask(args: {
   const input = extractInput(runState);
   const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
 
-  const ctx = makeStepCtx({
+  // `runStep` owns the atomic scope: adapter-managed tx, then atomic write of
+  // step output + `step.completed` fact + lease release. The handler's
+  // `ctx.tx` is the same tx so domain writes commit together with the step.
+  const output = await store.runStep<Json>(
     runId,
     stepId,
     attempt,
-    input,
-    store,
-    clock,
-    ...(deps.logger !== undefined ? { logger: deps.logger } : {}),
-  });
-
-  const output = (await def.run({ input, needs, ctx })) as Json;
-
-  const fact: Fact = {
-    kind: "step.completed",
-    runId,
-    stepId,
-    attempt,
-    output,
-    at: clock.now(),
-  };
-  await store.completeStep(runId, stepId, output, fact);
+    async (tx) => {
+      const ctx = makeStepCtx({
+        runId,
+        stepId,
+        attempt,
+        input,
+        store,
+        clock,
+        tx,
+        ...(deps.logger !== undefined ? { logger: deps.logger } : {}),
+      });
+      const out = (await def.run({ input, needs, ctx })) as Json;
+      const fact: Fact = {
+        kind: "step.completed",
+        runId,
+        stepId,
+        attempt,
+        output: out,
+        at: clock.now(),
+      };
+      return { output: out, fact };
+    },
+  );
   await queue.ack(message.receipt);
   return output;
 }
@@ -513,9 +522,10 @@ function makeStepCtx(args: {
   input: unknown;
   store: Store;
   clock: Clock;
+  tx: Tx;
   logger?: Logger;
 }): StepCtx<unknown> {
-  const { runId, stepId, attempt, input, store, clock } = args;
+  const { runId, stepId, attempt, input, store, clock, tx } = args;
   const ac = new AbortController();
 
   return {
@@ -525,7 +535,12 @@ function makeStepCtx(args: {
     attempt,
     signal: ac.signal,
     now: () => clock.now(),
-    tx: undefined as unknown as Tx,
+    // `tx` is supplied by `Store.runStep` — for adapters with no real
+    // transaction (in-memory) it is `undefined as Tx`, and handlers that
+    // touch `ctx.tx` will throw on the first call. Adapters that need
+    // typed transactional clients (e.g. `@nagi-js/postgres`) augment
+    // `Register.tx` and pass a real Kysely transaction here.
+    tx,
     logger: args.logger ?? consoleLogger(),
     once: makeOnce({ runId, stepId, store }),
     idempotencyKey: makeIdempotencyKey(runId, stepId),

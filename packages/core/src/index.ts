@@ -1,5 +1,11 @@
 export { flow } from "./builder";
-export { InMemoryClock, InMemoryQueue, InMemoryStore, InMemoryTrigger } from "./memory";
+export {
+  InMemoryClock,
+  InMemoryQueue,
+  InMemoryStore,
+  InMemoryTrigger,
+  projectRunState,
+} from "./memory";
 export {
   type NagiConfig,
   NagiRuntimeError,

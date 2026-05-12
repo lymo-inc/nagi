@@ -111,9 +111,7 @@ class WorkerImpl implements Worker {
       // (dispatchMessage handles its own ack/nack on the happy path; this is the safety net.)
       try {
         await this.deps.queue.nack(msg.receipt);
-      } catch {
-        // best-effort
-      }
+      } catch {}
     }
   }
 

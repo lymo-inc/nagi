@@ -1,15 +1,3 @@
-// End-to-end smoke tests — real worker, real timers, full lifecycle.
-//
-// The deterministic / fast-feedback layer lives in:
-//   - scheduler.test.ts   pure decisions
-//   - dispatch.test.ts    backoff + driver-style dispatch
-//   - builder.test.ts     id assignment + needs rewriting
-//   - idempotency.test.ts ctx.once + ctx.idempotencyKey
-//
-// This file is the assembly check: do the pieces compose into a working
-// worker loop? One test per scenario; helpers from `test-helpers.ts` hide
-// the AbortController / worker lifecycle / waitForFlowEnd plumbing.
-
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { emptySchema, makeHarness, passthroughSchema, runFlow } from "./test-helpers";

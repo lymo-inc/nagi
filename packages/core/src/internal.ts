@@ -194,14 +194,27 @@ export function readSelectedArm(matchId: string, runState: RunState): string | n
  *
  * The thrown Error's message becomes the `step.failed.error.message` for the
  * match, so phrase it for an operator reading a fact log.
- *
- * TODO(user): implement. ~10 lines. The two branches are dispatched by
- * `def.mode`. `args` carries the same `{ input, needs }` shape you'd hand to
- * a `task.run` — `on` and `when` callbacks expect exactly that.
  */
 export function selectArm(
   def: MatchDef,
   args: { readonly input: unknown; readonly needs: Record<string, unknown> },
 ): string {
-  throw new Error("selectArm: not yet implemented");
+  if (def.mode === "discriminator") {
+    const key = def.on(args);
+    if (def.arms[key] === undefined) {
+      const available = Object.keys(def.arms).join(", ");
+      throw new Error(
+        `match: discriminator returned "${key}" which has no arm (available: ${available || "<none>"})`,
+      );
+    }
+    return key;
+  }
+
+  for (const arm of def.arms) {
+    if (arm.otherwise) return arm.id;
+    if (arm.when?.(args)) return arm.id;
+  }
+  throw new Error(
+    `match: no guard arm matched and no { otherwise: true } fallback was provided`,
+  );
 }

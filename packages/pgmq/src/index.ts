@@ -1,3 +1,1 @@
-// @nagi-js/pgmq — Queue adapter built on PGMQ.
-// Full implementation lands in a later increment.
-export {};
+export { type PgmqQueue, type PgmqQueueOpts, pgmqQueue } from "./pgmq-queue";

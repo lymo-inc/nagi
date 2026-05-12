@@ -226,6 +226,29 @@ describe("Flow output inference", () => {
   });
 });
 
+describe("Flow literal id (const Id)", () => {
+  it("id narrows to the literal string", () => {
+    const f = flow({
+      id: "checkout",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({ a: b.task({ run: async () => ({ ok: true }) }) }),
+    });
+    expectTypeOf(f.id).toEqualTypeOf<"checkout">();
+  });
+
+  it("keyof steps narrows to the literal step keys", () => {
+    const f = flow({
+      id: "checkout",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({
+        a: b.task({ run: async () => ({ ok: true }) }),
+        b: b.task({ run: async () => ({ ok: true }) }),
+      }),
+    });
+    expectTypeOf<keyof typeof f.steps>().toEqualTypeOf<"a" | "b">();
+  });
+});
+
 describe("Fact discriminated union", () => {
   it("exhaustive switch on `kind` narrows correctly", () => {
     switch (factEx.kind) {

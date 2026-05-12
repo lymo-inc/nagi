@@ -1,14 +1,9 @@
 // Shared test fixtures + harnesses.
 //
 // Two modes:
-// - `runFlow(flow, input)` — fire-and-forget end-to-end with a worker. Used by
-//   smoke tests in `runtime.test.ts`.
+// - `runFlow(flow, input)` — fire-and-forget end-to-end with a worker.
 // - `makeHarness(flow)` — gives the test direct control of the dispatcher
-//   (no worker), the queue, the store, and a `Result` snapshot. Used by
-//   driver-style unit + integration tests.
-//
-// Not exported from `index.ts`. tsup ignores it (only follows imports from
-// `index.ts`); vitest typechecks it transitively.
+//   (no worker), the queue, the store, and a `Result` snapshot.
 
 import { type DispatchDeps, dispatchMessage } from "./dispatch";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
