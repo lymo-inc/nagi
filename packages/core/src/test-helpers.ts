@@ -11,6 +11,7 @@ import { type NagiConfig, nagi, type Wf } from "./runtime";
 import type {
   Fact,
   Flow,
+  FlowHooks,
   FlowInput,
   Json,
   RetryPolicy,
@@ -33,7 +34,10 @@ export function passthroughSchema<T>(): StandardSchemaV1<T, T> {
   };
 }
 
-export function emptySchema(): StandardSchemaV1<Record<string, never>, Record<string, never>> {
+export function emptySchema(): StandardSchemaV1<
+  Record<string, never>,
+  Record<string, never>
+> {
   return passthroughSchema<Record<string, never>>();
 }
 
@@ -49,7 +53,9 @@ export interface Result {
   error(stepName: string): SerializedError;
 
   factCount(kind: Fact["kind"]): number;
-  factsOf<K extends Fact["kind"]>(kind: K): readonly Extract<Fact, { kind: K }>[];
+  factsOf<K extends Fact["kind"]>(
+    kind: K,
+  ): readonly Extract<Fact, { kind: K }>[];
 }
 
 function makeResult(state: RunState): Result {
@@ -80,7 +86,10 @@ function makeResult(state: RunState): Result {
       return state.facts.filter((f) => f.kind === kind).length;
     },
     factsOf<K extends Fact["kind"]>(kind: K) {
-      return state.facts.filter((f) => f.kind === kind) as Extract<Fact, { kind: K }>[];
+      return state.facts.filter((f) => f.kind === kind) as Extract<
+        Fact,
+        { kind: K }
+      >[];
     },
   };
 }
@@ -88,6 +97,7 @@ function makeResult(state: RunState): Result {
 export interface HarnessOpts {
   readonly defaultRetry?: RetryPolicy;
   readonly logger?: NagiConfig["logger"];
+  readonly hooks?: FlowHooks;
 }
 
 export interface Harness {
@@ -121,7 +131,10 @@ export interface Harness {
   result(runId: RunId): Promise<Result>;
 }
 
-export function makeHarness(flows: Flow | ReadonlyArray<Flow>, opts?: HarnessOpts): Harness {
+export function makeHarness(
+  flows: Flow | ReadonlyArray<Flow>,
+  opts?: HarnessOpts,
+): Harness {
   const flowList = Array.isArray(flows) ? flows : [flows as Flow];
   const store = new InMemoryStore();
   const queue = new InMemoryQueue();
@@ -132,8 +145,11 @@ export function makeHarness(flows: Flow | ReadonlyArray<Flow>, opts?: HarnessOpt
     store,
     queue,
     clock,
-    ...(opts?.defaultRetry !== undefined ? { defaultRetry: opts.defaultRetry } : {}),
+    ...(opts?.defaultRetry !== undefined
+      ? { defaultRetry: opts.defaultRetry }
+      : {}),
     ...(opts?.logger !== undefined ? { logger: opts.logger } : {}),
+    ...(opts?.hooks !== undefined ? { hooks: opts.hooks } : {}),
   });
 
   if (flowList.length === 0) throw new Error("makeHarness: no flows provided");
@@ -154,8 +170,11 @@ export function makeHarness(flows: Flow | ReadonlyArray<Flow>, opts?: HarnessOpt
     store,
     queue,
     clock,
-    ...(opts?.defaultRetry !== undefined ? { defaultRetry: opts.defaultRetry } : {}),
+    ...(opts?.defaultRetry !== undefined
+      ? { defaultRetry: opts.defaultRetry }
+      : {}),
     ...(opts?.logger !== undefined ? { logger: opts.logger } : {}),
+    ...(opts?.hooks !== undefined ? { hooks: opts.hooks } : {}),
   };
 
   return {
@@ -169,7 +188,9 @@ export function makeHarness(flows: Flow | ReadonlyArray<Flow>, opts?: HarnessOpt
       const ac = new AbortController();
       const merged: WorkerConfig = {
         pollIntervalMs: config?.pollIntervalMs ?? 5,
-        ...(config?.concurrency !== undefined ? { concurrency: config.concurrency } : {}),
+        ...(config?.concurrency !== undefined
+          ? { concurrency: config.concurrency }
+          : {}),
         signal: config?.signal ?? ac.signal,
       };
       const worker = wf.worker(merged);
@@ -221,7 +242,9 @@ export function makeHarness(flows: Flow | ReadonlyArray<Flow>, opts?: HarnessOpt
         if (state.steps[stepName]?.status === status) return state;
         await new Promise((r) => setTimeout(r, 5));
       }
-      throw new Error(`waitForStep("${stepName}", "${status}"): timeout after ${timeoutMs}ms`);
+      throw new Error(
+        `waitForStep("${stepName}", "${status}"): timeout after ${timeoutMs}ms`,
+      );
     },
 
     async result(runId) {
@@ -237,7 +260,9 @@ export async function runFlow<F extends Flow>(
 ): Promise<Result> {
   const harness = makeHarness(flow, opts);
   const worker = harness.startWorker(
-    opts?.pollIntervalMs !== undefined ? { pollIntervalMs: opts.pollIntervalMs } : {},
+    opts?.pollIntervalMs !== undefined
+      ? { pollIntervalMs: opts.pollIntervalMs }
+      : {},
   );
   try {
     const runId = await harness.wf.start(flow, input);

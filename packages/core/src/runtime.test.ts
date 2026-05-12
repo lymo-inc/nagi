@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
-import { emptySchema, makeHarness, passthroughSchema, runFlow } from "./test-helpers";
+import { NagiValidationError } from "./runtime";
+import {
+  emptySchema,
+  makeHarness,
+  passthroughSchema,
+  runFlow,
+} from "./test-helpers";
+import type { RunId } from "./types";
 
 describe("e2e: linear task chain", () => {
   it("runs both steps and threads upstream output through needs", async () => {
@@ -8,7 +15,9 @@ describe("e2e: linear task chain", () => {
       id: "linear-e2e",
       input: passthroughSchema<{ start: number }>(),
       build: (b) => {
-        const a = b.task({ run: async ({ input }) => ({ doubled: input.start * 2 }) });
+        const a = b.task({
+          run: async ({ input }) => ({ doubled: input.start * 2 }),
+        });
         const c = b.task({
           needs: { a },
           run: async ({ needs }) => ({ plusTen: needs.a.doubled + 10 }),
@@ -30,7 +39,9 @@ describe("e2e: when:false skip cascade", () => {
       id: "skip-e2e",
       input: passthroughSchema<{ enable: boolean }>(),
       build: (b) => {
-        const gate = b.task({ run: async ({ input }) => ({ enabled: input.enable }) });
+        const gate = b.task({
+          run: async ({ input }) => ({ enabled: input.enable }),
+        });
         const branch = b.task({
           needs: { gate },
           when: ({ needs }) => needs.gate.enabled,
@@ -63,7 +74,12 @@ describe("e2e: retry with real backoff timers", () => {
       input: emptySchema(),
       build: (b) => ({
         flaky: b.task({
-          retry: { maxAttempts: 3, backoff: "exponential", initialDelayMs: 10, maxDelayMs: 50 },
+          retry: {
+            maxAttempts: 3,
+            backoff: "exponential",
+            initialDelayMs: 10,
+            maxDelayMs: 50,
+          },
           run: async () => {
             attempts++;
             if (attempts < 3) throw new Error(`fail ${attempts}`);
@@ -105,7 +121,9 @@ describe("e2e: signal full loop", () => {
       id: "signal-e2e",
       input: passthroughSchema<{ subject: string }>(),
       build: (b) => {
-        const prep = b.task({ run: async ({ input }) => ({ subject: input.subject }) });
+        const prep = b.task({
+          run: async ({ input }) => ({ subject: input.subject }),
+        });
         const review = b.signal({
           needs: { prep },
           schema: passthroughSchema<{ approved: boolean }>(),
@@ -134,6 +152,93 @@ describe("e2e: signal full loop", () => {
     } finally {
       await w.stop();
     }
+  });
+});
+
+describe("start: caller-supplied runId", () => {
+  const trivialFlow = () =>
+    flow({
+      id: "supplied-runid",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({
+        only: b.task({ run: async ({ input }) => ({ doubled: input.x * 2 }) }),
+      }),
+    });
+
+  it("uses the supplied runId when no run exists yet", async () => {
+    const f = trivialFlow();
+    const h = makeHarness(f);
+    const w = h.startWorker();
+    try {
+      const supplied = "run-deterministic-abc" as RunId;
+      const runId = await h.wf.start(f, { x: 3 }, { runId: supplied });
+      expect(runId).toBe(supplied);
+      const result = await h.waitForEnd(runId);
+      expect(result.output("only")).toEqual({ doubled: 6 });
+    } finally {
+      await w.stop();
+    }
+  });
+
+  it("mints a fresh runId when opts is omitted (back-compat)", async () => {
+    const f = trivialFlow();
+    const h = makeHarness(f);
+    const w = h.startWorker();
+    try {
+      const runId = await h.wf.start(f, { x: 1 });
+      expect(runId).toMatch(/^run-/);
+      await h.waitForEnd(runId);
+    } finally {
+      await w.stop();
+    }
+  });
+
+  it("is an idempotent no-op when the same runId is supplied twice", async () => {
+    const f = trivialFlow();
+    const h = makeHarness(f);
+
+    const supplied = "run-idem-xyz" as RunId;
+    const first = await h.wf.start(f, { x: 7 }, { runId: supplied });
+    // Second call BEFORE draining; runtime returns immediately with no new
+    // flow.started fact, no second dispatch.
+    const second = await h.wf.start(f, { x: 999 }, { runId: supplied });
+
+    expect(first).toBe(supplied);
+    expect(second).toBe(supplied);
+
+    const state = await h.store.loadRunState(supplied);
+    expect(state.facts.filter((f) => f.kind === "flow.started")).toHaveLength(
+      1,
+    );
+    // The single flow.started fact carries the FIRST input — second call
+    // didn't re-validate or overwrite.
+    const started = state.facts.find((f) => f.kind === "flow.started");
+    expect(
+      started && started.kind === "flow.started" ? started.input : null,
+    ).toEqual({ x: 7 });
+
+    // The queue should have exactly one enqueued message for `only` from the
+    // first dispatch — the second start() didn't re-dispatch.
+    await h.drain();
+    const final = await h.result(supplied);
+    expect(final.output("only")).toEqual({ doubled: 14 });
+  });
+
+  it("rejects an empty-string runId with NagiValidationError", async () => {
+    const f = trivialFlow();
+    const h = makeHarness(f);
+    await expect(
+      h.wf.start(f, { x: 1 }, { runId: "" as RunId }),
+    ).rejects.toBeInstanceOf(NagiValidationError);
+  });
+
+  it("rejects a non-string runId with NagiValidationError", async () => {
+    const f = trivialFlow();
+    const h = makeHarness(f);
+    await expect(
+      // Force an invalid type past the compile-time check.
+      h.wf.start(f, { x: 1 }, { runId: 123 as unknown as RunId }),
+    ).rejects.toBeInstanceOf(NagiValidationError);
   });
 });
 

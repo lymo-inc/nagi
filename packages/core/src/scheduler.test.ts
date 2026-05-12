@@ -18,7 +18,13 @@ async function projectFacts(facts: readonly Fact[]): Promise<RunState> {
 }
 
 function startedFact(flowId: string, input: unknown): Fact {
-  return { kind: "flow.started", runId: RUN, flowId, input: input as never, at: new Date() };
+  return {
+    kind: "flow.started",
+    runId: RUN,
+    flowId,
+    input: input as never,
+    at: new Date(),
+  };
 }
 
 function completedStepFact(stepId: string, output: unknown): Fact {
@@ -43,7 +49,10 @@ function failedStepFact(stepId: string): Fact {
   };
 }
 
-function skippedStepFact(stepId: string, reason: "when-false" | "transitive"): Fact {
+function skippedStepFact(
+  stepId: string,
+  reason: "when-false" | "transitive",
+): Fact {
   return { kind: "step.skipped", runId: RUN, stepId, reason, at: new Date() };
 }
 
@@ -52,7 +61,9 @@ function linearFlow(): Flow {
     id: "linear",
     input: passthroughSchema<{ n: number }>(),
     build: (b) => {
-      const a = b.task({ run: async ({ input }) => ({ doubled: input.n * 2 }) });
+      const a = b.task({
+        run: async ({ input }) => ({ doubled: input.n * 2 }),
+      });
       const c = b.task({
         needs: { a },
         run: async ({ needs }) => ({ tripled: needs.a.doubled * 3 }),
@@ -67,7 +78,9 @@ function gatedFlow(): Flow {
     id: "gated",
     input: passthroughSchema<{ enable: boolean }>(),
     build: (b) => {
-      const gate = b.task({ run: async ({ input }) => ({ enabled: input.enable }) });
+      const gate = b.task({
+        run: async ({ input }) => ({ enabled: input.enable }),
+      });
       const branch = b.task({
         needs: { gate },
         when: ({ needs }) => needs.gate.enabled,
@@ -82,10 +95,12 @@ describe("nextRunnable", () => {
   it("returns initial steps (no needs) on a fresh run", async () => {
     const f = linearFlow();
     const state = await projectFacts([startedFact(f.id, { n: 1 })]);
-    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual({
-      runnable: ["a"],
-      skip: [],
-    });
+    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual(
+      {
+        runnable: ["a"],
+        skip: [],
+      },
+    );
   });
 
   it("returns downstream once upstream completes", async () => {
@@ -94,16 +109,22 @@ describe("nextRunnable", () => {
       startedFact(f.id, { n: 1 }),
       completedStepFact("a", { doubled: 2 }),
     ]);
-    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual({
-      runnable: ["c"],
-      skip: [],
-    });
+    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual(
+      {
+        runnable: ["c"],
+        skip: [],
+      },
+    );
   });
 
   it("blocks downstream while upstream is pending", async () => {
     const f = linearFlow();
     const state = await projectFacts([startedFact(f.id, { n: 1 })]);
-    const decision = nextRunnable({ flow: f, runState: state, input: { n: 1 } });
+    const decision = nextRunnable({
+      flow: f,
+      runState: state,
+      input: { n: 1 },
+    });
     expect(decision.runnable).not.toContain("c");
   });
 
@@ -113,7 +134,9 @@ describe("nextRunnable", () => {
       startedFact(f.id, { enable: false }),
       completedStepFact("gate", { enabled: false }),
     ]);
-    expect(nextRunnable({ flow: f, runState: state, input: { enable: false } })).toEqual({
+    expect(
+      nextRunnable({ flow: f, runState: state, input: { enable: false } }),
+    ).toEqual({
       runnable: [],
       skip: [{ stepId: "branch", reason: "when-false" }],
     });
@@ -125,10 +148,12 @@ describe("nextRunnable", () => {
       startedFact(f.id, { n: 1 }),
       skippedStepFact("a", "when-false"),
     ]);
-    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual({
-      runnable: [],
-      skip: [{ stepId: "c", reason: "transitive" }],
-    });
+    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual(
+      {
+        runnable: [],
+        skip: [{ stepId: "c", reason: "transitive" }],
+      },
+    );
   });
 
   it("marks step as skip transitive when upstream failed", async () => {
@@ -137,22 +162,32 @@ describe("nextRunnable", () => {
       startedFact(f.id, { n: 1 }),
       failedStepFact("a"),
     ]);
-    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual({
-      runnable: [],
-      skip: [{ stepId: "c", reason: "transitive" }],
-    });
+    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual(
+      {
+        runnable: [],
+        skip: [{ stepId: "c", reason: "transitive" }],
+      },
+    );
   });
 
   it("does not re-emit an already-running step", async () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      { kind: "step.started", runId: RUN, stepId: "a", attempt: 1, at: new Date() },
+      {
+        kind: "step.started",
+        runId: RUN,
+        stepId: "a",
+        attempt: 1,
+        at: new Date(),
+      },
     ]);
-    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual({
-      runnable: [],
-      skip: [],
-    });
+    expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual(
+      {
+        runnable: [],
+        skip: [],
+      },
+    );
   });
 });
 

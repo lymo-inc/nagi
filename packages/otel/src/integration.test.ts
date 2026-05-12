@@ -55,7 +55,8 @@ async function runToEnd(
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const state = await store.loadRunState(runId);
-      if (state.status === "completed" || state.status === "failed") return state;
+      if (state.status === "completed" || state.status === "failed")
+        return state;
       await new Promise((res) => setTimeout(res, 5));
     }
     throw new Error("runToEnd: timeout");

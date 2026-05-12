@@ -1,8 +1,8 @@
-import { projectRunState } from "@nagi-js/core";
 import type {
   AttemptNumber,
   ClaimToken,
   Fact,
+  FlowStartedFact,
   Json,
   Millis,
   RunId,
@@ -14,6 +14,7 @@ import type {
   Store,
   Tx,
 } from "@nagi-js/core";
+import { projectRunState } from "@nagi-js/core";
 import type { Kysely } from "kysely";
 import { sql } from "kysely";
 import { uuidv7 } from "./uuidv7";
@@ -73,6 +74,38 @@ class PostgresStore<DB = unknown> implements Store {
     await this.maybeNotify(runId);
   }
 
+  async tryStartRun(
+    runId: RunId,
+    fact: FlowStartedFact,
+  ): Promise<{ readonly started: boolean }> {
+    // Race-safe atomic insert. We lean on the `workflow_run.run_id` PRIMARY
+    // KEY: `ON CONFLICT DO NOTHING` plus `RETURNING run_id` lets us detect in
+    // one round-trip whether THIS call is the writer that created the run.
+    // The fact insert and notify happen only on the winning branch — losers
+    // get a clean idempotent no-op with no `flow.started` double-emit.
+    const started = await this.db.transaction().execute(async (trx) => {
+      const insert = await sql<{ run_id: string }>`
+        INSERT INTO ${sql.raw(this.t("workflow_run"))}
+          (run_id, flow_id, status, input, started_at)
+        VALUES
+          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at})
+        ON CONFLICT (run_id) DO NOTHING
+        RETURNING run_id
+      `.execute(trx);
+
+      if (insert.rows.length === 0) {
+        return false;
+      }
+      await this.insertFact(trx, runId, fact);
+      return true;
+    });
+
+    if (started) {
+      await this.maybeNotify(runId);
+    }
+    return { started };
+  }
+
   async loadRunState(runId: RunId): Promise<RunState> {
     const rows = await sql<{
       kind: string;
@@ -119,7 +152,13 @@ class PostgresStore<DB = unknown> implements Store {
     fact: Fact,
   ): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
-      await this.upsertStepCompleted(trx, runId, stepId, fact.kind === "step.completed" ? fact.attempt : 1, output);
+      await this.upsertStepCompleted(
+        trx,
+        runId,
+        stepId,
+        fact.kind === "step.completed" ? fact.attempt : 1,
+        output,
+      );
       await this.insertFact(trx, runId, fact);
       await this.applyFactToMaterialized(trx, runId, fact);
       await this.deleteLease(trx, runId, stepId);
@@ -134,7 +173,13 @@ class PostgresStore<DB = unknown> implements Store {
     fact: Fact,
   ): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
-      await this.upsertStepFailed(trx, runId, stepId, fact.kind === "step.failed" ? fact.attempt : 1, error);
+      await this.upsertStepFailed(
+        trx,
+        runId,
+        stepId,
+        fact.kind === "step.failed" ? fact.attempt : 1,
+        error,
+      );
       await this.insertFact(trx, runId, fact);
       await this.applyFactToMaterialized(trx, runId, fact);
       await this.deleteLease(trx, runId, stepId);
@@ -238,11 +283,14 @@ class PostgresStore<DB = unknown> implements Store {
   ): Promise<void> {
     switch (fact.kind) {
       case "flow.started":
+        // `tryStartRun` is the canonical entry point for `flow.started`. This
+        // branch only fires if a caller threads the fact through `appendFact`
+        // directly (e.g. tests). Use DO NOTHING to preserve idempotent
+        // semantics — never clobber an existing run row.
         await sql`
           INSERT INTO ${sql.raw(this.t("workflow_run"))} (run_id, flow_id, status, input, started_at)
           VALUES (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at})
-          ON CONFLICT (run_id) DO UPDATE
-            SET flow_id = EXCLUDED.flow_id, status = 'running', input = EXCLUDED.input
+          ON CONFLICT (run_id) DO NOTHING
         `.execute(trx);
         return;
       case "flow.completed":

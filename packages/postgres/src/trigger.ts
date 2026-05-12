@@ -13,7 +13,10 @@ export interface ListenClient {
     event: "notification",
     handler: (msg: NotificationMessage) => void,
   ): void;
-  off?(event: "notification", handler: (msg: NotificationMessage) => void): void;
+  off?(
+    event: "notification",
+    handler: (msg: NotificationMessage) => void,
+  ): void;
 }
 
 export interface NotificationMessage {

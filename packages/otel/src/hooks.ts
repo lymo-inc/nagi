@@ -21,8 +21,8 @@ import {
   type Span,
   SpanKind,
   SpanStatusCode,
-  trace,
   type Tracer,
+  trace,
 } from "@opentelemetry/api";
 import { stepKey, stepSpanRegistry } from "./context";
 
@@ -56,7 +56,8 @@ export interface OtelHooksOpts {
  * workflow. Throws are logged via `console.error`.
  */
 export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
-  const tracer: Tracer = opts.tracer ?? trace.getTracer(TRACER_NAME, TRACER_VERSION);
+  const tracer: Tracer =
+    opts.tracer ?? trace.getTracer(TRACER_NAME, TRACER_VERSION);
   const flowPrefix = opts.spanNamePrefix?.flow ?? DEFAULT_FLOW_PREFIX;
   const stepPrefix = opts.spanNamePrefix?.step ?? DEFAULT_STEP_PREFIX;
   const baseAttrs: Attributes = opts.defaultAttributes ?? {};
@@ -67,7 +68,10 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
   // match completion, so we compute it ourselves from the stashed start time.
   const stepStartTimes = new Map<string, Date>();
 
-  function withGuard<E>(name: string, fn: (event: E) => void): (event: E) => void {
+  function withGuard<E>(
+    name: string,
+    fn: (event: E) => void,
+  ): (event: E) => void {
     return (event: E) => {
       try {
         fn(event);
@@ -77,7 +81,10 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
     };
   }
 
-  function flowAttrs(event: { readonly runId: RunId; readonly flowId: string }): Attributes {
+  function flowAttrs(event: {
+    readonly runId: RunId;
+    readonly flowId: string;
+  }): Attributes {
     return {
       ...baseAttrs,
       "nagi.flow.id": event.flowId,
@@ -207,17 +214,20 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
 
     // onSignalSent is declared in core/types.ts but never fired by the runtime;
     // intentionally omitted until core wires a sender path.
-    onSignalReceived: withGuard<SignalReceivedEvent>("onSignalReceived", (event) => {
-      const span = consumeStepSpan(event.runId, event.stepId, event.attempt);
-      if (!span) return;
-      span.addEvent(
-        "nagi.signal.received",
-        { "nagi.signal.payload_present": event.payload !== null },
-        event.at,
-      );
-      span.setAttribute("nagi.step.duration_ms", 0);
-      span.end(event.at);
-    }),
+    onSignalReceived: withGuard<SignalReceivedEvent>(
+      "onSignalReceived",
+      (event) => {
+        const span = consumeStepSpan(event.runId, event.stepId, event.attempt);
+        if (!span) return;
+        span.addEvent(
+          "nagi.signal.received",
+          { "nagi.signal.payload_present": event.payload !== null },
+          event.at,
+        );
+        span.setAttribute("nagi.step.duration_ms", 0);
+        span.end(event.at);
+      },
+    ),
   };
 }
 
@@ -230,4 +240,3 @@ function toError(err: SerializedError): Error {
   if (err.stack !== undefined) e.stack = err.stack;
   return e;
 }
-

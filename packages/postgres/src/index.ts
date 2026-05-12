@@ -25,14 +25,14 @@
 //     }
 //   }
 
+export type { MigrateOpts, Migration } from "./migrations";
 export { migrate, migrations } from "./migrations";
-export type { Migration, MigrateOpts } from "./migrations";
-export { postgresStore } from "./store";
 export type { PostgresStoreOpts } from "./store";
-export { postgresTrigger } from "./trigger";
+export { postgresStore } from "./store";
 export type {
   ListenClient,
   NotificationMessage,
   PostgresTriggerOpts,
 } from "./trigger";
+export { postgresTrigger } from "./trigger";
 export { uuidv7 } from "./uuidv7";

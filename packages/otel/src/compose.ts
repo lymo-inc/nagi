@@ -59,7 +59,8 @@ export function composeHooks(...hooks: readonly FlowHooks[]): FlowHooks {
   if (sigS.length > 0) result.onSignalSent = fanout("onSignalSent", sigS);
 
   const sigR = pick(hooks, "onSignalReceived");
-  if (sigR.length > 0) result.onSignalReceived = fanout("onSignalReceived", sigR);
+  if (sigR.length > 0)
+    result.onSignalReceived = fanout("onSignalReceived", sigR);
 
   return result;
 }
@@ -85,7 +86,10 @@ function fanout<E>(
       try {
         await fn(event);
       } catch (err) {
-        console.error(`[@nagi-js/otel] composeHooks: ${name} subscriber threw`, err);
+        console.error(
+          `[@nagi-js/otel] composeHooks: ${name} subscriber threw`,
+          err,
+        );
       }
     }
   };

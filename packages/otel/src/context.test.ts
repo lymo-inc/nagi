@@ -55,7 +55,10 @@ describe("stepKey + stepSpanRegistry + getStepSpan", () => {
   });
 
   it("getStepSpan does not return a span from a different run/step/attempt", () => {
-    stepSpanRegistry.set(stepKey("run-1" as RunId, "stepA", 1), realSpan("right"));
+    stepSpanRegistry.set(
+      stepKey("run-1" as RunId, "stepA", 1),
+      realSpan("right"),
+    );
     expect(getStepSpan(ctx({ attempt: 2 }))).toBeUndefined();
     expect(getStepSpan(ctx({ stepId: "stepB" }))).toBeUndefined();
     expect(getStepSpan(ctx({ runId: "run-2" as RunId }))).toBeUndefined();

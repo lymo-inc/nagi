@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { computeBackoff } from "./dispatch";
 import { makeHarness, passthroughSchema } from "./test-helpers";
-import type { RetryPolicy } from "./types";
+import type { RetryPolicy, StepStartEvent } from "./types";
 
 describe("computeBackoff", () => {
   const exp: RetryPolicy = {
@@ -175,7 +175,9 @@ describe("dispatchMessage — driver", () => {
       id: "with-output",
       input: passthroughSchema<{ x: number }>(),
       build: (b) => {
-        const a = b.task({ run: async ({ input }) => ({ doubled: input.x * 2 }) });
+        const a = b.task({
+          run: async ({ input }) => ({ doubled: input.x * 2 }),
+        });
         const c = b.task({
           needs: { a },
           run: async ({ needs }) => ({ tripled: needs.a.doubled * 3 }),
@@ -208,6 +210,62 @@ describe("dispatchMessage — driver", () => {
     const result = await h.result(runId);
     const completedFacts = result.factsOf("flow.completed");
     expect(completedFacts[0]?.output).toBeNull();
+  });
+
+  it("onStepStart hook receives the flow input for a task step", async () => {
+    const events: StepStartEvent[] = [];
+    const f = flow({
+      id: "hook-task-input",
+      input: passthroughSchema<{ prompt: string; n: number }>(),
+      build: (b) => ({
+        only: b.task({ run: async ({ input }) => ({ echoed: input.prompt }) }),
+      }),
+    });
+    const h = makeHarness(f, {
+      hooks: {
+        onStepStart: (e) => {
+          events.push(e);
+        },
+      },
+    });
+    await h.wf.start(f, { prompt: "hello", n: 7 });
+    await h.drain();
+
+    expect(events).toHaveLength(1);
+    const [start] = events;
+    expect(start?.stepId).toBe("only");
+    expect(start?.kind).toBe("task");
+    expect(start?.input).toEqual({ prompt: "hello", n: 7 });
+  });
+
+  it("onStepStart hook passes null for signal and match steps", async () => {
+    const events: StepStartEvent[] = [];
+    const f = flow({
+      id: "hook-signal-null",
+      input: passthroughSchema<{ tag: string }>(),
+      build: (b) => {
+        const wait = b.signal({ schema: passthroughSchema<{ ok: boolean }>() });
+        return { wait };
+      },
+    });
+    const h = makeHarness(f, {
+      hooks: {
+        onStepStart: (e) => {
+          events.push(e);
+        },
+      },
+    });
+    const runId = await h.wf.start(f, { tag: "x" });
+    await h.drain();
+
+    const signalEvent = events.find((e) => e.stepId === "wait");
+    expect(signalEvent).toBeDefined();
+    expect(signalEvent?.kind).toBe("signal");
+    expect(signalEvent?.input).toBeNull();
+
+    // sanity: signal completes after external payload arrives
+    await h.wf.signal(runId, "wait", { ok: true });
+    await h.drain();
   });
 
   it("is idempotent against duplicate dispatch of a completed step", async () => {

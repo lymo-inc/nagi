@@ -11,6 +11,7 @@ export {
   NagiRuntimeError,
   NagiValidationError,
   nagi,
+  type StartOpts,
   type Wf,
 } from "./runtime";
 export type * from "./types";

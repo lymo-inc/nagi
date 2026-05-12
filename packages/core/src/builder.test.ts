@@ -34,6 +34,7 @@ describe("flow()", () => {
     });
 
     const downstreamDef = getDef(f.steps.downstream as never);
+    // biome-ignore lint/complexity/useLiteralKeys: index-signature access requires bracket notation under TS strict
     const upstreamRef = downstreamDef.needs["foo"] as { id: string };
     expect(upstreamRef.id).toBe("upstream");
   });
@@ -54,6 +55,7 @@ describe("flow()", () => {
 
     const def = getDef(f.steps.downstream as never);
     expect(Object.keys(def.needs)).toEqual(["localName"]);
+    // biome-ignore lint/complexity/useLiteralKeys: index-signature access requires bracket notation under TS strict
     expect((def.needs["localName"] as { id: string }).id).toBe("a");
   });
 

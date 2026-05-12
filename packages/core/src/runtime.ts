@@ -32,9 +32,29 @@ export interface NagiConfig {
   readonly defaultRetry?: RetryPolicy;
 }
 
+export interface StartOpts {
+  /**
+   * Caller-supplied runId for idempotent kickoff. If provided and a run with
+   * this ID already exists, `start()` is a no-op and returns the same ID
+   * without re-appending `flow.started`, re-dispatching, or re-validating the
+   * input. Two concurrent `start()` calls with the same `runId` produce
+   * exactly one run (enforced at the Store layer).
+   *
+   * If omitted, the runtime mints a fresh ID via `crypto.randomUUID()`.
+   *
+   * Typical usage: a content hash of the input, so callers de-duplicate
+   * kickoffs without coordinating.
+   */
+  readonly runId?: RunId;
+}
+
 export interface Wf {
   /** Begin a new run. Returns the runId. */
-  start<F extends Flow>(flow: F, input: FlowInput<F>): Promise<RunId>;
+  start<F extends Flow>(
+    flow: F,
+    input: FlowInput<F>,
+    opts?: StartOpts,
+  ): Promise<RunId>;
 
   /** Resolve a `b.signal()` step waiting on external input. */
   signal(runId: RunId, stepName: string, payload: unknown): Promise<void>;
@@ -101,27 +121,60 @@ export function nagi(config: NagiConfig): Wf {
   };
 
   return {
-    async start<F extends Flow>(flow: F, input: FlowInput<F>): Promise<RunId> {
+    async start<F extends Flow>(
+      flow: F,
+      input: FlowInput<F>,
+      opts?: StartOpts,
+    ): Promise<RunId> {
       if (!flowsById.has(flow.id)) {
         throw new NagiRuntimeError(
           `Flow "${flow.id}" not registered with nagi(). Pass it to flows[].`,
         );
       }
-      const validated = (await validate(flow.input, input)) as Json;
-      const runId = mintRunId();
 
-      await config.store.appendFact(runId, {
-        kind: "flow.started",
+      // Caller-supplied runId. We accept it, validate shape, and rely on the
+      // Store's atomic `tryStartRun` for race safety — never check-then-insert
+      // at this layer.
+      let runId: RunId;
+      if (opts?.runId !== undefined) {
+        if (typeof opts.runId !== "string" || opts.runId.length === 0) {
+          throw new NagiValidationError([
+            {
+              message: "opts.runId must be a non-empty string",
+              path: ["runId"],
+            },
+          ]);
+        }
+        runId = opts.runId;
+      } else {
+        runId = mintRunId();
+      }
+
+      const validated = (await validate(flow.input, input)) as Json;
+      const startedAt = clock.now();
+      const fact = {
+        kind: "flow.started" as const,
         runId,
         flowId: flow.id,
         input: validated,
-        at: clock.now(),
-      });
+        at: startedAt,
+      };
+
+      const { started } = await config.store.tryStartRun(runId, fact);
+      if (!started) {
+        // Idempotent no-op: a run with this ID already exists. Per the contract
+        // we do NOT re-append the fact, do NOT re-dispatch, and do NOT
+        // re-validate against the prior input (we don't have it, and even if
+        // we did, callers asked for "use this runId" semantics — not "verify
+        // the same input").
+        return runId;
+      }
+
       await config.hooks?.onFlowStart?.({
         runId,
         flowId: flow.id,
         input: validated,
-        at: clock.now(),
+        at: startedAt,
       });
 
       await advance(dispatchDeps, runId);

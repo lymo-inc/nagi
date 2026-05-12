@@ -14,12 +14,14 @@ describe("postgresStore — config validation", () => {
     expect(() => postgresStore({ db: fakeDb })).not.toThrow();
   });
 
-  it.each(["custom", "Custom", "with_underscores", "_leading_underscore"])(
-    "accepts safe schema name %s",
-    (schema) => {
-      expect(() => postgresStore({ db: fakeDb, schema })).not.toThrow();
-    },
-  );
+  it.each([
+    "custom",
+    "Custom",
+    "with_underscores",
+    "_leading_underscore",
+  ])("accepts safe schema name %s", (schema) => {
+    expect(() => postgresStore({ db: fakeDb, schema })).not.toThrow();
+  });
 
   it.each([
     "1bad",
@@ -37,19 +39,19 @@ describe("postgresStore — config validation", () => {
 
 describe("postgresTrigger — channel validation", () => {
   it("accepts the default channel (nagi)", () => {
-    expect(() =>
-      postgresTrigger({ listen: fakeListen }),
-    ).not.toThrow();
+    expect(() => postgresTrigger({ listen: fakeListen })).not.toThrow();
   });
 
-  it.each(["1bad", "has space", "with-dash", "DROP TABLE foo"])(
-    "rejects unsafe channel %s",
-    (channel) => {
-      expect(() =>
-        postgresTrigger({ listen: fakeListen, channel }),
-      ).toThrow(/invalid NOTIFY channel/i);
-    },
-  );
+  it.each([
+    "1bad",
+    "has space",
+    "with-dash",
+    "DROP TABLE foo",
+  ])("rejects unsafe channel %s", (channel) => {
+    expect(() => postgresTrigger({ listen: fakeListen, channel })).toThrow(
+      /invalid NOTIFY channel/i,
+    );
+  });
 
   it("subscribe → unsubscribe is a no-op when never notified", () => {
     const trigger = postgresTrigger({ listen: fakeListen });

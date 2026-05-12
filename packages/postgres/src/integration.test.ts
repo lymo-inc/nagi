@@ -24,6 +24,7 @@ import { migrate } from "./migrations";
 import { postgresStore } from "./store";
 import { uuidv7 } from "./uuidv7";
 
+// biome-ignore lint/complexity/useLiteralKeys: index-signature access requires bracket notation under TS strict
 const url = process.env["NAGI_POSTGRES_TEST_URL"];
 const d = url ? describe : describe.skip;
 
@@ -42,8 +43,8 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
   afterAll(async () => {
     if (!db) return;
     await sql.raw(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).execute(db);
+    // db.destroy() ends the underlying pg.Pool — do not call pool.end() again.
     await db.destroy();
-    await pool.end();
   }, 30_000);
 
   function makeNagi(...flows: Parameters<typeof nagi>[0]["flows"]): Wf {
@@ -82,6 +83,9 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
           run: async ({ input }) => ({ doubled: input.x * 2 }),
         }),
       }),
+      output(s) {
+        return s.only;
+      },
     });
 
     const wf = makeNagi(f);
@@ -144,6 +148,98 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     await new Promise((r) => setTimeout(r, 80));
     expect(await store.claimStep(runId, "step", 1)).not.toBeNull();
   });
+
+  it("concurrent start() with the same runId produces one run and one dispatch", async () => {
+    let invocations = 0;
+    const f = flow({
+      id: "pg-idempotent-start",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({
+        only: b.task({
+          run: async ({ input }) => {
+            invocations++;
+            return { doubled: input.x * 2 };
+          },
+        }),
+      }),
+      output(s) {
+        return s.only;
+      },
+    });
+
+    const wf = makeNagi(f);
+    const supplied = `run-${uuidv7()}` as RunId;
+
+    // Fire two concurrent start() calls. The Postgres ON CONFLICT DO NOTHING
+    // on workflow_run.run_id must serialize them so exactly one writes the
+    // flow.started fact and dispatches the work.
+    const [a, b] = await Promise.all([
+      wf.start(f, { x: 5 }, { runId: supplied }),
+      wf.start(f, { x: 5 }, { runId: supplied }),
+    ]);
+    expect(a).toBe(supplied);
+    expect(b).toBe(supplied);
+
+    await runToEnd(wf, supplied);
+
+    // Workflow row exists exactly once.
+    const rows = await sql<{
+      count: string;
+    }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${supplied}`.execute(
+      db,
+    );
+    expect(rows.rows[0]?.count).toBe("1");
+
+    // Exactly one flow.started fact.
+    const facts = await sql<{
+      count: string;
+    }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.fact`)} WHERE run_id = ${supplied} AND kind = 'flow.started'`.execute(
+      db,
+    );
+    expect(facts.rows[0]?.count).toBe("1");
+
+    // The task ran exactly once (no double-dispatch).
+    expect(invocations).toBe(1);
+
+    const output = await loadOutput(db, schema, supplied);
+    expect(output).toEqual({ doubled: 10 });
+  }, 15_000);
+
+  it("start() with a previously-used runId is an idempotent no-op", async () => {
+    const f = flow({
+      id: "pg-idempotent-replay",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({
+        only: b.task({ run: async ({ input }) => ({ v: input.x }) }),
+      }),
+    });
+
+    const wf = makeNagi(f);
+    const supplied = `run-${uuidv7()}` as RunId;
+
+    const first = await wf.start(f, { x: 1 }, { runId: supplied });
+    await runToEnd(wf, supplied);
+
+    // Second start with same runId after completion: must return same id
+    // without re-appending or clobbering the original input.
+    const second = await wf.start(f, { x: 999 }, { runId: supplied });
+    expect(second).toBe(first);
+
+    const facts = await sql<{
+      count: string;
+    }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.fact`)} WHERE run_id = ${supplied} AND kind = 'flow.started'`.execute(
+      db,
+    );
+    expect(facts.rows[0]?.count).toBe("1");
+
+    // Original input preserved.
+    const row = await sql<{
+      input: { x: number };
+    }>`SELECT input FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${supplied}`.execute(
+      db,
+    );
+    expect(row.rows[0]?.input).toEqual({ x: 1 });
+  }, 15_000);
 });
 
 function passthroughSchema<T>() {

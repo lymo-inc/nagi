@@ -25,7 +25,9 @@ import type {
   TaskConfig,
 } from "./types";
 
-function isDiscriminator(config: object): config is MatchDiscriminatorConfig<
+function isDiscriminator(
+  config: object,
+): config is MatchDiscriminatorConfig<
   unknown,
   NeedsMap,
   string,
@@ -35,7 +37,9 @@ function isDiscriminator(config: object): config is MatchDiscriminatorConfig<
 }
 
 function makeBuilder<Input>(): Builder<Input> {
-  function task<N extends NeedsMap, O>(config: TaskConfig<Input, N, O>): Step<O> {
+  function task<N extends NeedsMap, O>(
+    config: TaskConfig<Input, N, O>,
+  ): Step<O> {
     const def: TaskDef = {
       kind: "task",
       needs: (config.needs ?? {}) as NeedsMap,
@@ -75,12 +79,17 @@ function makeBuilder<Input>(): Builder<Input> {
   }
 
   function match(config: object): Step<unknown> {
-    const needs = ("needs" in config && config.needs ? (config.needs as NeedsMap) : ({} as NeedsMap));
+    const needs =
+      "needs" in config && config.needs
+        ? (config.needs as NeedsMap)
+        : ({} as NeedsMap);
 
     if (isDiscriminator(config)) {
       const arms: Record<string, MatchArmDef> = {};
       for (const [caseKey, build] of Object.entries(config.cases)) {
-        const nested = (build as (b: Builder<Input>) => StepMap)(makeBuilder<Input>());
+        const nested = (build as (b: Builder<Input>) => StepMap)(
+          makeBuilder<Input>(),
+        );
         arms[caseKey] = { id: caseKey, stepIds: [], _nested: nested };
       }
       const def: DiscriminatorMatchDef = {
@@ -188,7 +197,8 @@ function collectIds(
       const arms: readonly MatchArmDef[] =
         def.mode === "discriminator" ? Object.values(def.arms) : def.arms;
       for (const arm of arms) {
-        if (arm._nested) collectIds(arm._nested, `${id}.${arm.id}`, idByIdentity);
+        if (arm._nested)
+          collectIds(arm._nested, `${id}.${arm.id}`, idByIdentity);
       }
     }
   }

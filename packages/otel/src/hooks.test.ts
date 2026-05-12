@@ -61,7 +61,9 @@ function flowStart(overrides: Partial<FlowStartEvent> = {}): FlowStartEvent {
   return { runId, flowId, at, input: { x: 1 }, ...overrides };
 }
 
-function flowComplete(overrides: Partial<FlowCompleteEvent> = {}): FlowCompleteEvent {
+function flowComplete(
+  overrides: Partial<FlowCompleteEvent> = {},
+): FlowCompleteEvent {
   return { runId, flowId, at, output: null, ...overrides };
 }
 
@@ -77,11 +79,14 @@ function stepStart(overrides: Partial<StepStartEvent> = {}): StepStartEvent {
     stepId: "stepA",
     attempt: 1,
     kind: "task",
+    input: null,
     ...overrides,
   };
 }
 
-function stepComplete(overrides: Partial<StepCompleteEvent> = {}): StepCompleteEvent {
+function stepComplete(
+  overrides: Partial<StepCompleteEvent> = {},
+): StepCompleteEvent {
   return {
     runId,
     flowId,
@@ -122,7 +127,9 @@ function stepRetry(overrides: Partial<StepRetryEvent> = {}): StepRetryEvent {
   };
 }
 
-function signalReceived(overrides: Partial<SignalReceivedEvent> = {}): SignalReceivedEvent {
+function signalReceived(
+  overrides: Partial<SignalReceivedEvent> = {},
+): SignalReceivedEvent {
   return {
     runId,
     flowId,
@@ -135,7 +142,10 @@ function signalReceived(overrides: Partial<SignalReceivedEvent> = {}): SignalRec
   };
 }
 
-function bySpanName(spans: ReadableSpan[], name: string): ReadableSpan | undefined {
+function bySpanName(
+  spans: ReadableSpan[],
+  name: string,
+): ReadableSpan | undefined {
   return spans.find((s) => s.name === name);
 }
 
@@ -158,7 +168,9 @@ describe("otelHooks — happy path", () => {
     // Step is a child of flow (parent-span-id matches flow's span id).
     expect(stepSpan!.parentSpanId).toBe(flowSpan!.spanContext().spanId);
     // Both share a trace id.
-    expect(stepSpan!.spanContext().traceId).toBe(flowSpan!.spanContext().traceId);
+    expect(stepSpan!.spanContext().traceId).toBe(
+      flowSpan!.spanContext().traceId,
+    );
   });
 
   it("stamps the documented nagi.* attributes on step spans", async () => {
@@ -181,7 +193,9 @@ describe("otelHooks — happy path", () => {
   });
 
   it("merges defaultAttributes onto every span", async () => {
-    const hooks = makeHooks({ defaultAttributes: { "deployment.environment": "test" } });
+    const hooks = makeHooks({
+      defaultAttributes: { "deployment.environment": "test" },
+    });
     await hooks.onFlowStart!(flowStart());
     await hooks.onStepStart!(stepStart());
     await hooks.onStepComplete!(stepComplete());
@@ -256,7 +270,9 @@ describe("otelHooks — retry", () => {
     expect(a1.parentSpanId).toBe(a2.parentSpanId);
 
     const flowSpan = bySpanName(exporter.getFinishedSpans(), "flow flow-test")!;
-    const retryEvent = flowSpan.events.find((e) => e.name === "nagi.retry.scheduled");
+    const retryEvent = flowSpan.events.find(
+      (e) => e.name === "nagi.retry.scheduled",
+    );
     expect(retryEvent).toBeDefined();
     expect(retryEvent!.attributes!["nagi.step.id"]).toBe("stepA");
     expect(retryEvent!.attributes!["nagi.step.attempt"]).toBe(1);
@@ -273,7 +289,9 @@ describe("otelHooks — signal received", () => {
 
     const sigSpan = bySpanName(exporter.getFinishedSpans(), "step sigA");
     expect(sigSpan).toBeDefined();
-    expect(sigSpan!.events.some((e) => e.name === "nagi.signal.received")).toBe(true);
+    expect(sigSpan!.events.some((e) => e.name === "nagi.signal.received")).toBe(
+      true,
+    );
   });
 });
 

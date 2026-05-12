@@ -56,7 +56,12 @@ export type InferSchemaInput<S> =
 export type InferSchemaOutput<S> =
   S extends StandardSchemaV1<unknown, infer O> ? O : never;
 
-export type Register = {};
+// Module-augmentation slot. Users declare `interface Register { tx: ... }`
+// from their own module to make `Tx` resolve at compile time. Must be
+// `interface` (not `type`) — type aliases cannot be augmented via declaration
+// merging across modules.
+// biome-ignore lint/suspicious/noEmptyInterface: intentional augmentation slot
+export interface Register {}
 
 export type Tx = Register extends { tx: infer T } ? T : unknown;
 
@@ -347,7 +352,16 @@ export interface StepEvent extends FlowEvent {
   readonly kind: StepKind;
 }
 
-export interface StepStartEvent extends StepEvent {}
+export interface StepStartEvent extends StepEvent {
+  /**
+   * The resolved input for this step at the moment it starts.
+   * - Task: the value passed to `run({ input, needs, ctx })`.
+   * - Signal: `null` (signals await an external payload — no pre-execution input).
+   * - Match: `null` (the discriminator value is computed inside the match
+   *   handler; the start event fires before that resolves).
+   */
+  readonly input: Json;
+}
 
 export interface StepCompleteEvent extends StepEvent {
   readonly output: Json;
@@ -440,6 +454,25 @@ export interface SerializedError {
 export interface Store {
   appendFact(runId: RunId, fact: Fact): Promise<void>;
   loadRunState(runId: RunId): Promise<RunState>;
+
+  /**
+   * Atomically begin a run. Inserts the `flow.started` fact and any
+   * materialized run row keyed by `runId` IFF no run with this `runId` already
+   * exists. Returns `{ started: true }` if this call created the run,
+   * `{ started: false }` if the run already exists.
+   *
+   * Two concurrent `tryStartRun(runId, ...)` calls with the same `runId` must
+   * result in exactly one `flow.started` fact. Adapters enforce this at the
+   * durability layer (e.g. Postgres `INSERT ... ON CONFLICT DO NOTHING` keyed
+   * by `run_id`), NOT via app-level check-then-insert.
+   *
+   * The runtime calls this exactly once at `wf.start()`. Subsequent facts go
+   * through `appendFact` as usual.
+   */
+  tryStartRun(
+    runId: RunId,
+    fact: FlowStartedFact,
+  ): Promise<{ readonly started: boolean }>;
 
   /**
    * Returns null if the step is already claimed under a live lease. Lease

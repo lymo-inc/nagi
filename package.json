@@ -13,20 +13,23 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
+    "test:integration": "NAGI_POSTGRES_TEST_URL=postgres://postgres:postgres@localhost:5433/nagi_test pnpm -F @nagi-js/postgres test",
     "typecheck": "pnpm -r typecheck",
     "lint": "biome check .",
     "format": "biome format --write .",
+    "db:up": "docker compose -f docker-compose.test.yml up -d --wait",
+    "db:down": "docker compose -f docker-compose.test.yml down -v",
     "changeset": "changeset",
     "version": "changeset version",
     "release": "pnpm -r build && changeset publish"
   },
   "devDependencies": {
-    "@arethetypeswrong/cli": "^0.17.0",
+    "@arethetypeswrong/cli": "^0.17.4",
     "@biomejs/biome": "2.4.14",
-    "@changesets/cli": "^2.27.10",
+    "@changesets/cli": "^2.31.0",
     "publint": "^0.2.12",
     "tsup": "^8.5.1",
-    "typescript": "^5.7.2",
-    "vitest": "^4.1.5"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.6"
   }
 }

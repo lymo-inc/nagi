@@ -97,12 +97,20 @@ export async function dispatchMessage(
     attempt,
     at: clock.now(),
   });
+  // Resolve the hook's `input` field by step kind:
+  //  - task:   the same value passed to `run({ input, ... })` (flow input).
+  //  - signal: `null` — no pre-execution input.
+  //  - match:  `null` — the discriminator value is computed inside the
+  //            match handler; the start event fires before that resolves.
+  const startEventInput: Json =
+    def.kind === "task" ? extractInput(await store.loadRunState(runId)) : null;
   await deps.hooks?.onStepStart?.({
     runId,
     flowId: flow.id,
     stepId,
     attempt,
     kind: def.kind,
+    input: startEventInput,
     at: clock.now(),
   });
 

@@ -11,11 +11,7 @@ describe("InMemoryClock — wake-up via Trigger", () => {
     trigger.subscribe((runId) => wakes.push(runId));
 
     const runId = "run-wake-1" as RunId;
-    await clock.schedule(
-      new Date(Date.now() + 5),
-      runId,
-      "step1" as StepId,
-    );
+    await clock.schedule(new Date(Date.now() + 5), runId, "step1" as StepId);
 
     await new Promise((r) => setTimeout(r, 25));
 

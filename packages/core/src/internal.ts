@@ -27,7 +27,10 @@ export interface TaskDef {
   readonly needs: NeedsMap;
   readonly retry?: RetryPolicy;
   readonly timeout?: Millis;
-  readonly when?: (args: { input: unknown; needs: Record<string, unknown> }) => boolean;
+  readonly when?: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+  }) => boolean;
   readonly run: (args: {
     input: unknown;
     needs: Record<string, unknown>;
@@ -41,7 +44,10 @@ export interface SignalDef {
   readonly needs: NeedsMap;
   readonly schema: StandardSchemaV1;
   readonly timeout?: Millis;
-  readonly when?: (args: { input: unknown; needs: Record<string, unknown> }) => boolean;
+  readonly when?: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+  }) => boolean;
   readonly parentMatch?: ParentMatchRef;
 }
 
@@ -56,7 +62,10 @@ export interface SignalDef {
  */
 export interface MatchArmDef {
   readonly id: string;
-  readonly when?: (args: { input: unknown; needs: Record<string, unknown> }) => boolean;
+  readonly when?: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+  }) => boolean;
   readonly otherwise?: true;
   readonly stepIds: readonly string[];
   /** @internal Transient. Populated by builder, consumed by flow(). */
@@ -71,7 +80,10 @@ interface MatchDefBase {
 
 export interface DiscriminatorMatchDef extends MatchDefBase {
   readonly mode: "discriminator";
-  readonly on: (args: { input: unknown; needs: Record<string, unknown> }) => string;
+  readonly on: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+  }) => string;
   readonly arms: Readonly<Record<string, MatchArmDef>>;
 }
 
@@ -121,7 +133,12 @@ export function needsKeys(def: StepDef): readonly string[] {
 export function needsStepIds(def: StepDef): readonly string[] {
   const out: string[] = [];
   for (const upstream of Object.values(def.needs)) {
-    if (upstream && typeof upstream === "object" && "id" in upstream && typeof upstream.id === "string") {
+    if (
+      upstream &&
+      typeof upstream === "object" &&
+      "id" in upstream &&
+      typeof upstream.id === "string"
+    ) {
       out.push(upstream.id);
     }
   }
@@ -135,7 +152,12 @@ export function resolveNeeds(
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [localKey, upstream] of Object.entries(def.needs)) {
-    if (upstream && typeof upstream === "object" && "id" in upstream && typeof upstream.id === "string") {
+    if (
+      upstream &&
+      typeof upstream === "object" &&
+      "id" in upstream &&
+      typeof upstream.id === "string"
+    ) {
       result[localKey] = loadOutput(upstream.id);
     }
   }
@@ -169,7 +191,10 @@ export function findArm(def: MatchDef, armId: string): MatchArmDef | undefined {
  * and replay, and the match's own `running` state in the steps projection
  * doesn't carry the chosen-arm bit.
  */
-export function readSelectedArm(matchId: string, runState: RunState): string | null {
+export function readSelectedArm(
+  matchId: string,
+  runState: RunState,
+): string | null {
   for (const fact of runState.facts) {
     if (fact.kind === "match.arm-selected" && fact.stepId === matchId) {
       return fact.arm;

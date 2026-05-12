@@ -1,14 +1,15 @@
 import { describe, expectTypeOf, it } from "vitest";
 import { flow } from "./builder";
+import type { Wf } from "./runtime";
 import { passthroughSchema } from "./test-helpers";
 import type {
   Builder,
   Fact,
-  Flow,
   FlowOutput,
   Json,
   MatchArm,
   NeedsOutputs,
+  RunId,
   Step,
   StepCtx,
   StepMap,
@@ -25,10 +26,13 @@ declare const ctxCall: StepCtx<{ callId: string }>;
 declare const builderX: Builder<{ x: number }>;
 declare const builderU: Builder<unknown>;
 declare const factEx: Fact;
+declare const wfEx: Wf;
 
 describe("Step output inference", () => {
   it("StepOutput extracts the Output type parameter", () => {
-    expectTypeOf<StepOutput<typeof taskStep>>().toEqualTypeOf<{ doubled: number }>();
+    expectTypeOf<StepOutput<typeof taskStep>>().toEqualTypeOf<{
+      doubled: number;
+    }>();
     expectTypeOf<StepOutput<typeof classifyStep>>().toEqualTypeOf<{
       category: "hot" | "warm" | "cold";
     }>();
@@ -122,9 +126,15 @@ describe("Builder.match — discriminator mode", () => {
       needs: { c: classifyStep },
       on: ({ needs }) => needs.c.category,
       cases: {
-        hot: (b) => ({ f: b.task({ run: async () => ({ kind: "hot" as const }) }) }),
-        warm: (b) => ({ f: b.task({ run: async () => ({ kind: "warm" as const }) }) }),
-        cold: (b) => ({ f: b.task({ run: async () => ({ kind: "cold" as const }) }) }),
+        hot: (b) => ({
+          f: b.task({ run: async () => ({ kind: "hot" as const }) }),
+        }),
+        warm: (b) => ({
+          f: b.task({ run: async () => ({ kind: "warm" as const }) }),
+        }),
+        cold: (b) => ({
+          f: b.task({ run: async () => ({ kind: "cold" as const }) }),
+        }),
       },
     });
     expectTypeOf<StepOutput<typeof route>>().toEqualTypeOf<
@@ -154,11 +164,15 @@ describe("Builder.match — guard mode", () => {
       arms: [
         {
           when: ({ needs }) => needs.s.value >= 90,
-          build: (b) => ({ f: b.task({ run: async () => ({ tier: "premium" as const }) }) }),
+          build: (b) => ({
+            f: b.task({ run: async () => ({ tier: "premium" as const }) }),
+          }),
         },
         {
           otherwise: true,
-          build: (b) => ({ f: b.task({ run: async () => ({ tier: "default" as const }) }) }),
+          build: (b) => ({
+            f: b.task({ run: async () => ({ tier: "default" as const }) }),
+          }),
         },
       ],
     });
@@ -174,7 +188,8 @@ describe("Builder.match — guard mode", () => {
     type ScoreNeeds = { s: typeof scoreStep };
     // @ts-expect-error — `when` and `otherwise` are mutually exclusive on one arm.
     const _badArm: MatchArm<unknown, ScoreNeeds, StepMap> = {
-      when: (args: { input: unknown; needs: NeedsOutputs<ScoreNeeds> }) => args.needs.s.intent,
+      when: (args: { input: unknown; needs: NeedsOutputs<ScoreNeeds> }) =>
+        args.needs.s.intent,
       otherwise: true,
       build: (b) => ({ f: b.task({ run: async () => null }) }),
     };
@@ -246,6 +261,39 @@ describe("Flow literal id (const Id)", () => {
       }),
     });
     expectTypeOf<keyof typeof f.steps>().toEqualTypeOf<"a" | "b">();
+  });
+});
+
+describe("Wf.start signature", () => {
+  it("accepts (flow, input) — opts is optional (back-compat)", () => {
+    const f = flow({
+      id: "sig-back-compat",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+    expectTypeOf(wfEx.start(f, { x: 1 })).toEqualTypeOf<Promise<RunId>>();
+  });
+
+  it("accepts (flow, input, { runId })", () => {
+    const f = flow({
+      id: "sig-with-opts",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+    const id = "run-supplied" as RunId;
+    expectTypeOf(wfEx.start(f, { x: 1 }, { runId: id })).toEqualTypeOf<
+      Promise<RunId>
+    >();
+  });
+
+  it("opts.runId must be a RunId (branded string), not a raw string", () => {
+    const f = flow({
+      id: "sig-brand",
+      input: passthroughSchema<{ x: number }>(),
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+    // @ts-expect-error — RunId is branded; a raw string literal isn't assignable.
+    void wfEx.start(f, { x: 1 }, { runId: "raw-string" });
   });
 });
 

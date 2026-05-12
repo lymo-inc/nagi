@@ -1,11 +1,19 @@
-import { getDef, readSelectedArm, resolveNeeds, type StepDef } from "./internal";
+import {
+  getDef,
+  readSelectedArm,
+  resolveNeeds,
+  type StepDef,
+} from "./internal";
 import type { Flow, Json, RunState, StepState } from "./types";
 
 export type SkipReason = "when-false" | "transitive";
 
 export interface ScheduleDecision {
   readonly runnable: readonly string[];
-  readonly skip: ReadonlyArray<{ readonly stepId: string; readonly reason: SkipReason }>;
+  readonly skip: ReadonlyArray<{
+    readonly stepId: string;
+    readonly reason: SkipReason;
+  }>;
 }
 
 export interface ScheduleArgs {
@@ -46,7 +54,10 @@ export function nextRunnable(args: ScheduleArgs): ScheduleDecision {
 
     const when = def.kind === "match" ? undefined : def.when;
     if (when) {
-      const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
+      const needs = resolveNeeds(
+        def,
+        (id) => runState.steps[id]?.output ?? null,
+      );
       const shouldRun = when({ input, needs });
       if (!shouldRun) {
         skip.push({ stepId, reason: "when-false" });
@@ -75,7 +86,10 @@ function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
     const upstreamState = runState.steps[upstream.id];
     if (upstreamState === undefined) return "blocked";
     if (upstreamState.status === "completed") continue;
-    if (upstreamState.status === "skipped" || upstreamState.status === "failed") {
+    if (
+      upstreamState.status === "skipped" ||
+      upstreamState.status === "failed"
+    ) {
       return "transitive-skip";
     }
     return "blocked";
@@ -108,7 +122,10 @@ function checkParentMatch(def: StepDef, runState: RunState): UpstreamStatus {
 
 export type MatchAggregation =
   | { readonly kind: "pending" }
-  | { readonly kind: "complete"; readonly output: Readonly<Record<string, Json>> }
+  | {
+      readonly kind: "complete";
+      readonly output: Readonly<Record<string, Json>>;
+    }
   | { readonly kind: "fail-fast"; readonly failedStepId: string };
 
 /**
@@ -139,7 +156,9 @@ export function aggregateMatch(
   if (selected === null) return { kind: "pending" };
 
   const arm =
-    def.mode === "discriminator" ? def.arms[selected] : def.arms.find((a) => a.id === selected);
+    def.mode === "discriminator"
+      ? def.arms[selected]
+      : def.arms.find((a) => a.id === selected);
   if (!arm) return { kind: "pending" };
 
   const output: Record<string, Json> = {};
@@ -148,15 +167,22 @@ export function aggregateMatch(
 
   for (const stepId of arm.stepIds) {
     const state: StepState | undefined = runState.steps[stepId];
-    if (state === undefined || state.status === "pending" || state.status === "running") {
+    if (
+      state === undefined ||
+      state.status === "pending" ||
+      state.status === "running"
+    ) {
       allTerminal = false;
       continue;
     }
     if (state.status === "failed") {
       return { kind: "fail-fast", failedStepId: stepId };
     }
-    const localKey = stepId.startsWith(stripPrefix) ? stepId.slice(stripPrefix.length) : stepId;
-    output[localKey] = state.status === "completed" ? (state.output ?? null) : null;
+    const localKey = stepId.startsWith(stripPrefix)
+      ? stepId.slice(stripPrefix.length)
+      : stepId;
+    output[localKey] =
+      state.status === "completed" ? (state.output ?? null) : null;
   }
 
   if (!allTerminal) return { kind: "pending" };
@@ -173,12 +199,19 @@ export interface FlowTermination {
  * `failed` ⇔ at least one step failed terminally.
  * The runtime appends `flow.completed` (or `flow.failed`) once `done`.
  */
-export function flowTermination(flow: Flow, runState: RunState): FlowTermination {
+export function flowTermination(
+  flow: Flow,
+  runState: RunState,
+): FlowTermination {
   let done = true;
   let failed = false;
   for (const stepId of Object.keys(flow.steps)) {
     const state: StepState | undefined = runState.steps[stepId];
-    if (state === undefined || state.status === "pending" || state.status === "running") {
+    if (
+      state === undefined ||
+      state.status === "pending" ||
+      state.status === "running"
+    ) {
       done = false;
       break;
     }
@@ -186,7 +219,6 @@ export function flowTermination(flow: Flow, runState: RunState): FlowTermination
   }
   return { done, failed };
 }
-
 
 /**
  * The flow input is persisted in the `flow.started` fact. Extracted on every
@@ -196,5 +228,7 @@ export function extractInput(runState: RunState): Json {
   for (const fact of runState.facts) {
     if (fact.kind === "flow.started") return fact.input;
   }
-  throw new Error("No flow.started fact in run — was the run initialized via wf.start?");
+  throw new Error(
+    "No flow.started fact in run — was the run initialized via wf.start?",
+  );
 }

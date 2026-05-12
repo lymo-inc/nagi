@@ -3,6 +3,7 @@ import type {
   ClaimToken,
   Clock,
   Fact,
+  FlowStartedFact,
   Json,
   Millis,
   Queue,
@@ -50,6 +51,21 @@ export class InMemoryStore implements Store {
     this.facts.set(runId, list);
   }
 
+  async tryStartRun(
+    runId: RunId,
+    fact: FlowStartedFact,
+  ): Promise<{ readonly started: boolean }> {
+    // Single-process JS is cooperatively single-threaded between awaits, so
+    // this `has` + `set` pair is atomic with respect to any other call into
+    // this Store. No locking primitive needed; the Postgres adapter is where
+    // real cross-process race safety lives.
+    if (this.facts.has(runId)) {
+      return { started: false };
+    }
+    this.facts.set(runId, [fact]);
+    return { started: true };
+  }
+
   async loadRunState(runId: RunId): Promise<RunState> {
     return projectRunState(runId, this.facts.get(runId) ?? []);
   }
@@ -70,12 +86,22 @@ export class InMemoryStore implements Store {
     return token;
   }
 
-  async completeStep(runId: RunId, stepId: StepId, output: Json, fact: Fact): Promise<void> {
+  async completeStep(
+    runId: RunId,
+    stepId: StepId,
+    output: Json,
+    fact: Fact,
+  ): Promise<void> {
     this.outputs.set(`${runId}::${stepId}`, output);
     await this.appendFact(runId, fact);
   }
 
-  async failStep(runId: RunId, _stepId: StepId, _error: SerializedError, fact: Fact): Promise<void> {
+  async failStep(
+    runId: RunId,
+    _stepId: StepId,
+    _error: SerializedError,
+    fact: Fact,
+  ): Promise<void> {
     await this.appendFact(runId, fact);
   }
 
@@ -83,11 +109,20 @@ export class InMemoryStore implements Store {
     return this.outputs.get(`${runId}::${stepId}`) ?? null;
   }
 
-  async recordOnce(runId: RunId, stepId: StepId, scope: string, value: Json): Promise<void> {
+  async recordOnce(
+    runId: RunId,
+    stepId: StepId,
+    scope: string,
+    value: Json,
+  ): Promise<void> {
     this.onces.set(`${runId}::${stepId}::${scope}`, value);
   }
 
-  async getOnce(runId: RunId, stepId: StepId, scope: string): Promise<Json | null> {
+  async getOnce(
+    runId: RunId,
+    stepId: StepId,
+    scope: string,
+  ): Promise<Json | null> {
     return this.onces.get(`${runId}::${stepId}::${scope}`) ?? null;
   }
 
@@ -115,7 +150,10 @@ export class InMemoryStore implements Store {
  * (e.g. `@nagi-js/postgres`) can re-use the same projection rules — keeping
  * one canonical definition of "what does the fact log mean".
  */
-export function projectRunState(runId: RunId, facts: readonly Fact[]): RunState {
+export function projectRunState(
+  runId: RunId,
+  facts: readonly Fact[],
+): RunState {
   let flowId = "";
   let status: RunStatus = "pending";
   const steps: Record<string, StepState> = {};
@@ -195,7 +233,11 @@ export class InMemoryQueue implements Queue {
     this.leaseMs = opts.leaseMs ?? DEFAULT_QUEUE_LEASE_MS;
   }
 
-  async enqueue(runId: RunId, stepId: StepId, opts?: QueueEnqueueOpts): Promise<void> {
+  async enqueue(
+    runId: RunId,
+    stepId: StepId,
+    opts?: QueueEnqueueOpts,
+  ): Promise<void> {
     const now = Date.now();
     const item: QueuedItem = {
       receipt: crypto.randomUUID(),
@@ -212,7 +254,11 @@ export class InMemoryQueue implements Queue {
   async dequeue(opts: QueueDequeueOpts): Promise<readonly QueueMessage[]> {
     const now = Date.now();
     const claimed: QueueMessage[] = [];
-    for (let i = 0; i < this.pending.length && claimed.length < opts.count; i++) {
+    for (
+      let i = 0;
+      i < this.pending.length && claimed.length < opts.count;
+      i++
+    ) {
       const item = this.pending[i];
       if (item === undefined) continue;
       if (item.visibleAt > now) continue;

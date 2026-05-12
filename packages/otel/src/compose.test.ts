@@ -1,4 +1,9 @@
-import type { FlowHooks, FlowStartEvent, RunId, StepStartEvent } from "@nagi-js/core";
+import type {
+  FlowHooks,
+  FlowStartEvent,
+  RunId,
+  StepStartEvent,
+} from "@nagi-js/core";
 import { describe, expect, it, vi } from "vitest";
 import { composeHooks } from "./compose";
 
@@ -16,6 +21,7 @@ const stepStartEvent: StepStartEvent = {
   stepId: "stepA",
   attempt: 1,
   kind: "task",
+  input: null,
 };
 
 describe("composeHooks", () => {
@@ -69,7 +75,9 @@ describe("composeHooks", () => {
     };
     const c: FlowHooks = { onFlowStart: () => void calls.push("c") };
     const composed = composeHooks(a, b, c);
-    await expect(composed.onFlowStart!(flowStartEvent)).resolves.toBeUndefined();
+    await expect(
+      composed.onFlowStart!(flowStartEvent),
+    ).resolves.toBeUndefined();
     expect(calls).toEqual(["a", "c"]);
     expect(spy).toHaveBeenCalledOnce();
     spy.mockRestore();
