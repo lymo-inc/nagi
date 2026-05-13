@@ -1,7 +1,7 @@
 {
   "name": "nagi-monorepo",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.0.1-rc.0",
   "description": "Type-safe declarative workflow library for TypeScript.",
   "license": "MIT",
   "type": "module",
