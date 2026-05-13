@@ -5,6 +5,22 @@
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
+  "keywords": [
+    "nagi",
+    "workflow",
+    "postgres",
+    "kysely",
+    "durable",
+    "store",
+    "adapter"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": false
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -23,7 +39,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:types": "vitest run --typecheck",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm run build"
   },
   "dependencies": {
     "@nagi-js/core": "workspace:*"

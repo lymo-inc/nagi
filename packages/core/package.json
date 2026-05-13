@@ -5,6 +5,23 @@
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
+  "keywords": [
+    "workflow",
+    "durable",
+    "llm",
+    "typescript",
+    "type-safe",
+    "declarative",
+    "step-functions",
+    "orchestration"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": false
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -23,7 +40,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:types": "vitest run --typecheck",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm run build"
   },
   "repository": {
     "type": "git",

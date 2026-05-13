@@ -19,9 +19,12 @@
     "format": "biome format --write .",
     "db:up": "docker compose -f docker-compose.test.yml up -d --wait",
     "db:down": "docker compose -f docker-compose.test.yml down -v",
+    "verify": "pnpm -r build && pnpm verify:publint && pnpm verify:attw",
+    "verify:publint": "pnpm -r --parallel exec publint",
+    "verify:attw": "pnpm -r --parallel exec attw --pack . --profile esm-only",
     "changeset": "changeset",
     "version": "changeset version",
-    "release": "pnpm -r build && changeset publish"
+    "release": "pnpm verify && changeset publish"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.17.4",
