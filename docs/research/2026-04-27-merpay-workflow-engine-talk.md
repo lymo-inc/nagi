@@ -170,25 +170,27 @@ This is the part of the doc that only Jay can author. The talk gives us nine can
 - **Already shipped** — Nagi has this
 
 ```
-| # | Idea                                          | Verdict       | One-line rationale |
-|---|-----------------------------------------------|---------------|--------------------|
-| 1 | Persist step I/O, return on retry             | Already shipped | `once()` covers this; step-level not effect-level — open question whether that gap matters |
-| 2 | Error taxonomy (Completable/Retryable/Incomp.) | TODO          | TODO |
-| 3 | Recovery sweeper as the durability primitive  | TODO          | TODO |
-| 4 | Saga DSL with compensations                   | TODO          | TODO |
-| 5 | Signal for human-in-the-loop                  | Already shipped | `b.signal` already exists |
-| 6 | Fire-and-forget child workflow                | TODO          | TODO |
-| 7 | Determinism rules + lint (LLM-augmented?)     | TODO          | TODO |
-| 8 | Store-agnostic core (SQLite/MySQL adapters)   | TODO          | TODO |
-| 9 | AI-as-community (docs MCP, examples corpus)   | TODO          | TODO |
+| # | Idea                                          | Verdict           | One-line rationale |
+|---|-----------------------------------------------|-------------------|--------------------|
+| 1 | Persist step I/O, return on retry             | Already shipped   | `once()` covers this; step-level not effect-level — open question whether that gap matters |
+| 2 | Error taxonomy (Completable/Retryable/Incomp.) | Endorsed (Jay)   | "Powerful concept we haven't thought of." Specific verdict (Adopt-now vs Adopt-later) and breaking-change timing — TODO |
+| 3 | Recovery sweeper as the **durability primitive** | Reject          | Recovery-by-sweep is "self-healing" not "unrepresentable"; §0 bar not met. The real fix is §6.2 same-tx ack. Sweeper remains acceptable as a *fallback* for non-co-located queue topologies (G7), not as the default mechanism |
+| 3' | Same-transaction ack (§6.2 / G1)              | TODO              | Construction-level replacement for idea 3. Likely Adopt-now under the §0 lens, but Jay decides |
+| 4 | Saga DSL with compensations                   | TODO              | TODO |
+| 5 | Signal for human-in-the-loop                  | Already shipped   | `b.signal` already exists |
+| 6 | Fire-and-forget child workflow                | TODO              | TODO |
+| 7 | Determinism rules + lint (LLM-augmented?)     | TODO              | TODO. Under §0, prefer the type-level variant in G6 (branded `Deterministic<T>`) over a pure-runtime lint — the lint becomes the diagnostic, not the enforcement |
+| 8 | Store-agnostic core (SQLite/MySQL adapters)   | TODO              | TODO |
+| 9 | AI-as-community (docs MCP, examples corpus)   | TODO              | TODO |
+| 10 | "Default = do not finalise" semantic (G3)    | Endorsed (Jay)   | Adopted in principle 2026-05-14. Specific landing — TODO |
 ```
 
 Sketch of how each verdict shapes the next ~quarter:
 
-- If **G1 / idea 3 = Adopt-now**, it unblocks production claims (no silent stuck runs). It's also the smallest of the open gaps.
-- If **G2+G3 / idea 2 = Adopt-now**, it's a public-API breaking change — wants a major bump and a migration note. Worth bundling with the next deliberate API revision.
+- If **G1 / idea 3' = Adopt-now**, it's the smallest surgery (one tx scope change in `dispatch.ts`) and eliminates a real divergence window. Highest leverage-to-effort ratio in the table.
+- **G2 + G3 / ideas 2 and 10** are now both endorsed — together they amount to a deliberate "error model" RFC. It's a public-API breaking change — wants a major bump and a migration note. Worth bundling.
 - If **idea 4 (Saga) = Reject**, that's a meaningful scope statement worth making explicit: Nagi handles step-level idempotency but compensations are the caller's job. Cleanly defensible given the "LLM backend" framing — most LLM steps are read-only or already idempotent via `once()`.
-- If **idea 7 (LLM lint) = Adopt-now**, it's a strong differentiator vs. Inngest/Trigger.dev. Idiosyncratic to Nagi's audience.
+- If **idea 7 (lint) = Adopt-now**, prefer the type-level form (branded `Deterministic<T>` on handler parameters, so non-determinism fails to typecheck). The ESLint rules become a diagnostic layer for the cases the type system can't catch — closer to the §0 lens than a pure-runtime check.
 
 ---
 
@@ -196,11 +198,13 @@ Sketch of how each verdict shapes the next ~quarter:
 
 1. **Step-level vs effect-level memoisation.** Merpay memoises whole Activities; Nagi memoises *named effects* inside a step via `once(scope, fn)`. The latter is finer-grained (you can do multiple `once()`s per step) but requires the user to name each effect. Is this strictly better, or does a step-level default-on memoise reduce the user's surface area? Worth deciding before publicising a 1.0 API.
 
-2. **Where does the Recovery Worker live?** Three options: (a) a separate exported `makeSweeper()` the user opts into; (b) folded into `makeWorker()` so every worker process sweeps periodically; (c) a sidecar binary. The talk picks (a) implicitly. (b) lowers operator load.
+2. **Blessed topology declaration.** §6.3 implies PGMQ-with-Postgres is the only topology that meets the §0 bar. Should the README/docs call it out as the recommended path and treat external queues (SQS, Redis) as opt-in with documented divergence windows — or keep adapter parity and pay the sweeper tax everywhere?
 
-3. **Does Nagi want a `Completable` error type, or a `Result`-typed step return?** The talk's `ErrorMarshaler` is awkward in idiomatic TS. A `Result<Ok, Err>` return type from step handlers is more natural — but breaks the symmetry with `throw` for unexpected errors. Worth a small spike before RFC.
+3. **`Completable` as a sum-type return, not a thrown error.** The talk's `ErrorMarshaler` is awkward in idiomatic TS, and a thrown error is structurally the "I don't know what happened" path — exactly the kind of state §0 wants narrowed. A `Result<Ok, Completable | Retryable>` return type makes the handler's intent typecheck-enforced, with `throw` reserved for genuinely unknown errors that default-to-Incompletable. Worth a small spike before any RFC on G2/G3.
 
-4. **Versioning narrative.** Nagi has snapshot+drift; the talk has nothing. This is a story worth telling in the README — but only Jay writes the README.
+4. **Branded `Deterministic<T>` for handler inputs.** If step-handler arguments were typed `Deterministic<Input>` (a branded wrapper opaque to the user), then `Date.now()`, `Math.random()`, and untyped externals could only enter the handler via an explicit `unsafeFromNonDeterministic(...)` boundary. That makes the lint G6 fall out of the type system instead of needing a separate static analysis pass. Cost: ergonomic friction at the call site; benefit: full §0 coverage on the determinism question.
+
+5. **Versioning narrative.** Nagi has snapshot+drift; the talk has nothing. This is a story worth telling in the README — but only Jay writes the README.
 
 ---
 
