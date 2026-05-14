@@ -1,5 +1,6 @@
 import {
   attachDef,
+  attachDefMut,
   type DiscriminatorMatchDef,
   type GuardMatchDef,
   type MatchArmDef,
@@ -10,6 +11,7 @@ import {
   type TaskDef,
 } from "./internal";
 import type {
+  AsStepMap,
   Builder,
   Flow,
   FlowConfig,
@@ -20,10 +22,38 @@ import type {
   NeedsMap,
   SignalConfig,
   StandardSchemaV1,
+  StepEntryConfig,
   Step,
   StepMap,
   TaskConfig,
 } from "./types";
+
+/**
+ * Marker stamped on every Builder instance so `flow()` (and match-case
+ * extraction) can distinguish a chain return from a plain `StepMap`.
+ */
+const BUILDER_BRAND = Symbol.for("nagi.builder");
+
+interface BuilderInternal {
+  readonly [BUILDER_BRAND]: true;
+  readonly __steps: Map<string, Step<unknown>>;
+}
+
+function isBuilder(value: unknown): value is BuilderInternal {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as { [BUILDER_BRAND]?: unknown })[BUILDER_BRAND] === true
+  );
+}
+
+/** Resolve a build-callback result (Builder | StepMap) to a plain StepMap. */
+function resolveBuildResult(value: unknown): StepMap {
+  if (isBuilder(value)) {
+    return Object.fromEntries(value.__steps) as StepMap;
+  }
+  return value as StepMap;
+}
 
 function isDiscriminator(
   config: object,
@@ -37,6 +67,11 @@ function isDiscriminator(
 }
 
 function makeBuilder<Input>(): Builder<Input> {
+  // Chain accumulator. Each `.step()` / `.include()` call writes here so the
+  // build callback can return the builder directly and `flow()` can read the
+  // assembled StepMap.
+  const chainSteps = new Map<string, Step<unknown>>();
+
   function task<N extends NeedsMap, O>(
     config: TaskConfig<Input, N, O>,
   ): Step<O> {
@@ -44,7 +79,7 @@ function makeBuilder<Input>(): Builder<Input> {
       kind: "task",
       needs: (config.needs ?? {}) as NeedsMap,
       ...(config.retry !== undefined ? { retry: config.retry } : {}),
-      ...(config.timeout !== undefined ? { timeout: config.timeout } : {}),
+      ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
       ...(config.when !== undefined
         ? {
             when: config.when as (args: {
@@ -65,7 +100,7 @@ function makeBuilder<Input>(): Builder<Input> {
       kind: "signal",
       needs: (config.needs ?? {}) as NeedsMap,
       schema: config.schema,
-      ...(config.timeout !== undefined ? { timeout: config.timeout } : {}),
+      ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
       ...(config.when !== undefined
         ? {
             when: config.when as (args: {
@@ -87,8 +122,8 @@ function makeBuilder<Input>(): Builder<Input> {
     if (isDiscriminator(config)) {
       const arms: Record<string, MatchArmDef> = {};
       for (const [caseKey, build] of Object.entries(config.cases)) {
-        const nested = (build as (b: Builder<Input>) => StepMap)(
-          makeBuilder<Input>(),
+        const nested = resolveBuildResult(
+          (build as (b: Builder<Input>) => unknown)(makeBuilder<Input>()),
         );
         arms[caseKey] = { id: caseKey, stepIds: [], _nested: nested };
       }
@@ -106,7 +141,7 @@ function makeBuilder<Input>(): Builder<Input> {
     const arms: MatchArmDef[] = [];
     for (let i = 0; i < guardConfig.arms.length; i++) {
       const arm = guardConfig.arms[i] as MatchArm<Input, NeedsMap, StepMap>;
-      const nested = arm.build(makeBuilder<Input>());
+      const nested = resolveBuildResult(arm.build(makeBuilder<Input>()));
       const armId = arm.otherwise ? "otherwise" : `arm${i}`;
       arms.push({
         id: armId,
@@ -132,7 +167,91 @@ function makeBuilder<Input>(): Builder<Input> {
     return attachDef<unknown>({ kind: "match", id: "" }, def);
   }
 
-  return { task, signal, match: match as Builder<Input>["match"] };
+  /**
+   * Chainable task entry. Pre-allocates a `Step` shell so sibling `needs`
+   * keys can hold a stable object reference, then immediately stamps the
+   * built `TaskDef` onto the shell. The shell is registered in the chain
+   * accumulator so subsequent `.step()` calls can resolve sibling refs.
+   */
+  function step(
+    key: string,
+    config: StepEntryConfig<
+      Input,
+      Record<string, unknown>,
+      ReadonlyArray<string>,
+      unknown
+    >,
+  ): Builder<Input, Record<string, unknown>> {
+    if (chainSteps.has(key)) {
+      throw new Error(
+        `b.step: duplicate key "${key}" — each chain entry must have a unique key.`,
+      );
+    }
+    const shell: Step<unknown> = { kind: "task", id: "" };
+    const needs: Record<string, Step<unknown>> = {};
+    if (config.needs) {
+      for (const sibKey of config.needs) {
+        const sibling = chainSteps.get(sibKey);
+        if (sibling === undefined) {
+          throw new Error(
+            `b.step("${key}"): unknown sibling "${sibKey}". ` +
+              `Available keys so far: ${[...chainSteps.keys()].join(", ") || "<none>"}.`,
+          );
+        }
+        needs[sibKey] = sibling;
+      }
+    }
+    const def: TaskDef = {
+      kind: "task",
+      needs,
+      ...(config.retry !== undefined ? { retry: config.retry } : {}),
+      ...(config.timeoutMs !== undefined
+        ? { timeoutMs: config.timeoutMs }
+        : {}),
+      ...(config.when !== undefined
+        ? {
+            when: config.when as (args: {
+              input: unknown;
+              needs: Record<string, unknown>;
+            }) => boolean,
+          }
+        : {}),
+      run: config.run as TaskDef["run"],
+    };
+    attachDefMut(shell, def);
+    chainSteps.set(key, shell);
+    return builder as Builder<Input, Record<string, unknown>>;
+  }
+
+  /**
+   * Bring a pre-built `Step` (from `b.task` / `b.signal` / `b.match`) into
+   * the chain under a key. The step's def is already attached; we only
+   * register the identity in the accumulator.
+   */
+  function include(
+    key: string,
+    s: Step<unknown>,
+  ): Builder<Input, Record<string, unknown>> {
+    if (chainSteps.has(key)) {
+      throw new Error(
+        `b.include: duplicate key "${key}" — each chain entry must have a unique key.`,
+      );
+    }
+    chainSteps.set(key, s);
+    return builder as Builder<Input, Record<string, unknown>>;
+  }
+
+  const builder = {
+    task,
+    signal,
+    match: match as Builder<Input>["match"],
+    step: step as Builder<Input>["step"],
+    include: include as Builder<Input>["include"],
+    [BUILDER_BRAND]: true as const,
+    __steps: chainSteps,
+  } as Builder<Input> & BuilderInternal;
+
+  return builder;
 }
 
 /**
@@ -154,13 +273,13 @@ function makeBuilder<Input>(): Builder<Input> {
 export function flow<
   const Id extends string,
   InputSchema extends StandardSchemaV1,
-  M extends StepMap,
+  R,
   Output = unknown,
 >(
-  config: FlowConfig<Id, InputSchema, M, Output>,
-): Flow<Id, InputSchema, M, Output> {
+  config: FlowConfig<Id, InputSchema, R, Output>,
+): Flow<Id, InputSchema, AsStepMap<R>, Output> {
   const builder = makeBuilder<InferSchemaOutput<InputSchema>>();
-  const built = config.build(builder);
+  const built = resolveBuildResult(config.build(builder));
 
   const idByIdentity = new Map<Step<unknown>, string>();
   collectIds(built, "", idByIdentity);
@@ -178,7 +297,7 @@ export function flow<
   return {
     id: config.id,
     input: config.input,
-    steps: finalSteps as M,
+    steps: finalSteps as AsStepMap<R>,
     ...(config.output !== undefined ? { output: config.output } : {}),
   };
 }

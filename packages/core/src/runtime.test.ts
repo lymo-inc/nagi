@@ -139,7 +139,7 @@ describe("e2e: signal full loop", () => {
       },
     });
 
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const w = h.startWorker();
     try {
       const runId = await h.wf.start(f, { subject: "hi" });
@@ -167,7 +167,7 @@ describe("start: caller-supplied runId", () => {
 
   it("uses the supplied runId when no run exists yet", async () => {
     const f = trivialFlow();
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const w = h.startWorker();
     try {
       const supplied = "run-deterministic-abc" as RunId;
@@ -182,7 +182,7 @@ describe("start: caller-supplied runId", () => {
 
   it("mints a fresh runId when opts is omitted (back-compat)", async () => {
     const f = trivialFlow();
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const w = h.startWorker();
     try {
       const runId = await h.wf.start(f, { x: 1 });
@@ -195,7 +195,7 @@ describe("start: caller-supplied runId", () => {
 
   it("is an idempotent no-op when the same runId is supplied twice", async () => {
     const f = trivialFlow();
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
 
     const supplied = "run-idem-xyz" as RunId;
     const first = await h.wf.start(f, { x: 7 }, { runId: supplied });
@@ -226,7 +226,7 @@ describe("start: caller-supplied runId", () => {
 
   it("rejects an empty-string runId with NagiValidationError", async () => {
     const f = trivialFlow();
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     await expect(
       h.wf.start(f, { x: 1 }, { runId: "" as RunId }),
     ).rejects.toBeInstanceOf(NagiValidationError);
@@ -234,11 +234,91 @@ describe("start: caller-supplied runId", () => {
 
   it("rejects a non-string runId with NagiValidationError", async () => {
     const f = trivialFlow();
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     await expect(
       // Force an invalid type past the compile-time check.
       h.wf.start(f, { x: 1 }, { runId: 123 as unknown as RunId }),
     ).rejects.toBeInstanceOf(NagiValidationError);
+  });
+});
+
+describe("e2e: b.step chain parity (RFC 0002)", () => {
+  it("linear chain runs identically when authored via b.step()", async () => {
+    const f = flow({
+      id: "step-linear",
+      input: passthroughSchema<{ start: number }>(),
+      build: (b) =>
+        b
+          .step("a", {
+            run: async ({ input }) => ({ doubled: input.start * 2 }),
+          })
+          .step("c", {
+            needs: ["a"],
+            run: async ({ needs }) => ({ plusTen: needs.a.doubled + 10 }),
+          }),
+    });
+
+    const result = await runFlow(f, { start: 5 });
+    expect(result.status).toBe("completed");
+    expect(result.output("a")).toEqual({ doubled: 10 });
+    expect(result.output("c")).toEqual({ plusTen: 20 });
+  });
+
+  it("when:false skip cascade works via b.step()", async () => {
+    const f = flow({
+      id: "step-skip",
+      input: passthroughSchema<{ enable: boolean }>(),
+      build: (b) =>
+        b
+          .step("gate", {
+            run: async ({ input }) => ({ enabled: input.enable }),
+          })
+          .step("branch", {
+            needs: ["gate"],
+            when: ({ needs }) => needs.gate.enabled,
+            run: async () => ({ ran: true }),
+          })
+          .step("after", {
+            needs: ["branch"],
+            run: async () => ({ ran: true }),
+          }),
+    });
+
+    const result = await runFlow(f, { enable: false });
+    expect(result.stepStatus("gate")).toBe("completed");
+    expect(result.stepStatus("branch")).toBe("skipped");
+    expect(result.stepStatus("after")).toBe("skipped");
+
+    const skips = result.factsOf("step.skipped");
+    expect(skips.find((s) => s.stepId === "branch")?.reason).toBe("when-false");
+    expect(skips.find((s) => s.stepId === "after")?.reason).toBe("transitive");
+  });
+
+  it("retry policy on a b.step entry is wired to dispatch", async () => {
+    let attempts = 0;
+    const f = flow({
+      id: "step-retry",
+      input: emptySchema(),
+      build: (b) =>
+        b.step("flaky", {
+          retry: {
+            maxAttempts: 3,
+            backoff: "exponential",
+            initialDelayMs: 10,
+            maxDelayMs: 50,
+          },
+          run: async () => {
+            attempts++;
+            if (attempts < 3) throw new Error(`fail ${attempts}`);
+            return { attempts };
+          },
+        }),
+    });
+
+    const result = await runFlow(f, {});
+    expect(attempts).toBe(3);
+    expect(result.output("flaky")).toEqual({ attempts: 3 });
+    expect(result.factCount("step.retried")).toBe(2);
   });
 });
 

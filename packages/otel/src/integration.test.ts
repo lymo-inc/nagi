@@ -84,7 +84,7 @@ describe("@nagi-js/otel — end-to-end against a real nagi runtime", () => {
     });
 
     const store = new InMemoryStore();
-    const wf = nagi({
+    const wf = await nagi({
       store,
       queue: new InMemoryQueue(),
       clock: new InMemoryClock(),

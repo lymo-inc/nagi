@@ -26,7 +26,7 @@ export interface TaskDef {
   readonly kind: "task";
   readonly needs: NeedsMap;
   readonly retry?: RetryPolicy;
-  readonly timeout?: Millis;
+  readonly timeoutMs?: Millis;
   readonly when?: (args: {
     input: unknown;
     needs: Record<string, unknown>;
@@ -43,7 +43,7 @@ export interface SignalDef {
   readonly kind: "signal";
   readonly needs: NeedsMap;
   readonly schema: StandardSchemaV1;
-  readonly timeout?: Millis;
+  readonly timeoutMs?: Millis;
   readonly when?: (args: {
     input: unknown;
     needs: Record<string, unknown>;
@@ -107,6 +107,16 @@ export function attachDef<Output>(
   def: StepDef,
 ): StepWithDef<Output> {
   return { kind: meta.kind, id: meta.id, [DEF]: def };
+}
+
+/**
+ * In-place def attachment for the `b.steps()` two-phase build. Phase 1
+ * allocates a placeholder `Step` so sibling `needs` can hold a stable object
+ * reference; phase 2 builds the def (whose `needs` map points to those same
+ * shells) and stamps it onto the shell here.
+ */
+export function attachDefMut(step: Step<unknown>, def: StepDef): void {
+  (step as unknown as { [DEF]: StepDef })[DEF] = def;
 }
 
 export function getDef(step: Step<unknown>): StepDef {

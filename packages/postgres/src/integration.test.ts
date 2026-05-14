@@ -47,7 +47,9 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     await db.destroy();
   }, 30_000);
 
-  function makeNagi(...flows: Parameters<typeof nagi>[0]["flows"]): Wf {
+  async function makeNagi(
+    ...flows: Parameters<typeof nagi>[0]["flows"]
+  ): Promise<Wf> {
     return nagi({
       store: postgresStore({ db, schema }),
       queue: new InMemoryQueue(),
@@ -88,7 +90,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       },
     });
 
-    const wf = makeNagi(f);
+    const wf = await makeNagi(f);
     const runId = await wf.start(f, { x: 21 });
     await runToEnd(wf, runId);
 
@@ -111,7 +113,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       }),
     });
 
-    const wf = makeNagi(f);
+    const wf = await makeNagi(f);
     const runId = await wf.start(f, {});
     await runToEnd(wf, runId);
 
@@ -167,7 +169,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       },
     });
 
-    const wf = makeNagi(f);
+    const wf = await makeNagi(f);
     const supplied = `run-${uuidv7()}` as RunId;
 
     // Fire two concurrent start() calls. The Postgres ON CONFLICT DO NOTHING
@@ -214,7 +216,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       }),
     });
 
-    const wf = makeNagi(f);
+    const wf = await makeNagi(f);
     const supplied = `run-${uuidv7()}` as RunId;
 
     const first = await wf.start(f, { x: 1 }, { runId: supplied });

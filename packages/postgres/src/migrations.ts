@@ -87,6 +87,41 @@ export const migrations: readonly Migration[] = [
       );
     `,
   },
+  {
+    id: "0002_snapshot_tables",
+    sql: (schema) => `
+      CREATE TABLE IF NOT EXISTS ${schema}.flow_snapshot (
+        flow_hash   text        PRIMARY KEY,
+        flow_id     text        NOT NULL,
+        dag         jsonb       NOT NULL,
+        recorded_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS flow_snapshot_by_id_idx
+        ON ${schema}.flow_snapshot (flow_id, recorded_at DESC);
+
+      CREATE TABLE IF NOT EXISTS ${schema}.flow_ref (
+        flow_id    text        PRIMARY KEY,
+        flow_hash  text        NOT NULL REFERENCES ${schema}.flow_snapshot(flow_hash),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS ${schema}.global_fact (
+        fact_id text        PRIMARY KEY,
+        kind    text        NOT NULL,
+        at      timestamptz NOT NULL,
+        payload jsonb       NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS global_fact_kind_idx
+        ON ${schema}.global_fact (kind, at DESC);
+
+      ALTER TABLE ${schema}.workflow_run
+        ADD COLUMN IF NOT EXISTS flow_hash    text REFERENCES ${schema}.flow_snapshot(flow_hash);
+      ALTER TABLE ${schema}.workflow_run
+        ADD COLUMN IF NOT EXISTS code_version text;
+      CREATE INDEX IF NOT EXISTS workflow_run_flow_hash_idx
+        ON ${schema}.workflow_run (flow_hash);
+    `,
+  },
 ];
 
 export interface MigrateOpts {

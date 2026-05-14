@@ -32,19 +32,34 @@ describe("migrations", () => {
   });
 
   it("emits IF NOT EXISTS for every table — migrations are idempotent on partial runs", () => {
-    const sql = (migrations[0] as { sql: (schema: string) => string }).sql(
-      "nagi",
+    const totalTables = migrations.reduce(
+      (n, m) =>
+        n + (m.sql("nagi").match(/CREATE TABLE IF NOT EXISTS/g) ?? []).length,
+      0,
     );
-    const tableCount = (sql.match(/CREATE TABLE IF NOT EXISTS/g) ?? []).length;
-    expect(tableCount).toBeGreaterThanOrEqual(6);
+    expect(totalTables).toBeGreaterThanOrEqual(6);
   });
 
   it("declares all PKs (no missing PRIMARY KEY)", () => {
-    const sql = (migrations[0] as { sql: (schema: string) => string }).sql(
-      "nagi",
+    const totalPks = migrations.reduce(
+      (n, m) => n + (m.sql("nagi").match(/PRIMARY KEY/g) ?? []).length,
+      0,
     );
-    // 6 tables, each with one PRIMARY KEY declaration (either inline or composite).
-    const pkCount = (sql.match(/PRIMARY KEY/g) ?? []).length;
-    expect(pkCount).toBeGreaterThanOrEqual(6);
+    // Original 6 tables + flow_snapshot + flow_ref + global_fact.
+    expect(totalPks).toBeGreaterThanOrEqual(6);
+  });
+
+  it("0002_snapshot_tables adds snapshot store DDL", () => {
+    const m = migrations.find((x) => x.id === "0002_snapshot_tables");
+    expect(m).toBeDefined();
+    const sql = (m as { sql: (schema: string) => string }).sql("custom_schema");
+    expect(sql).toContain("custom_schema.flow_snapshot");
+    expect(sql).toContain("custom_schema.flow_ref");
+    expect(sql).toContain("custom_schema.global_fact");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS flow_hash");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS code_version");
+    expect(sql).toContain(
+      "REFERENCES custom_schema.flow_snapshot(flow_hash)",
+    );
   });
 });

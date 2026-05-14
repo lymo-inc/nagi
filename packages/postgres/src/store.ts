@@ -3,6 +3,7 @@ import type {
   ClaimToken,
   Fact,
   FlowStartedFact,
+  GlobalFact,
   Json,
   Millis,
   RunId,
@@ -86,9 +87,9 @@ class PostgresStore<DB = unknown> implements Store {
     const started = await this.db.transaction().execute(async (trx) => {
       const insert = await sql<{ run_id: string }>`
         INSERT INTO ${sql.raw(this.t("workflow_run"))}
-          (run_id, flow_id, status, input, started_at)
+          (run_id, flow_id, status, input, started_at, flow_hash, code_version)
         VALUES
-          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at})
+          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null})
         ON CONFLICT (run_id) DO NOTHING
         RETURNING run_id
       `.execute(trx);
@@ -288,8 +289,10 @@ class PostgresStore<DB = unknown> implements Store {
         // directly (e.g. tests). Use DO NOTHING to preserve idempotent
         // semantics — never clobber an existing run row.
         await sql`
-          INSERT INTO ${sql.raw(this.t("workflow_run"))} (run_id, flow_id, status, input, started_at)
-          VALUES (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at})
+          INSERT INTO ${sql.raw(this.t("workflow_run"))}
+            (run_id, flow_id, status, input, started_at, flow_hash, code_version)
+          VALUES
+            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null})
           ON CONFLICT (run_id) DO NOTHING
         `.execute(trx);
         return;
@@ -393,6 +396,55 @@ class PostgresStore<DB = unknown> implements Store {
       this.db,
     );
   }
+
+  async upsertSnapshot(args: {
+    readonly flowHash: string;
+    readonly flowId: string;
+    readonly dag: Json;
+  }): Promise<void> {
+    await sql`
+      INSERT INTO ${sql.raw(this.t("flow_snapshot"))} (flow_hash, flow_id, dag)
+      VALUES (${args.flowHash}, ${args.flowId}, ${jsonb(args.dag)})
+      ON CONFLICT (flow_hash) DO NOTHING
+    `.execute(this.db);
+  }
+
+  async getRef(flowId: string): Promise<string | null> {
+    const r = await sql<{ flow_hash: string }>`
+      SELECT flow_hash
+        FROM ${sql.raw(this.t("flow_ref"))}
+       WHERE flow_id = ${flowId}
+    `.execute(this.db);
+    return r.rows[0]?.flow_hash ?? null;
+  }
+
+  async setRef(flowId: string, flowHash: string): Promise<void> {
+    await sql`
+      INSERT INTO ${sql.raw(this.t("flow_ref"))} (flow_id, flow_hash, updated_at)
+      VALUES (${flowId}, ${flowHash}, now())
+      ON CONFLICT (flow_id) DO UPDATE
+        SET flow_hash = EXCLUDED.flow_hash, updated_at = now()
+    `.execute(this.db);
+  }
+
+  async loadSnapshot(
+    flowHash: string,
+  ): Promise<{ readonly flowId: string; readonly dag: Json } | null> {
+    const r = await sql<{ flow_id: string; dag: Json }>`
+      SELECT flow_id, dag
+        FROM ${sql.raw(this.t("flow_snapshot"))}
+       WHERE flow_hash = ${flowHash}
+    `.execute(this.db);
+    const row = r.rows[0];
+    return row ? { flowId: row.flow_id, dag: row.dag } : null;
+  }
+
+  async appendGlobalFact(fact: GlobalFact): Promise<void> {
+    await sql`
+      INSERT INTO ${sql.raw(this.t("global_fact"))} (fact_id, kind, at, payload)
+      VALUES (${uuidv7()}, ${fact.kind}, ${fact.at}, ${jsonb(serializeGlobalFactPayload(fact))})
+    `.execute(this.db);
+  }
 }
 
 /**
@@ -402,6 +454,11 @@ class PostgresStore<DB = unknown> implements Store {
 function serializeFactPayload(fact: Fact): Json {
   // Strip the redundantly-stored top-level fields. `runId` is the row key.
   const { kind: _kind, at: _at, runId: _runId, ...rest } = fact;
+  return rest as unknown as Json;
+}
+
+function serializeGlobalFactPayload(fact: GlobalFact): Json {
+  const { kind: _kind, at: _at, ...rest } = fact;
   return rest as unknown as Json;
 }
 

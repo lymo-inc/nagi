@@ -47,7 +47,7 @@ describe("dispatchMessage — driver", () => {
         only: b.task({ run: async ({ input }) => ({ result: input.x + 1 }) }),
       }),
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
 
     const runId = await h.wf.start(f, { x: 41 });
     const processed = await h.drain();
@@ -71,7 +71,7 @@ describe("dispatchMessage — driver", () => {
         return { a, c };
       },
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
     expect(await h.drainOnce()).toBe(1); // dispatches `a`
@@ -99,7 +99,7 @@ describe("dispatchMessage — driver", () => {
         }),
       }),
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
     await h.drain(); // delay is 0, so all retries drain in one pass
@@ -124,7 +124,7 @@ describe("dispatchMessage — driver", () => {
         }),
       }),
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
     await h.drain();
@@ -153,7 +153,7 @@ describe("dispatchMessage — driver", () => {
         return { wait, after };
       },
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
     expect(await h.drainOnce()).toBe(1); // dispatches the signal step
@@ -186,7 +186,7 @@ describe("dispatchMessage — driver", () => {
       },
       output: ({ a, c }) => ({ start: a.doubled / 2, end: c.tripled }),
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, { x: 5 });
     await h.drain();
 
@@ -203,7 +203,7 @@ describe("dispatchMessage — driver", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({ only: b.task({ run: async () => ({ v: 1 }) }) }),
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
     await h.drain();
 
@@ -221,7 +221,7 @@ describe("dispatchMessage — driver", () => {
         only: b.task({ run: async ({ input }) => ({ echoed: input.prompt }) }),
       }),
     });
-    const h = makeHarness(f, {
+    const h = await makeHarness(f, {
       hooks: {
         onStepStart: (e) => {
           events.push(e);
@@ -248,7 +248,7 @@ describe("dispatchMessage — driver", () => {
         return { wait };
       },
     });
-    const h = makeHarness(f, {
+    const h = await makeHarness(f, {
       hooks: {
         onStepStart: (e) => {
           events.push(e);
@@ -282,7 +282,7 @@ describe("dispatchMessage — driver", () => {
         }),
       }),
     });
-    const h = makeHarness(f);
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
     await h.drain();

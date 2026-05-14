@@ -131,16 +131,16 @@ export interface Harness {
   result(runId: RunId): Promise<Result>;
 }
 
-export function makeHarness(
+export async function makeHarness(
   flows: Flow | ReadonlyArray<Flow>,
   opts?: HarnessOpts,
-): Harness {
+): Promise<Harness> {
   const flowList = Array.isArray(flows) ? flows : [flows as Flow];
   const store = new InMemoryStore();
   const queue = new InMemoryQueue();
   const clock = new InMemoryClock();
 
-  const wf = nagi({
+  const wf = await nagi({
     flows: flowList,
     store,
     queue,
@@ -177,6 +177,14 @@ export function makeHarness(
     ...(opts?.hooks !== undefined ? { hooks: opts.hooks } : {}),
   };
 
+  async function drainOnce(count = 32): Promise<number> {
+    const messages = await queue.dequeue({ count });
+    for (const msg of messages) {
+      await dispatchMessage(deps, msg);
+    }
+    return messages.length;
+  }
+
   return {
     wf,
     store,
@@ -203,19 +211,13 @@ export function makeHarness(
       };
     },
 
-    async drainOnce(count = 32) {
-      const messages = await queue.dequeue({ count });
-      for (const msg of messages) {
-        await dispatchMessage(deps, msg);
-      }
-      return messages.length;
-    },
+    drainOnce,
 
     async drain(opts) {
       const max = opts?.maxIter ?? 256;
       let total = 0;
       for (let i = 0; i < max; i++) {
-        const n = await this.drainOnce();
+        const n = await drainOnce();
         if (n === 0) return total;
         total += n;
       }
@@ -258,7 +260,7 @@ export async function runFlow<F extends Flow>(
   input: FlowInput<F>,
   opts?: HarnessOpts & { timeoutMs?: number; pollIntervalMs?: number },
 ): Promise<Result> {
-  const harness = makeHarness(flow, opts);
+  const harness = await makeHarness(flow, opts);
   const worker = harness.startWorker(
     opts?.pollIntervalMs !== undefined
       ? { pollIntervalMs: opts.pollIntervalMs }

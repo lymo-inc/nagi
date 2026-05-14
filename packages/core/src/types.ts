@@ -135,7 +135,7 @@ interface StepConfigBase<Input, N extends NeedsMap> {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<NeedsOutputs<N>>;
   }) => boolean;
-  readonly timeout?: Millis;
+  readonly timeoutMs?: Millis;
 }
 
 export interface TaskConfig<Input, N extends NeedsMap, Output>
@@ -172,7 +172,9 @@ export interface MatchDiscriminatorConfig<
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<NeedsOutputs<N>>;
   }) => D;
-  readonly cases: { readonly [K in D]: (b: Builder<Input>) => M[K] };
+  readonly cases: {
+    readonly [K in D]: (b: Builder<Input>) => BuildResult<Input, M[K]>;
+  };
 }
 
 export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {
@@ -181,13 +183,13 @@ export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {
     readonly needs: NoInfer<NeedsOutputs<N>>;
   }) => boolean;
   readonly otherwise?: never;
-  readonly build: (b: Builder<Input>) => M;
+  readonly build: (b: Builder<Input>) => BuildResult<Input, M>;
 }
 
 export interface MatchArmOtherwise<Input, M extends StepMap> {
   readonly otherwise: true;
   readonly when?: never;
-  readonly build: (b: Builder<Input>) => M;
+  readonly build: (b: Builder<Input>) => BuildResult<Input, M>;
 }
 
 export type MatchArm<Input, N extends NeedsMap, M extends StepMap> =
@@ -207,12 +209,12 @@ export type MatchArmShape<Input, N extends NeedsMap> =
         readonly needs: NoInfer<NeedsOutputs<N>>;
       }) => boolean;
       readonly otherwise?: never;
-      readonly build: (b: Builder<Input>) => StepMap;
+      readonly build: (b: Builder<Input>) => BuildResult<Input, StepMap>;
     }
   | {
       readonly otherwise: true;
       readonly when?: never;
-      readonly build: (b: Builder<Input>) => StepMap;
+      readonly build: (b: Builder<Input>) => BuildResult<Input, StepMap>;
     };
 
 /**
@@ -243,10 +245,53 @@ export type MatchDiscriminatorOutput<
 }[D];
 
 /**
- * `b` inside `flow({ build: (b) => ... })`. Constructors return `Step<Output>`
- * values whose Output has been inferred from the handler / schema / arms.
+ * Per-entry config for `b.step(key, config)`. `Needs` is a const tuple of
+ * sibling keys that resolve against the chain's accumulator `A`.
  */
-export interface Builder<Input = unknown> {
+export interface StepEntryConfig<
+  Input,
+  A extends Record<string, unknown>,
+  Needs extends ReadonlyArray<keyof A & string>,
+  Output,
+> {
+  readonly needs?: Needs;
+  readonly retry?: RetryPolicy;
+  readonly timeoutMs?: Millis;
+  readonly when?: (args: {
+    readonly input: NoInfer<Input>;
+    readonly needs: { readonly [P in Needs[number]]: A[P] };
+  }) => boolean;
+  readonly run: (args: {
+    readonly input: NoInfer<Input>;
+    readonly needs: { readonly [P in Needs[number]]: A[P] };
+    readonly ctx: StepCtx<NoInfer<Input>>;
+  }) => Promise<Output>;
+}
+
+/**
+ * `b` inside `flow({ build: (b) => ... })`.
+ *
+ * Two complementary authoring styles:
+ *
+ *   1. **Standalone constructors** — `b.task`, `b.signal`, `b.match` each
+ *      return a `Step<Output>` value the user can assign and reference. The
+ *      build callback returns a `StepMap` of those values.
+ *
+ *   2. **Chain (key-first)** — `b.step(key, config)` is keyed and chainable.
+ *      Each call extends the builder's accumulator `A` with `{ [Key]: Output }`,
+ *      and subsequent `.step()` calls type `needs: ["sibling"]` against `A`.
+ *      `b.include(key, prebuiltStep)` brings a `Step<O>` (from `b.task` /
+ *      `b.signal` / `b.match`) into the chain under a key. The chain itself
+ *      is returned from the build callback; `flow()` extracts the accumulator.
+ *
+ * Both styles compose in the same build callback — the chain end is the
+ * canonical result; pre-built standalone steps enter the chain via
+ * `.include(key, step)`.
+ */
+export interface Builder<
+  Input = unknown,
+  A extends Record<string, unknown> = Record<never, never>,
+> {
   task<N extends NeedsMap, Output>(
     config: TaskConfig<Input, N, Output>,
   ): Step<Output>;
@@ -261,7 +306,9 @@ export interface Builder<Input = unknown> {
   match<
     N extends NeedsMap,
     D extends string,
-    Cases extends { readonly [K in D]: (b: Builder<Input>) => StepMap },
+    Cases extends {
+      readonly [K in D]: (b: Builder<Input>) => BuildResult<Input, StepMap>;
+    },
   >(config: {
     readonly needs?: N;
     readonly on: (args: {
@@ -271,7 +318,9 @@ export interface Builder<Input = unknown> {
     readonly cases: Cases;
   }): Step<
     {
-      readonly [K in keyof Cases]: MatchArmOutput<ReturnType<Cases[K]>>;
+      readonly [K in keyof Cases]: MatchArmOutput<
+        AsStepMap<ReturnType<Cases[K]>>
+      >;
     }[keyof Cases]
   >;
 
@@ -284,28 +333,87 @@ export interface Builder<Input = unknown> {
   >(config: {
     readonly needs?: N;
     readonly arms: Arms;
-  }): Step<MatchArmOutput<ReturnType<Arms[number]["build"]>>>;
+  }): Step<MatchArmOutput<AsStepMap<ReturnType<Arms[number]["build"]>>>>;
+
+  /**
+   * Chainable task definition. The first arg is the persisted step id; the
+   * config follows the standalone `task` shape plus a `needs: ["sibling"]`
+   * tuple of accumulator keys. Returns the same builder typed with the new
+   * entry appended to `A`.
+   *
+   *   b.step('fetchRecording', { run: async () => ({ url: '…' }) })
+   *    .step('transcribe', {
+   *      needs: ['fetchRecording'],
+   *      run: async ({ needs }) => ({ text: needs.fetchRecording.url + '…' }),
+   *    })
+   */
+  step<
+    const Key extends string,
+    const Needs extends ReadonlyArray<keyof A & string>,
+    Output,
+  >(
+    key: Exclude<Key, keyof A>,
+    config: StepEntryConfig<Input, A, Needs, Output>,
+  ): Builder<Input, A & { readonly [K in Key]: Output }>;
+
+  /**
+   * Include a pre-built `Step<O>` (from `b.task` / `b.signal` / `b.match`)
+   * into the chain under a key. The included step's output joins `A`.
+   */
+  include<const Key extends string, S extends Step<unknown>>(
+    key: Exclude<Key, keyof A>,
+    step: S,
+  ): Builder<
+    Input,
+    A & {
+      readonly [K in Key]: S extends Step<infer O> ? O : never;
+    }
+  >;
 }
+
+/**
+ * Acceptable shape for a build callback's return. Either a plain `StepMap`
+ * (record-literal style) or a `Builder<Input, A>` whose accumulator is
+ * extracted by `flow()`.
+ */
+export type BuildResult<Input, M extends StepMap> =
+  | M
+  | Builder<Input, BuilderAccumulator<M>>;
+
+/** Convert a `StepMap` back to its accumulator shape `{ [K]: Output }`. */
+export type BuilderAccumulator<M extends StepMap> = {
+  readonly [K in keyof M]: M[K] extends Step<infer O> ? O : never;
+};
+
+/** Extract a `StepMap` from either a plain map or a `Builder` chain result. */
+export type AsStepMap<R> = R extends Builder<unknown, infer A>
+  ? { readonly [K in keyof A]: Step<A[K]> }
+  : R extends StepMap
+    ? R
+    : never;
 
 export interface FlowConfig<
   Id extends string,
   InputSchema extends StandardSchemaV1,
-  M extends StepMap,
+  R,
   Output = unknown,
 > {
   /** Stable persistence handle. TanStack-key shaped (kebab or snake). */
   readonly id: Id;
   readonly input: InputSchema;
-  readonly build: (b: Builder<InferSchemaOutput<InputSchema>>) => M;
+  /**
+   * Returns either a `StepMap` (record-literal style with `b.task` / `b.signal`
+   * / `b.match`) or a chained `Builder<Input, A>` (Express-style with `b.step`
+   * / `b.include`). `flow()` extracts the assembled `StepMap` either way.
+   */
+  readonly build: (b: Builder<InferSchemaOutput<InputSchema>>) => R;
   /**
    * Compute the flow's terminal output from its step outputs. Fired once at
    * `flow.completed` and persisted on the fact + `onFlowComplete` event.
    * Skipped steps land as `null` in the input record at runtime even though
    * the type claims otherwise (consistent with the "skip is transitive" lock).
-   * Method-shorthand syntax keeps `M` bivariant so `Flow<Id, S, M, O>` remains
-   * assignable to `Flow<string, S, StepMap, O>` in fixture/test code.
    */
-  output?(steps: NeedsOutputs<M>): Output;
+  output?(steps: NeedsOutputs<AsStepMap<R>>): Output;
 }
 
 export interface Flow<
@@ -540,6 +648,52 @@ export interface Store {
       readonly fact: StepCompletedFact | StepFailedFact;
     }>,
   ): Promise<T>;
+
+  /**
+   * Deduped store of canonical flow DAGs, keyed by content hash. Inserts are
+   * idempotent — the same `(flowHash, dag)` may be written by many concurrent
+   * boots; only the first physical row survives. Subsequent writes are
+   * no-ops.
+   *
+   * Adapters MUST enforce this at the durability layer (e.g. Postgres
+   * `INSERT ... ON CONFLICT (flow_hash) DO NOTHING`).
+   */
+  upsertSnapshot(args: {
+    readonly flowHash: string;
+    readonly flowId: string;
+    readonly dag: Json;
+  }): Promise<void>;
+
+  /**
+   * Read the currently-published hash for a flow id. Returns `null` if no
+   * `flow_ref` row exists yet — first boot of a never-published flow.
+   */
+  getRef(flowId: string): Promise<string | null>;
+
+  /**
+   * Atomically set the published hash for a flow id. Last writer wins; the
+   * audit trail of ref changes lives in {@link appendGlobalFact} as
+   * `flow_ref.updated`.
+   *
+   * Adapters MUST enforce atomicity at the durability layer (e.g. Postgres
+   * `INSERT ... ON CONFLICT (flow_id) DO UPDATE`).
+   */
+  setRef(flowId: string, flowHash: string): Promise<void>;
+
+  /**
+   * Load a snapshot by its content hash. Returns `null` if no snapshot with
+   * this hash has been recorded — e.g., the deployment is replaying a run
+   * whose pinned topology was never seen by this store.
+   */
+  loadSnapshot(
+    flowHash: string,
+  ): Promise<{ readonly flowId: string; readonly dag: Json } | null>;
+
+  /**
+   * Append a non-run-scoped fact. See {@link GlobalFact} for the union.
+   * Currently only `flow_ref.updated` events flow through this method.
+   */
+  appendGlobalFact(fact: GlobalFact): Promise<void>;
 }
 
 export interface QueueMessage {
@@ -612,7 +766,41 @@ export interface FlowStartedFact extends FactBase {
   readonly kind: "flow.started";
   readonly flowId: string;
   readonly input: Json;
+  /**
+   * Content hash of the canonical flow DAG at the moment this run started.
+   * Pins the run to a specific topology; `wf.replay()` reads this to detect
+   * snapshot drift. Optional in v0 — legacy runs from before the snapshot
+   * store landed have `undefined`. After a soak period it becomes required.
+   */
+  readonly flowHash?: string;
+  /**
+   * Free-form handler-code identifier, typically a git SHA. Sourced from
+   * `nagi({ codeVersion })`. Captures handler-source drift orthogonally to
+   * `flowHash` (which only captures topology). See RFC 0001
+   * "Topology vs handler code."
+   */
+  readonly codeVersion?: string;
 }
+
+/**
+ * A non-run-scoped event, recorded as a side effect of nagi runtime activity
+ * that has no specific `runId`. Lives in the `nagi.global_fact` table.
+ *
+ * Per RFC 0001: when nagi boots and a flow's canonical hash differs from the
+ * currently-published one, the runtime updates `flow_ref` and appends a
+ * `flow_ref.updated` global fact. The audit trail of ref changes is queryable
+ * independently of any single run.
+ */
+export interface FlowRefUpdatedFact {
+  readonly kind: "flow_ref.updated";
+  readonly flowId: string;
+  /** Previous hash, or null when this is the first publish of `flowId`. */
+  readonly from: string | null;
+  readonly to: string;
+  readonly at: Date;
+}
+
+export type GlobalFact = FlowRefUpdatedFact;
 
 export interface FlowCompletedFact extends FactBase {
   readonly kind: "flow.completed";
@@ -718,10 +906,23 @@ export interface RunState {
   readonly status: RunStatus;
   readonly steps: Readonly<Record<StepId, StepState>>;
   readonly facts: ReadonlyArray<Fact>;
+  /** Content hash of the canonical flow DAG this run is pinned to. */
+  readonly flowHash?: string;
+  /** Handler-code identifier (typically a git SHA) recorded at run start. */
+  readonly codeVersion?: string;
 }
 
 export type ReplayMode = "inspect" | "continue";
 
 export interface ReplayOpts {
   readonly mode: ReplayMode;
+  /**
+   * When true, allow replays to proceed even if the live flow's canonical
+   * hash differs from the snapshot pinned to the run. Scheduling decisions
+   * come from the pinned snapshot; handler bodies are resolved from the
+   * currently-registered flow by step id (best-effort).
+   *
+   * When false (default), drift throws `NagiSnapshotDriftError`.
+   */
+  readonly allowDrift?: boolean;
 }

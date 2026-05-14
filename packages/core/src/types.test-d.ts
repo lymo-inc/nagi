@@ -264,6 +264,143 @@ describe("Flow literal id (const Id)", () => {
   });
 });
 
+describe("Builder.step chain (RFC 0002)", () => {
+  it("step return-map has typed Step<Output> per key", () => {
+    const f = flow({
+      id: "step-types",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) =>
+        b
+          .step("a", { run: async () => ({ y: 1 }) })
+          .step("c", { run: async () => ({ z: "x" }) }),
+    });
+
+    expectTypeOf(f.steps).toEqualTypeOf<{
+      readonly a: Step<{ y: number }>;
+      readonly c: Step<{ z: string }>;
+    }>();
+  });
+
+  it("flow.output sees typed step outputs from b.step chain", () => {
+    const f = flow({
+      id: "step-output",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) =>
+        b
+          .step("a", { run: async () => ({ v: 1 }) })
+          .step("c", { needs: ["a"], run: async () => ({ s: "x" }) }),
+      output: ({ a, c }) => ({ total: a.v, label: c.s }),
+    });
+    expectTypeOf<FlowOutput<typeof f>>().toEqualTypeOf<{
+      total: number;
+      label: string;
+    }>();
+  });
+
+  it("keyof steps narrows to the literal chain keys", () => {
+    const f = flow({
+      id: "step-keys",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) =>
+        b
+          .step("fetchRecording", { run: async () => ({ url: "x" }) })
+          .step("transcribe", {
+            needs: ["fetchRecording"],
+            run: async () => ({ text: "y" }),
+          }),
+    });
+    expectTypeOf<keyof typeof f.steps>().toEqualTypeOf<
+      "fetchRecording" | "transcribe"
+    >();
+  });
+
+  it("needs.<sibling> is auto-typed inside the run handler", () => {
+    flow({
+      id: "step-needs-typed",
+      input: passthroughSchema<{ start: number }>(),
+      build: (b) =>
+        b
+          .step("a", {
+            run: async ({ input }) => ({ doubled: input.start * 2 }),
+          })
+          .step("b", {
+            needs: ["a"],
+            run: async ({ input, needs }) => {
+              expectTypeOf(input).toEqualTypeOf<{ start: number }>();
+              expectTypeOf(needs.a).toEqualTypeOf<{ doubled: number }>();
+              return { next: input.start + needs.a.doubled };
+            },
+          }),
+    });
+  });
+
+  it("needs.<sibling> is auto-typed inside the when predicate", () => {
+    flow({
+      id: "step-when-typed",
+      input: passthroughSchema<{ on: boolean }>(),
+      build: (b) =>
+        b
+          .step("gate", { run: async () => ({ enabled: true }) })
+          .step("branch", {
+            needs: ["gate"],
+            when: ({ input, needs }) => {
+              expectTypeOf(input).toEqualTypeOf<{ on: boolean }>();
+              expectTypeOf(needs.gate).toEqualTypeOf<{ enabled: boolean }>();
+              return input.on && needs.gate.enabled;
+            },
+            run: async () => null,
+          }),
+    });
+  });
+
+  it("rejects an unknown sibling in needs[] at compile time", () => {
+    flow({
+      id: "step-typo",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) =>
+        b.step("a", { run: async () => ({ y: 1 }) }).step("b", {
+          // @ts-expect-error - "wrong" is not in the accumulator
+          needs: ["wrong"],
+          run: async () => null,
+        }),
+    });
+  });
+
+  it("rejects a duplicate chain key at compile time", () => {
+    flow({
+      id: "step-dup",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) =>
+        b.step("a", { run: async () => ({ y: 1 }) }).step(
+          // @ts-expect-error - "a" is already in the accumulator
+          "a",
+          { run: async () => null },
+        ),
+    });
+  });
+
+  it("include() brings a pre-built Step under a chain key", () => {
+    flow({
+      id: "step-include",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const pre = b.task({ run: async () => ({ pre: "v" }) });
+        return b
+          .step("a", { run: async () => ({ y: 1 }) })
+          .include("pre", pre)
+          .step("c", {
+            needs: ["a", "pre"],
+            run: async ({ needs }) => {
+              expectTypeOf(needs.a).toEqualTypeOf<{ y: number }>();
+              expectTypeOf(needs.pre).toEqualTypeOf<{ pre: string }>();
+              return null;
+            },
+          });
+      },
+    });
+  });
+});
+
 describe("Wf.start signature", () => {
   it("accepts (flow, input) — opts is optional (back-compat)", () => {
     const f = flow({

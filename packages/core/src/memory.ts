@@ -4,6 +4,7 @@ import type {
   Clock,
   Fact,
   FlowStartedFact,
+  GlobalFact,
   Json,
   Millis,
   Queue,
@@ -39,6 +40,12 @@ export class InMemoryStore implements Store {
   private readonly outputs = new Map<string, Json>();
   private readonly onces = new Map<string, Json>();
   private readonly leases = new Map<string, MemoryLease>();
+  private readonly snapshots = new Map<
+    string,
+    { readonly flowId: string; readonly dag: Json }
+  >();
+  private readonly refs = new Map<string, string>();
+  private readonly globalFacts: GlobalFact[] = [];
   private readonly leaseMs: Millis;
 
   constructor(opts: InMemoryStoreOpts = {}) {
@@ -143,6 +150,38 @@ export class InMemoryStore implements Store {
     }
     return result.output;
   }
+
+  async upsertSnapshot(args: {
+    readonly flowHash: string;
+    readonly flowId: string;
+    readonly dag: Json;
+  }): Promise<void> {
+    if (this.snapshots.has(args.flowHash)) return;
+    this.snapshots.set(args.flowHash, { flowId: args.flowId, dag: args.dag });
+  }
+
+  async getRef(flowId: string): Promise<string | null> {
+    return this.refs.get(flowId) ?? null;
+  }
+
+  async setRef(flowId: string, flowHash: string): Promise<void> {
+    this.refs.set(flowId, flowHash);
+  }
+
+  async loadSnapshot(
+    flowHash: string,
+  ): Promise<{ readonly flowId: string; readonly dag: Json } | null> {
+    return this.snapshots.get(flowHash) ?? null;
+  }
+
+  async appendGlobalFact(fact: GlobalFact): Promise<void> {
+    this.globalFacts.push(fact);
+  }
+
+  /** Test-only: peek at the in-memory global fact log. */
+  readGlobalFacts(): ReadonlyArray<GlobalFact> {
+    return this.globalFacts;
+  }
 }
 
 /**
@@ -156,6 +195,8 @@ export function projectRunState(
 ): RunState {
   let flowId = "";
   let status: RunStatus = "pending";
+  let flowHash: string | undefined;
+  let codeVersion: string | undefined;
   const steps: Record<string, StepState> = {};
 
   for (const fact of facts) {
@@ -163,6 +204,8 @@ export function projectRunState(
       case "flow.started":
         flowId = fact.flowId;
         status = "running";
+        flowHash = fact.flowHash;
+        codeVersion = fact.codeVersion;
         break;
       case "flow.completed":
         status = "completed";
@@ -210,7 +253,15 @@ export function projectRunState(
     }
   }
 
-  return { runId, flowId, status, steps, facts };
+  return {
+    runId,
+    flowId,
+    status,
+    steps,
+    facts,
+    ...(flowHash !== undefined ? { flowHash } : {}),
+    ...(codeVersion !== undefined ? { codeVersion } : {}),
+  };
 }
 
 interface QueuedItem extends QueueMessage {

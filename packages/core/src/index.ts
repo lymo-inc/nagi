@@ -1,5 +1,20 @@
 export { flow } from "./builder";
 export {
+  type CanonicalDag,
+  type CanonicalMatchArm,
+  type CanonicalRetryPolicy,
+  type CanonicalSchema,
+  type CanonicalStep,
+  canonicalize,
+  sha256Canonical,
+} from "./canonicalize";
+export {
+  diffSnapshots,
+  type SnapshotChangedEdge,
+  type SnapshotChangedField,
+  type SnapshotDiff,
+} from "./diff";
+export {
   InMemoryClock,
   InMemoryQueue,
   InMemoryStore,
@@ -9,6 +24,7 @@ export {
 export {
   type NagiConfig,
   NagiRuntimeError,
+  NagiSnapshotDriftError,
   NagiValidationError,
   nagi,
   type StartOpts,
