@@ -5,13 +5,16 @@ import type {
   CanonicalRetryPolicy,
   CanonicalSchema,
   CanonicalStep,
+  canonicalize,
+  sha256Canonical,
 } from "./canonicalize";
-import { canonicalize, sha256Canonical } from "./canonicalize";
 
 describe("CanonicalDag — type shape", () => {
   it("CanonicalDag has flowId, inputSchema, steps", () => {
     expectTypeOf<CanonicalDag["flowId"]>().toEqualTypeOf<string>();
-    expectTypeOf<CanonicalDag["inputSchema"]>().toEqualTypeOf<CanonicalSchema>();
+    expectTypeOf<
+      CanonicalDag["inputSchema"]
+    >().toEqualTypeOf<CanonicalSchema>();
     expectTypeOf<CanonicalDag["steps"]>().toEqualTypeOf<
       readonly CanonicalStep[]
     >();
@@ -38,12 +41,12 @@ describe("CanonicalDag — type shape", () => {
     expectTypeOf<CanonicalMatchArm["stepIds"]>().toEqualTypeOf<
       readonly string[]
     >();
-    expectTypeOf<
-      CanonicalMatchArm["whenHash"]
-    >().toEqualTypeOf<string | undefined>();
-    expectTypeOf<
-      CanonicalMatchArm["otherwise"]
-    >().toEqualTypeOf<true | undefined>();
+    expectTypeOf<CanonicalMatchArm["whenHash"]>().toEqualTypeOf<
+      string | undefined
+    >();
+    expectTypeOf<CanonicalMatchArm["otherwise"]>().toEqualTypeOf<
+      true | undefined
+    >();
   });
 
   it("canonicalize returns Promise<CanonicalDag>", () => {

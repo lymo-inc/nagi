@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
-import {
-  canonicalize,
-  sha256Canonical,
-  stableStringify,
-} from "./canonicalize";
+import { canonicalize, sha256Canonical, stableStringify } from "./canonicalize";
 import { passthroughSchema } from "./test-helpers";
 
 async function hashOf(f: Parameters<typeof canonicalize>[0]): Promise<string> {
@@ -430,9 +426,9 @@ describe("stableStringify", () => {
   });
 
   it("handles nested objects deterministically", () => {
-    expect(
-      stableStringify({ z: { b: 1, a: 2 }, a: [{ y: 1, x: 2 }] }),
-    ).toBe('{"a":[{"x":2,"y":1}],"z":{"a":2,"b":1}}');
+    expect(stableStringify({ z: { b: 1, a: 2 }, a: [{ y: 1, x: 2 }] })).toBe(
+      '{"a":[{"x":2,"y":1}],"z":{"a":2,"b":1}}',
+    );
   });
 
   it("encodes null primitives correctly", () => {

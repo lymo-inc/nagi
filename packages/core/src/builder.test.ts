@@ -162,12 +162,10 @@ describe("b.step chain API", () => {
       id: "step-needs",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) =>
-        b
-          .step("upstream", { run: async () => ({ v: 1 }) })
-          .step("downstream", {
-            needs: ["upstream"],
-            run: async ({ needs }) => ({ v: needs.upstream.v + 1 }),
-          }),
+        b.step("upstream", { run: async () => ({ v: 1 }) }).step("downstream", {
+          needs: ["upstream"],
+          run: async ({ needs }) => ({ v: needs.upstream.v + 1 }),
+        }),
     });
 
     const downstreamDef = getDef(f.steps.downstream as never);
@@ -181,12 +179,10 @@ describe("b.step chain API", () => {
       id: "step-no-rename",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) =>
-        b
-          .step("a", { run: async () => ({ v: 1 }) })
-          .step("b", {
-            needs: ["a"],
-            run: async ({ needs }) => ({ v: needs.a.v + 1 }),
-          }),
+        b.step("a", { run: async () => ({ v: 1 }) }).step("b", {
+          needs: ["a"],
+          run: async ({ needs }) => ({ v: needs.a.v + 1 }),
+        }),
     });
 
     const def = getDef(f.steps.b as never);

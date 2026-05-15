@@ -58,8 +58,6 @@ describe("migrations", () => {
     expect(sql).toContain("custom_schema.global_fact");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS flow_hash");
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS code_version");
-    expect(sql).toContain(
-      "REFERENCES custom_schema.flow_snapshot(flow_hash)",
-    );
+    expect(sql).toContain("REFERENCES custom_schema.flow_snapshot(flow_hash)");
   });
 });

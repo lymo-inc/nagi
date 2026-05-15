@@ -1,9 +1,9 @@
 import {
   getDef,
-  matchArms,
-  needsStepIds,
   type MatchArmDef,
   type MatchDef,
+  matchArms,
+  needsStepIds,
   type SignalDef,
   type StepDef,
   type TaskDef,
@@ -204,7 +204,9 @@ async function canonicalizeSchema(
   };
 }
 
-async function hashFnSource(fn: (...args: never[]) => unknown): Promise<string> {
+async function hashFnSource(
+  fn: (...args: never[]) => unknown,
+): Promise<string> {
   warnSourceHashOnce();
   return sha256Hex(fn.toString());
 }

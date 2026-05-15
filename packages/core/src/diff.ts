@@ -82,9 +82,7 @@ export function diffSnapshots(
     a.to !== b.to ? cmp(a.to, b.to) : cmp(a.from, b.from),
   );
   changedPredicates.sort((a, b) =>
-    a.stepId !== b.stepId
-      ? cmp(a.stepId, b.stepId)
-      : cmp(a.field, b.field),
+    a.stepId !== b.stepId ? cmp(a.stepId, b.stepId) : cmp(a.field, b.field),
   );
 
   return { addedSteps, removedSteps, changedEdges, changedPredicates };

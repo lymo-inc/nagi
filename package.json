@@ -18,20 +18,26 @@
     "format": "biome format --write .",
     "db:up": "docker compose -f docker-compose.test.yml up -d --wait",
     "db:down": "docker compose -f docker-compose.test.yml down -v",
-    "verify": "pnpm -r build && pnpm verify:publint && pnpm verify:attw",
+    "verify": "pnpm lint && pnpm -r build && pnpm verify:publint && pnpm verify:attw",
     "verify:publint": "pnpm -r --parallel exec publint",
     "verify:attw": "pnpm -r --parallel exec attw --pack . --profile esm-only",
     "changeset": "changeset",
     "version": "changeset version",
-    "release": "pnpm verify && changeset publish"
+    "release": "pnpm verify && changeset publish",
+    "prepare": "husky"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.17.4",
     "@biomejs/biome": "2.4.14",
     "@changesets/cli": "^2.31.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.4",
     "publint": "^0.2.12",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.6"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx,json,jsonc}": "biome check --write --no-errors-on-unmatched"
   }
 }
