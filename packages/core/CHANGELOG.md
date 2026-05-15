@@ -1,5 +1,11 @@
 # @nagi-js/core
 
+## 0.2.0-rc.3
+
+### Patch Changes
+
+- fix rc tagging
+
 ## 0.2.0-rc.2
 
 ### Minor Changes
