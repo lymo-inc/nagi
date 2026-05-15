@@ -7,5 +7,10 @@
     "@nagi-js/pgmq": "0.1.1-rc.0",
     "@nagi-js/postgres": "0.1.1-rc.0"
   },
-  "changesets": ["auto-code-version", "eight-dolls-rescue", "hip-peaches-win"]
+  "changesets": [
+    "auto-code-version",
+    "eight-dolls-rescue",
+    "hip-peaches-win",
+    "realign-core-0-1-x"
+  ]
 }
