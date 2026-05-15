@@ -45,6 +45,38 @@ export interface DispatchDeps {
   readonly hooks?: FlowHooks;
   readonly logger?: Logger;
   readonly defaultRetry?: RetryPolicy;
+  /**
+   * When `false`, neither step-local nor flow-local hooks fire, and the
+   * cross-cutting `hooks` (FlowHooks) are also suppressed. Set by
+   * `wf.replay({ fireHooks: false })` for backfills where webhooks
+   * must not re-publish. Default behavior (undefined / `true`): hooks fire.
+   */
+  readonly fireHooks?: boolean;
+}
+
+/**
+ * Invoke a lifecycle hook, swallowing thrown errors so a hook bug cannot fail
+ * the run. Errors are logged via `deps.logger` — operators see the failure
+ * without the workflow caring. When `deps.fireHooks === false`, the call is a
+ * no-op (used by replay to suppress re-emission).
+ */
+export async function fireHook<E>(
+  hook: ((event: E) => void | Promise<void>) | undefined,
+  event: E,
+  hookName: string,
+  deps: DispatchDeps,
+): Promise<void> {
+  if (deps.fireHooks === false) return;
+  if (hook === undefined) return;
+  try {
+    await hook(event);
+  } catch (err) {
+    const { message, stack } = serializeError(err);
+    deps.logger?.error(`nagi hook "${hookName}" threw — swallowed`, {
+      error: message,
+      ...(stack !== undefined ? { stack } : {}),
+    });
+  }
 }
 
 const DEFAULT_RETRY: RetryPolicy = {
@@ -104,7 +136,7 @@ export async function dispatchMessage(
   //            match handler; the start event fires before that resolves.
   const startEventInput: Json =
     def.kind === "task" ? extractInput(await store.loadRunState(runId)) : null;
-  await deps.hooks?.onStepStart?.({
+  const startEvent = {
     runId,
     flowId: flow.id,
     stepId,
@@ -112,7 +144,10 @@ export async function dispatchMessage(
     kind: def.kind,
     input: startEventInput,
     at: clock.now(),
-  });
+  };
+  const stepOnStart = def.kind === "task" ? def.onStart : undefined;
+  await fireHook(stepOnStart, startEvent, "step.onStart", deps);
+  await fireHook(deps.hooks?.onStepStart, startEvent, "onStepStart", deps);
 
   const startedAt = Date.now();
 
@@ -126,16 +161,23 @@ export async function dispatchMessage(
         stepId,
         attempt,
       });
-      await deps.hooks?.onStepComplete?.({
+      const completeEvent = {
         runId,
         flowId: flow.id,
         stepId,
         attempt,
-        kind: "task",
+        kind: "task" as const,
         output,
         durationMs: Date.now() - startedAt,
         at: clock.now(),
-      });
+      };
+      await fireHook(def.onComplete, completeEvent, "step.onComplete", deps);
+      await fireHook(
+        deps.hooks?.onStepComplete,
+        completeEvent,
+        "onStepComplete",
+        deps,
+      );
       await advance(deps, runId);
     } else if (def.kind === "signal") {
       // Signals don't run; they wait. Mark `started` (already done above) and ack.
@@ -276,7 +318,7 @@ async function handleStepError(args: {
       nextAttemptAt: new Date(Date.now() + delayMs),
       at: clock.now(),
     });
-    await deps.hooks?.onStepRetry?.({
+    const retryEvent = {
       runId,
       flowId: flow.id,
       stepId,
@@ -285,7 +327,10 @@ async function handleStepError(args: {
       error,
       nextAttemptAt: new Date(Date.now() + delayMs),
       at: clock.now(),
-    });
+    };
+    const stepOnRetry = def.kind === "task" ? def.onRetry : undefined;
+    await fireHook(stepOnRetry, retryEvent, "step.onRetry", deps);
+    await fireHook(deps.hooks?.onStepRetry, retryEvent, "onStepRetry", deps);
     await queue.enqueue(runId, stepId, { attempt: attempt + 1, delayMs });
     await queue.ack(message.receipt);
     return;
@@ -300,7 +345,7 @@ async function handleStepError(args: {
     at: clock.now(),
   };
   await store.failStep(runId, stepId, error, fact);
-  await deps.hooks?.onStepError?.({
+  const errorEvent = {
     runId,
     flowId: flow.id,
     stepId,
@@ -308,7 +353,10 @@ async function handleStepError(args: {
     kind: def.kind,
     error,
     at: clock.now(),
-  });
+  };
+  const stepOnError = def.kind === "task" ? def.onError : undefined;
+  await fireHook(stepOnError, errorEvent, "step.onError", deps);
+  await fireHook(deps.hooks?.onStepError, errorEvent, "onStepError", deps);
   await queue.ack(message.receipt);
   await advance(deps, runId);
 }
@@ -331,55 +379,18 @@ export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
     const termination = flowTermination(flow, runState);
 
     if (termination.done) {
-      const last = runState.facts[runState.facts.length - 1];
-      const flowAlreadyTerminal =
-        last !== undefined &&
-        (last.kind === "flow.completed" || last.kind === "flow.failed");
-      if (!flowAlreadyTerminal) {
-        if (termination.failed) {
-          const failedStep = Object.values(runState.steps).find(
-            (s) => s.status === "failed",
-          );
-          await store.appendFact(runId, {
-            kind: "flow.failed",
-            runId,
-            error: failedStep?.error ?? {
-              name: "Error",
-              message: "step failed",
-            },
-            at: clock.now(),
-          });
-          await deps.hooks?.onFlowError?.({
-            runId,
-            flowId: flow.id,
-            error: failedStep?.error ?? {
-              name: "Error",
-              message: "step failed",
-            },
-            at: clock.now(),
-          });
-        } else {
-          let flowOutput: Json = null;
-          if (flow.output !== undefined) {
-            const stepOutputs: Record<string, Json> = {};
-            for (const [sid, sstate] of Object.entries(runState.steps)) {
-              if (sstate.output !== undefined) stepOutputs[sid] = sstate.output;
-            }
-            flowOutput = flow.output(stepOutputs as never) as Json;
-          }
-          await store.appendFact(runId, {
-            kind: "flow.completed",
-            runId,
-            output: flowOutput,
-            at: clock.now(),
-          });
-          await deps.hooks?.onFlowComplete?.({
-            runId,
-            flowId: flow.id,
-            output: flowOutput,
-            at: clock.now(),
-          });
-        }
+      if (isFlowTerminal(runState.facts)) return;
+      if (termination.failed) {
+        const failedStep = Object.values(runState.steps).find(
+          (s) => s.status === "failed",
+        );
+        const flowError = failedStep?.error ?? {
+          name: "Error",
+          message: "step failed",
+        };
+        await finalizeFlowFailure({ deps, flow, runId, error: flowError });
+      } else {
+        await finalizeFlowCompletion({ deps, flow, runId, runState });
       }
       return;
     }
@@ -417,23 +428,9 @@ export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
     name: "NagiCycleError",
     message: `advance exceeded ${MAX_ADVANCE_ITERS} iterations — likely a cycle or infinite skip loop in flow "${flow.id}"`,
   };
-  const last = (await store.loadRunState(runId)).facts.slice(-1)[0];
-  const alreadyTerminal =
-    last !== undefined &&
-    (last.kind === "flow.completed" || last.kind === "flow.failed");
-  if (!alreadyTerminal) {
-    await store.appendFact(runId, {
-      kind: "flow.failed",
-      runId,
-      error: cycleError,
-      at: clock.now(),
-    });
-    await deps.hooks?.onFlowError?.({
-      runId,
-      flowId: flow.id,
-      error: cycleError,
-      at: clock.now(),
-    });
+  const facts = (await store.loadRunState(runId)).facts;
+  if (!isFlowTerminal(facts)) {
+    await finalizeFlowFailure({ deps, flow, runId, error: cycleError });
   }
 }
 
@@ -485,15 +482,20 @@ async function promoteMatches(args: {
         at: clock.now(),
       };
       await store.failStep(runState.runId, matchId, error, fact);
-      await deps.hooks?.onStepError?.({
-        runId: runState.runId,
-        flowId: flow.id,
-        stepId: matchId,
-        attempt,
-        kind: "match",
-        error,
-        at: clock.now(),
-      });
+      await fireHook(
+        deps.hooks?.onStepError,
+        {
+          runId: runState.runId,
+          flowId: flow.id,
+          stepId: matchId,
+          attempt,
+          kind: "match",
+          error,
+          at: clock.now(),
+        },
+        "onStepError",
+        deps,
+      );
       promoted = true;
       continue;
     }
@@ -507,16 +509,21 @@ async function promoteMatches(args: {
       at: clock.now(),
     };
     await store.completeStep(runState.runId, matchId, agg.output, fact);
-    await deps.hooks?.onStepComplete?.({
-      runId: runState.runId,
-      flowId: flow.id,
-      stepId: matchId,
-      attempt,
-      kind: "match",
-      output: agg.output,
-      durationMs: 0,
-      at: clock.now(),
-    });
+    await fireHook(
+      deps.hooks?.onStepComplete,
+      {
+        runId: runState.runId,
+        flowId: flow.id,
+        stepId: matchId,
+        attempt,
+        kind: "match",
+        output: agg.output,
+        durationMs: 0,
+        at: clock.now(),
+      },
+      "onStepComplete",
+      deps,
+    );
     promoted = true;
   }
 
@@ -580,6 +587,62 @@ export function computeBackoff(policy: RetryPolicy, attempt: number): Millis {
 function retryAllows(policy: RetryPolicy, err: unknown): boolean {
   if (!policy.retryOn) return true;
   return policy.retryOn(err);
+}
+
+function isFlowTerminal(facts: readonly Fact[]): boolean {
+  const last = facts[facts.length - 1];
+  return (
+    last !== undefined &&
+    (last.kind === "flow.completed" || last.kind === "flow.failed")
+  );
+}
+
+async function finalizeFlowFailure(args: {
+  readonly deps: DispatchDeps;
+  readonly flow: Flow;
+  readonly runId: RunId;
+  readonly error: SerializedError;
+}): Promise<void> {
+  const { deps, flow, runId, error } = args;
+  const { store, clock } = deps;
+  await store.appendFact(runId, {
+    kind: "flow.failed",
+    runId,
+    error,
+    at: clock.now(),
+  });
+  const event = { runId, flowId: flow.id, error, at: clock.now() };
+  await fireHook(flow.onError, event, "flow.onError", deps);
+  await fireHook(deps.hooks?.onFlowError, event, "onFlowError", deps);
+}
+
+async function finalizeFlowCompletion(args: {
+  readonly deps: DispatchDeps;
+  readonly flow: Flow;
+  readonly runId: RunId;
+  readonly runState: RunState;
+}): Promise<void> {
+  const { deps, flow, runId, runState } = args;
+  const { store, clock } = deps;
+  const output = computeFlowOutput(flow, runState);
+  await store.appendFact(runId, {
+    kind: "flow.completed",
+    runId,
+    output,
+    at: clock.now(),
+  });
+  const event = { runId, flowId: flow.id, output, at: clock.now() };
+  await fireHook(flow.onComplete, event, "flow.onComplete", deps);
+  await fireHook(deps.hooks?.onFlowComplete, event, "onFlowComplete", deps);
+}
+
+function computeFlowOutput(flow: Flow, runState: RunState): Json {
+  if (flow.output === undefined) return null;
+  const stepOutputs: Record<string, Json> = {};
+  for (const [sid, sstate] of Object.entries(runState.steps)) {
+    if (sstate.output !== undefined) stepOutputs[sid] = sstate.output;
+  }
+  return flow.output(stepOutputs as never) as Json;
 }
 
 function serializeError(err: unknown): SerializedError {

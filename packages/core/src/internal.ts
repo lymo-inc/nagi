@@ -6,8 +6,12 @@ import type {
   RunState,
   StandardSchemaV1,
   Step,
+  StepCompleteEvent,
   StepCtx,
+  StepErrorEvent,
   StepMap,
+  StepRetryEvent,
+  StepStartEvent,
 } from "./types";
 
 /**
@@ -37,6 +41,17 @@ export interface TaskDef {
     ctx: StepCtx<unknown>;
   }) => Promise<Json>;
   readonly parentMatch?: ParentMatchRef;
+
+  /**
+   * Step-local lifecycle hooks, forwarded from `TaskConfig` / `StepEntryConfig`.
+   * Stored at runtime-wide signatures (Json output) because the dispatcher
+   * deals in Json — the typed `Output` narrowing happens at the public config
+   * layer, not here.
+   */
+  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
+  readonly onComplete?: (event: StepCompleteEvent) => void | Promise<void>;
+  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
+  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
 export interface SignalDef {

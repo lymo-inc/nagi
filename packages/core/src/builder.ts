@@ -14,6 +14,7 @@ import type {
   AsStepMap,
   Builder,
   Flow,
+  FlowCompleteEvent,
   FlowConfig,
   InferSchemaOutput,
   MatchArm,
@@ -22,8 +23,9 @@ import type {
   NeedsMap,
   SignalConfig,
   StandardSchemaV1,
-  StepEntryConfig,
   Step,
+  StepCompleteEvent,
+  StepEntryConfig,
   StepMap,
   TaskConfig,
 } from "./types";
@@ -79,7 +81,9 @@ function makeBuilder<Input>(): Builder<Input> {
       kind: "task",
       needs: (config.needs ?? {}) as NeedsMap,
       ...(config.retry !== undefined ? { retry: config.retry } : {}),
-      ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
+      ...(config.timeoutMs !== undefined
+        ? { timeoutMs: config.timeoutMs }
+        : {}),
       ...(config.when !== undefined
         ? {
             when: config.when as (args: {
@@ -89,6 +93,16 @@ function makeBuilder<Input>(): Builder<Input> {
           }
         : {}),
       run: config.run as TaskDef["run"],
+      ...(config.onStart !== undefined ? { onStart: config.onStart } : {}),
+      ...(config.onComplete !== undefined
+        ? {
+            onComplete: config.onComplete as (
+              event: StepCompleteEvent,
+            ) => void | Promise<void>,
+          }
+        : {}),
+      ...(config.onError !== undefined ? { onError: config.onError } : {}),
+      ...(config.onRetry !== undefined ? { onRetry: config.onRetry } : {}),
     };
     return attachDef<O>({ kind: "task", id: "" }, def);
   }
@@ -100,7 +114,9 @@ function makeBuilder<Input>(): Builder<Input> {
       kind: "signal",
       needs: (config.needs ?? {}) as NeedsMap,
       schema: config.schema,
-      ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
+      ...(config.timeoutMs !== undefined
+        ? { timeoutMs: config.timeoutMs }
+        : {}),
       ...(config.when !== undefined
         ? {
             when: config.when as (args: {
@@ -217,6 +233,16 @@ function makeBuilder<Input>(): Builder<Input> {
           }
         : {}),
       run: config.run as TaskDef["run"],
+      ...(config.onStart !== undefined ? { onStart: config.onStart } : {}),
+      ...(config.onComplete !== undefined
+        ? {
+            onComplete: config.onComplete as (
+              event: StepCompleteEvent,
+            ) => void | Promise<void>,
+          }
+        : {}),
+      ...(config.onError !== undefined ? { onError: config.onError } : {}),
+      ...(config.onRetry !== undefined ? { onRetry: config.onRetry } : {}),
     };
     attachDefMut(shell, def);
     chainSteps.set(key, shell);
@@ -299,6 +325,15 @@ export function flow<
     input: config.input,
     steps: finalSteps as AsStepMap<R>,
     ...(config.output !== undefined ? { output: config.output } : {}),
+    ...(config.onStart !== undefined ? { onStart: config.onStart } : {}),
+    ...(config.onComplete !== undefined
+      ? {
+          onComplete: config.onComplete as (
+            event: FlowCompleteEvent,
+          ) => void | Promise<void>,
+        }
+      : {}),
+    ...(config.onError !== undefined ? { onError: config.onError } : {}),
   };
 }
 

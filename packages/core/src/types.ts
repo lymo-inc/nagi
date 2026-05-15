@@ -146,6 +146,21 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
     readonly needs: NoInfer<NeedsOutputs<N>>;
     readonly ctx: StepCtx<NoInfer<Input>>;
   }) => Promise<Output>;
+
+  /**
+   * Lifecycle hooks colocated with this step. Fire *before* the cross-cutting
+   * `FlowHooks` callbacks (deterministic ordering). A throwing hook is logged
+   * via the runtime's `Logger` and swallowed — hooks cannot fail the run.
+   *
+   * `onComplete`'s event is typed against this step's `Output` — no `Json`
+   * narrowing required at the call site.
+   */
+  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
+  readonly onComplete?: (
+    event: StepCompleteEvent & { readonly output: NoInfer<Output> },
+  ) => void | Promise<void>;
+  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
+  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
 export interface SignalConfig<
@@ -266,6 +281,14 @@ export interface StepEntryConfig<
     readonly needs: { readonly [P in Needs[number]]: A[P] };
     readonly ctx: StepCtx<NoInfer<Input>>;
   }) => Promise<Output>;
+
+  /** See {@link TaskConfig} for hook semantics. */
+  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
+  readonly onComplete?: (
+    event: StepCompleteEvent & { readonly output: NoInfer<Output> },
+  ) => void | Promise<void>;
+  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
+  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
 /**
@@ -386,11 +409,12 @@ export type BuilderAccumulator<M extends StepMap> = {
 };
 
 /** Extract a `StepMap` from either a plain map or a `Builder` chain result. */
-export type AsStepMap<R> = R extends Builder<unknown, infer A>
-  ? { readonly [K in keyof A]: Step<A[K]> }
-  : R extends StepMap
-    ? R
-    : never;
+export type AsStepMap<R> =
+  R extends Builder<unknown, infer A>
+    ? { readonly [K in keyof A]: Step<A[K]> }
+    : R extends StepMap
+      ? R
+      : never;
 
 export interface FlowConfig<
   Id extends string,
@@ -414,6 +438,20 @@ export interface FlowConfig<
    * the type claims otherwise (consistent with the "skip is transitive" lock).
    */
   output?(steps: NeedsOutputs<AsStepMap<R>>): Output;
+
+  /**
+   * Flow-level lifecycle hooks. Like step-local hooks (see {@link TaskConfig}),
+   * these fire *before* the cross-cutting `FlowHooks` callbacks, and a thrown
+   * hook is swallowed + logged rather than failing the run.
+   *
+   * `onComplete`'s event is typed against this flow's `Output` (whatever the
+   * `output()` resolver returns).
+   */
+  readonly onStart?: (event: FlowStartEvent) => void | Promise<void>;
+  readonly onComplete?: (
+    event: FlowCompleteEvent & { readonly output: NoInfer<Output> },
+  ) => void | Promise<void>;
+  readonly onError?: (event: FlowErrorEvent) => void | Promise<void>;
 }
 
 export interface Flow<
@@ -426,6 +464,18 @@ export interface Flow<
   readonly input: InputSchema;
   readonly steps: M;
   output?(steps: NeedsOutputs<M>): Output;
+
+  /**
+   * Forwarded from {@link FlowConfig}; surfaced for the dispatcher.
+   *
+   * Note these use the plain (non-Output-augmented) event types — the typed
+   * narrowing lives on {@link FlowConfig}'s callbacks at build time, while
+   * the runtime form is variance-friendly so a concrete `Flow<...{x: number}>`
+   * stays assignable to `Flow<...unknown>` (the dispatcher's view).
+   */
+  readonly onStart?: (event: FlowStartEvent) => void | Promise<void>;
+  readonly onComplete?: (event: FlowCompleteEvent) => void | Promise<void>;
+  readonly onError?: (event: FlowErrorEvent) => void | Promise<void>;
 }
 
 export type FlowInput<F> =
@@ -925,4 +975,13 @@ export interface ReplayOpts {
    * When false (default), drift throws `NagiSnapshotDriftError`.
    */
   readonly allowDrift?: boolean;
+  /**
+   * Whether step / flow lifecycle hooks (both the step-local ones on
+   * `TaskConfig` / `FlowConfig` and the cross-cutting `FlowHooks`) fire during
+   * replay. Defaults to `true` — replay re-executes steps via the idempotent
+   * dispatcher and emits the same observable lifecycle. Set to `false` for
+   * backfills or inspection-style replays where re-emitting webhooks would
+   * dual-publish.
+   */
+  readonly fireHooks?: boolean;
 }

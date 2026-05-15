@@ -1,13 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { canonicalize, sha256Canonical } from "./canonicalize";
-import {
-  InMemoryClock,
-  InMemoryQueue,
-  InMemoryStore,
-} from "./memory";
-import { nagi, NagiSnapshotDriftError } from "./runtime";
-import { passthroughSchema } from "./test-helpers";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
+import { NagiSnapshotDriftError, nagi } from "./runtime";
+import { makeHarness, passthroughSchema } from "./test-helpers";
 import type { RunId } from "./types";
 
 function makeStores() {
@@ -228,5 +224,74 @@ describe("wf.replay() — drift detection", () => {
     await expect(
       wf.replay(runId, { mode: "continue" }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("wf.replay() — fireHooks suppression", () => {
+  it("fireHooks: false suppresses step-local AND top-level on replay", async () => {
+    const stepLocalFires: string[] = [];
+    const topLevelFires: string[] = [];
+    const f = flow({
+      id: "replay-suppress",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          run: async () => ({ ok: true }),
+          onComplete: () => {
+            stepLocalFires.push("step.onComplete");
+          },
+        }),
+      }),
+      onComplete: () => {
+        stepLocalFires.push("flow.onComplete");
+      },
+    });
+    const h = await makeHarness(f, {
+      hooks: {
+        onStepComplete: () => {
+          topLevelFires.push("onStepComplete");
+        },
+        onFlowComplete: () => {
+          topLevelFires.push("onFlowComplete");
+        },
+      },
+    });
+
+    const runId = await h.wf.start(f, {});
+
+    await h.wf.replay(runId, { mode: "continue", fireHooks: false });
+    await h.drain();
+
+    expect(stepLocalFires).toEqual([]);
+    expect(topLevelFires).toEqual([]);
+
+    const result = await h.result(runId);
+    expect(result.status).toBe("completed");
+  });
+
+  it("default replay (fireHooks omitted) fires hooks normally", async () => {
+    const fires: string[] = [];
+    const f = flow({
+      id: "replay-default",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          run: async () => ({ ok: true }),
+          onComplete: () => {
+            fires.push("step.onComplete");
+          },
+        }),
+      }),
+      onComplete: () => {
+        fires.push("flow.onComplete");
+      },
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    await h.wf.replay(runId, { mode: "continue" });
+    await h.drain();
+
+    expect(fires).toContain("step.onComplete");
+    expect(fires).toContain("flow.onComplete");
   });
 });

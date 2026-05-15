@@ -3,7 +3,12 @@ import {
   canonicalize,
   sha256Canonical,
 } from "./canonicalize";
-import { advance, type DispatchDeps } from "./dispatch";
+import {
+  advance,
+  type DispatchDeps,
+  dispatchMessage,
+  fireHook as fireRuntimeHook,
+} from "./dispatch";
 import { attachDef, getDef, type StepDef } from "./internal";
 import { InMemoryClock } from "./memory";
 import type {
@@ -242,12 +247,24 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
         return runId;
       }
 
-      await config.hooks?.onFlowStart?.({
+      const startEvent = {
         runId,
         flowId: flow.id,
         input: validated,
         at: startedAt,
-      });
+      };
+      await fireRuntimeHook(
+        flow.onStart,
+        startEvent,
+        "flow.onStart",
+        dispatchDeps,
+      );
+      await fireRuntimeHook(
+        config.hooks?.onFlowStart,
+        startEvent,
+        "onFlowStart",
+        dispatchDeps,
+      );
 
       await advance(dispatchDeps, runId);
       return runId;
@@ -310,15 +327,20 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
         completedFact,
       );
 
-      await config.hooks?.onSignalReceived?.({
-        runId,
-        flowId: flow.id,
-        stepId: stepName,
-        attempt,
-        kind: "signal",
-        payload: validated,
-        at: clock.now(),
-      });
+      await fireRuntimeHook(
+        config.hooks?.onSignalReceived,
+        {
+          runId,
+          flowId: flow.id,
+          stepId: stepName,
+          attempt,
+          kind: "signal",
+          payload: validated,
+          at: clock.now(),
+        },
+        "onSignalReceived",
+        dispatchDeps,
+      );
 
       await advance(dispatchDeps, runId);
     },
@@ -345,10 +367,18 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       }
       if (opts.mode === "inspect") return;
 
-      // Drift detection. Runs started before snapshot tracking landed have
-      // `flowHash === undefined`; for those we proceed without a check —
-      // best-effort legacy behavior. Runs with a pinned hash get validated
-      // against the live flow's hash.
+      // When `fireHooks: false`, every hook call (step-local, flow-local,
+      // cross-cutting `FlowHooks`) short-circuits inside `fireHook` —
+      // preventing dual-publish on backfills.
+      const fireHooks = opts.fireHooks !== false;
+      const baseDeps: DispatchDeps = fireHooks
+        ? dispatchDeps
+        : { ...dispatchDeps, fireHooks: false };
+
+      // On allowed drift, swap in a synthesized flow (topology from the
+      // pinned snapshot, handlers from live code). Without drift, the
+      // run replays against baseDeps unchanged.
+      let replayDeps = baseDeps;
       const pinned = runState.flowHash;
       if (pinned !== undefined) {
         const liveHash = flowHashById.get(liveFlow.id);
@@ -360,10 +390,6 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
               actual: liveHash,
             });
           }
-          // allowDrift: build a synthesized flow whose topology comes from the
-          // pinned snapshot and whose handler bodies come from the live flow.
-          // Steps present in the snapshot but missing from the live flow
-          // throw at synthesis time (clear failure rather than silent skip).
           const snapshot = await config.store.loadSnapshot(pinned);
           if (snapshot === null) {
             throw new NagiRuntimeError(
@@ -375,22 +401,38 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
             snapshot.dag as unknown as CanonicalDag,
             liveFlow,
           );
-          const driftDeps: DispatchDeps = {
-            ...dispatchDeps,
-            flowFor: async () => synthesized,
-          };
-          await advance(driftDeps, runId);
-          return;
+          replayDeps = { ...baseDeps, flowFor: async () => synthesized };
         }
       }
 
-      await advance(dispatchDeps, runId);
+      await advance(replayDeps, runId);
+      // Drain inline so the hook-suppression scope covers every dispatch
+      // this replay initiates. Without it, advance() only enqueues work
+      // and a worker would later run those dispatches with worker-scoped
+      // deps (no suppression) — defeating the flag's purpose.
+      if (!fireHooks) await drainInline(replayDeps);
     },
   };
 }
 
 function mintRunId(): RunId {
   return `run-${crypto.randomUUID()}` as RunId;
+}
+
+/**
+ * Drain the queue under the given dispatch deps until empty. Used by
+ * `wf.replay({ fireHooks: false })` to keep every replayed dispatch under
+ * the hook-suppressed scope. Bounded to avoid runaway loops on broken
+ * stores; if hit, the caller can re-invoke replay to pick up where this
+ * left off.
+ */
+const MAX_REPLAY_DISPATCHES = 4096;
+async function drainInline(deps: DispatchDeps): Promise<void> {
+  for (let i = 0; i < MAX_REPLAY_DISPATCHES; i++) {
+    const messages = await deps.queue.dequeue({ count: 1 });
+    if (messages.length === 0) return;
+    for (const msg of messages) await dispatchMessage(deps, msg);
+  }
 }
 
 async function validate<S extends StandardSchemaV1>(
