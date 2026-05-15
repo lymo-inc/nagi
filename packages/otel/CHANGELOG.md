@@ -1,5 +1,12 @@
 # @nagi-js/otel
 
+## 0.1.1-rc.2
+
+### Patch Changes
+
+- Updated dependencies [d67d361]
+  - @nagi-js/core@0.2.0-rc.2
+
 ## 0.1.1-rc.1
 
 ### Patch Changes
