@@ -66,7 +66,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
         const r = await loadStatus(db, schema, runId);
-        if (r === "completed" || r === "failed") return;
+        if (r === "completed" || r === "failed" || r === "canceled") return;
         await new Promise((res) => setTimeout(res, 10));
       }
       throw new Error("runToEnd: timeout");
@@ -206,6 +206,138 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const output = await loadOutput(db, schema, supplied);
     expect(output).toEqual({ doubled: 10 });
   }, 15_000);
+
+  it("cancel-in-progress: second start with the same concurrency key cancels the first", async () => {
+    const f = flow({
+      id: "pg-conc-basic",
+      input: passthroughSchema<{ videoId: string }>(),
+      concurrency: {
+        keyFn: (input) => input.videoId,
+        mode: "cancel-in-progress",
+      },
+      build: (b) => ({
+        analyze: b.task({
+          run: async ({ input }) => {
+            // Hold the step briefly so the second start can land first.
+            await new Promise((r) => setTimeout(r, 50));
+            return { v: input.videoId };
+          },
+        }),
+      }),
+    });
+
+    const wf = await makeNagi(f);
+    const first = await wf.start(f, { videoId: "v1" });
+    const second = await wf.start(f, { videoId: "v1" });
+    expect(first).not.toBe(second);
+
+    // First run is canceled (in workflow_run.status), and the fact log has
+    // a flow.canceled entry pointing at the second run.
+    await runToEnd(wf, first);
+    const firstStatus = await loadStatus(db, schema, first);
+    expect(firstStatus).toBe("canceled");
+
+    const canceledRow = await sql<{
+      canceled_by_run_id: string | null;
+    }>`SELECT canceled_by_run_id FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${first}`.execute(
+      db,
+    );
+    expect(canceledRow.rows[0]?.canceled_by_run_id).toBe(second);
+
+    const cancelFact = await sql<{
+      payload: { canceledByRunId: string; concurrencyKey: string };
+    }>`SELECT payload FROM ${sql.raw(`${schema}.fact`)} WHERE run_id = ${first} AND kind = 'flow.canceled'`.execute(
+      db,
+    );
+    expect(cancelFact.rows[0]?.payload.canceledByRunId).toBe(second);
+    expect(cancelFact.rows[0]?.payload.concurrencyKey).toBe("v1");
+
+    // Second run completes successfully.
+    await runToEnd(wf, second);
+    const secondStatus = await loadStatus(db, schema, second);
+    expect(secondStatus).toBe("completed");
+  }, 20_000);
+
+  it("partial unique index rejects direct insert of a second active row for the same key", async () => {
+    const runIdA = `run-${uuidv7()}` as RunId;
+    const runIdB = `run-${uuidv7()}` as RunId;
+    const flowId = "pg-conc-uidx";
+    const key = "k1";
+
+    // Insert run A as 'running' with concurrency_key = 'k1'. OK.
+    await sql`
+      INSERT INTO ${sql.raw(`${schema}.workflow_run`)}
+        (run_id, flow_id, status, input, started_at, concurrency_key)
+      VALUES (${runIdA}, ${flowId}, 'running', '{}'::jsonb, now(), ${key})
+    `.execute(db);
+
+    // Try to insert run B as 'running' with same flow_id + key → should fail
+    // due to partial unique index.
+    await expect(
+      sql`
+        INSERT INTO ${sql.raw(`${schema}.workflow_run`)}
+          (run_id, flow_id, status, input, started_at, concurrency_key)
+        VALUES (${runIdB}, ${flowId}, 'running', '{}'::jsonb, now(), ${key})
+      `.execute(db),
+    ).rejects.toThrow(/workflow_run_concurrency_active_uidx/);
+
+    // After A transitions to canceled, the index slot is free.
+    await sql`
+      UPDATE ${sql.raw(`${schema}.workflow_run`)} SET status = 'canceled' WHERE run_id = ${runIdA}
+    `.execute(db);
+    await sql`
+      INSERT INTO ${sql.raw(`${schema}.workflow_run`)}
+        (run_id, flow_id, status, input, started_at, concurrency_key)
+      VALUES (${runIdB}, ${flowId}, 'running', '{}'::jsonb, now(), ${key})
+    `.execute(db);
+
+    // Cleanup so subsequent tests aren't affected.
+    await sql`DELETE FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id IN (${runIdA}, ${runIdB})`.execute(
+      db,
+    );
+  }, 15_000);
+
+  it("concurrent starts with the same key produce exactly one active run", async () => {
+    const f = flow({
+      id: "pg-conc-race",
+      input: passthroughSchema<{ key: string }>(),
+      concurrency: {
+        keyFn: (input) => input.key,
+        mode: "cancel-in-progress",
+      },
+      build: (b) => ({
+        only: b.task({ run: async ({ input }) => ({ k: input.key }) }),
+      }),
+    });
+
+    const wf = await makeNagi(f);
+    const key = "race-key";
+
+    // Fire 8 concurrent start() calls. The advisory lock + cancel-then-insert
+    // path must serialize them so exactly one ends up running and no two
+    // active rows for the same key coexist (which would violate the partial
+    // unique index).
+    const runIds = await Promise.all(
+      Array.from({ length: 8 }, () => wf.start(f, { key })),
+    );
+    expect(new Set(runIds).size).toBe(8);
+
+    // Exactly one row should be in an active status.
+    const activeCount = await sql<{
+      count: string;
+    }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.workflow_run`)}
+       WHERE flow_id = ${f.id} AND concurrency_key = ${key} AND status IN ('pending', 'running')
+    `.execute(db);
+    expect(activeCount.rows[0]?.count).toBe("1");
+
+    // All other runs should be in 'canceled' status.
+    const canceledCount = await sql<{
+      count: string;
+    }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.workflow_run`)}
+       WHERE flow_id = ${f.id} AND concurrency_key = ${key} AND status = 'canceled'
+    `.execute(db);
+    expect(canceledCount.rows[0]?.count).toBe("7");
+  }, 30_000);
 
   it("start() with a previously-used runId is an idempotent no-op", async () => {
     const f = flow({

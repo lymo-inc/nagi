@@ -122,6 +122,31 @@ export const migrations: readonly Migration[] = [
         ON ${schema}.workflow_run (flow_hash);
     `,
   },
+  {
+    id: "0003_concurrency_groups",
+    sql: (schema) => `
+      ALTER TABLE ${schema}.workflow_run
+        ADD COLUMN IF NOT EXISTS concurrency_key   text;
+      ALTER TABLE ${schema}.workflow_run
+        ADD COLUMN IF NOT EXISTS canceled_by_run_id text;
+
+      ALTER TABLE ${schema}.workflow_run
+        DROP CONSTRAINT IF EXISTS workflow_run_status_check;
+      ALTER TABLE ${schema}.workflow_run
+        ADD CONSTRAINT workflow_run_status_check
+        CHECK (status IN ('pending','running','completed','failed','canceled'));
+
+      -- Defense-in-depth: even if application code skips the advisory lock,
+      -- this index makes "two active runs sharing a concurrency key" a
+      -- unique-violation at insert time. Excludes terminal rows and rows
+      -- without a key (the common case for flows that don't declare
+      -- concurrency).
+      CREATE UNIQUE INDEX IF NOT EXISTS workflow_run_concurrency_active_uidx
+        ON ${schema}.workflow_run (flow_id, concurrency_key)
+        WHERE concurrency_key IS NOT NULL
+          AND status IN ('pending','running');
+    `,
+  },
 ];
 
 export interface MigrateOpts {

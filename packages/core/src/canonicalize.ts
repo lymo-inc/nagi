@@ -224,6 +224,28 @@ export async function sha256Canonical(dag: CanonicalDag): Promise<string> {
 }
 
 /**
+ * Compute a structural fingerprint over a set of registered flows. Used as
+ * the default value of `nagi({ codeVersion })` when the caller omits it.
+ *
+ * Per-flow projection reuses {@link canonicalize} unchanged — so this hash
+ * and each flow's snapshot `flowHash` share one canonical definition and
+ * cannot drift apart. Equivalent flow sets produce byte-identical hashes;
+ * adding/removing a flow, renaming a flow id, or any structural step change
+ * moves the result. `run`-body edits do not.
+ */
+export async function fingerprintFlows(
+  flows: ReadonlyArray<Flow>,
+): Promise<string> {
+  const entries: Array<readonly [string, string]> = [];
+  for (const f of flows) {
+    const dag = await canonicalize(f);
+    entries.push([f.id, await sha256Canonical(dag)]);
+  }
+  entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return sha256Hex(stableStringify(entries));
+}
+
+/**
  * Deterministic JSON serializer. Object keys are emitted in ascending
  * lexicographic order; `undefined` entries are skipped (matching `JSON.stringify`).
  *

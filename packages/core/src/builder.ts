@@ -15,8 +15,10 @@ import type {
   Builder,
   Flow,
   FlowCompleteEvent,
+  FlowConcurrency,
   FlowConfig,
   InferSchemaOutput,
+  Json,
   MatchArm,
   MatchDiscriminatorConfig,
   MatchGuardConfig,
@@ -334,6 +336,9 @@ export function flow<
         }
       : {}),
     ...(config.onError !== undefined ? { onError: config.onError } : {}),
+    ...(config.concurrency !== undefined
+      ? { concurrency: config.concurrency as FlowConcurrency<Json> }
+      : {}),
   };
 }
 

@@ -105,6 +105,14 @@ export async function dispatchMessage(
   const def = getDef(step);
 
   const preState = await store.loadRunState(runId);
+  // Run was canceled by a concurrency-group supersede before this message
+  // was claimed. Ack and skip — the dispatcher stops scheduling new work
+  // for canceled runs; in-flight steps already executing run to completion
+  // (their facts persist), but anything that hadn't started yet is dropped.
+  if (preState.status === "canceled") {
+    await queue.ack(message.receipt);
+    return;
+  }
   const preStep = preState.steps[stepId];
   if (
     preStep &&
@@ -590,11 +598,21 @@ function retryAllows(policy: RetryPolicy, err: unknown): boolean {
 }
 
 function isFlowTerminal(facts: readonly Fact[]): boolean {
-  const last = facts[facts.length - 1];
-  return (
-    last !== undefined &&
-    (last.kind === "flow.completed" || last.kind === "flow.failed")
-  );
+  // Walk back from the tail. `flow.canceled` is appended to a prior run by a
+  // concurrent `wf.start()`, which may interleave with the prior run's own
+  // step facts — so the canceled fact is not always the literal last entry.
+  for (let i = facts.length - 1; i >= 0; i--) {
+    const f = facts[i];
+    if (
+      f !== undefined &&
+      (f.kind === "flow.completed" ||
+        f.kind === "flow.failed" ||
+        f.kind === "flow.canceled")
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function finalizeFlowFailure(args: {

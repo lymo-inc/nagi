@@ -6,6 +6,7 @@ export {
   type CanonicalSchema,
   type CanonicalStep,
   canonicalize,
+  fingerprintFlows,
   sha256Canonical,
 } from "./canonicalize";
 export {
@@ -22,6 +23,7 @@ export {
   projectRunState,
 } from "./memory";
 export {
+  NagiCanceledError,
   type NagiConfig,
   NagiRuntimeError,
   NagiSnapshotDriftError,

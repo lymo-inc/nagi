@@ -1,7 +1,9 @@
 import type {
   AttemptNumber,
   ClaimToken,
+  ConcurrencyMode,
   Fact,
+  FlowCanceledFact,
   FlowStartedFact,
   GlobalFact,
   Json,
@@ -78,33 +80,125 @@ class PostgresStore<DB = unknown> implements Store {
   async tryStartRun(
     runId: RunId,
     fact: FlowStartedFact,
-  ): Promise<{ readonly started: boolean }> {
-    // Race-safe atomic insert. We lean on the `workflow_run.run_id` PRIMARY
-    // KEY: `ON CONFLICT DO NOTHING` plus `RETURNING run_id` lets us detect in
-    // one round-trip whether THIS call is the writer that created the run.
-    // The fact insert and notify happen only on the winning branch — losers
-    // get a clean idempotent no-op with no `flow.started` double-emit.
-    const started = await this.db.transaction().execute(async (trx) => {
-      const insert = await sql<{ run_id: string }>`
-        INSERT INTO ${sql.raw(this.t("workflow_run"))}
-          (run_id, flow_id, status, input, started_at, flow_hash, code_version)
-        VALUES
-          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null})
-        ON CONFLICT (run_id) DO NOTHING
-        RETURNING run_id
+    concurrency?: {
+      readonly key: string;
+      readonly mode: ConcurrencyMode;
+    },
+  ): Promise<{
+    readonly started: boolean;
+    readonly canceled: ReadonlyArray<{
+      readonly runId: RunId;
+      readonly fact: FlowCanceledFact;
+    }>;
+  }> {
+    if (concurrency === undefined) {
+      // Fast path with no concurrency: race-safe atomic insert via the
+      // run_id PRIMARY KEY. Losers of a runId-collision race get the
+      // clean idempotent no-op.
+      const started = await this.db.transaction().execute(async (trx) => {
+        const insert = await sql<{ run_id: string }>`
+          INSERT INTO ${sql.raw(this.t("workflow_run"))}
+            (run_id, flow_id, status, input, started_at, flow_hash, code_version)
+          VALUES
+            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null})
+          ON CONFLICT (run_id) DO NOTHING
+          RETURNING run_id
+        `.execute(trx);
+
+        if (insert.rows.length === 0) {
+          return false;
+        }
+        await this.insertFact(trx, runId, fact);
+        return true;
+      });
+
+      if (started) {
+        await this.maybeNotify(runId);
+      }
+      return { started, canceled: [] };
+    }
+
+    // Concurrency path: serialize starts for the same `(flowId, key)` via an
+    // advisory lock so the partial unique index on active runs is never
+    // violated. We cancel prior actives BEFORE inserting the new row, so the
+    // index slot is free at INSERT time.
+    const result = await this.db.transaction().execute(async (trx) => {
+      const lockText = `nagi:concurrency:${fact.flowId}:${concurrency.key}`;
+      await sql`SELECT pg_advisory_xact_lock(hashtext(${lockText}))`.execute(
+        trx,
+      );
+
+      // runId-idempotency wins: if a run with this id already exists, do
+      // nothing — no cancellation, no double-emit, same contract as the
+      // non-concurrency path.
+      const existing = await sql<{ run_id: string }>`
+        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
+         WHERE run_id = ${runId}
+         LIMIT 1
+      `.execute(trx);
+      if (existing.rows.length > 0) {
+        return {
+          started: false,
+          canceled: [] as ReadonlyArray<{
+            runId: RunId;
+            fact: FlowCanceledFact;
+          }>,
+        };
+      }
+
+      // Cancel any other active runs sharing this key. FOR UPDATE inside the
+      // advisory lock is belt-and-suspenders — the lock already serializes;
+      // the row lock just makes the cancel safe even if some other path
+      // (e.g. an admin SQL update) is mid-flight.
+      const others = await sql<{ run_id: string }>`
+        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
+         WHERE flow_id = ${fact.flowId}
+           AND concurrency_key = ${concurrency.key}
+           AND status IN ('pending', 'running')
+        FOR UPDATE
       `.execute(trx);
 
-      if (insert.rows.length === 0) {
-        return false;
+      const canceled: Array<{ runId: RunId; fact: FlowCanceledFact }> = [];
+      for (const row of others.rows) {
+        const priorRunId = row.run_id as RunId;
+        const cancelFact: FlowCanceledFact = {
+          kind: "flow.canceled",
+          runId: priorRunId,
+          at: fact.at,
+          canceledByRunId: runId,
+          concurrencyKey: concurrency.key,
+        };
+        await sql`
+          UPDATE ${sql.raw(this.t("workflow_run"))}
+             SET status = 'canceled',
+                 canceled_by_run_id = ${runId},
+                 completed_at = ${fact.at}
+           WHERE run_id = ${priorRunId}
+        `.execute(trx);
+        await this.insertFact(trx, priorRunId, cancelFact);
+        canceled.push({ runId: priorRunId, fact: cancelFact });
       }
+
+      // Now insert the new run. With prior actives moved to `canceled`,
+      // the partial unique index slot is free.
+      await sql`
+        INSERT INTO ${sql.raw(this.t("workflow_run"))}
+          (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key)
+        VALUES
+          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key})
+      `.execute(trx);
       await this.insertFact(trx, runId, fact);
-      return true;
+
+      return { started: true, canceled };
     });
 
-    if (started) {
+    if (result.started) {
       await this.maybeNotify(runId);
+      for (const c of result.canceled) {
+        await this.maybeNotify(c.runId);
+      }
     }
-    return { started };
+    return result;
   }
 
   async loadRunState(runId: RunId): Promise<RunState> {
@@ -307,6 +401,20 @@ class PostgresStore<DB = unknown> implements Store {
         await sql`
           UPDATE ${sql.raw(this.t("workflow_run"))}
              SET status = 'failed', error = ${jsonb(fact.error as unknown as Json)}, completed_at = ${fact.at}
+           WHERE run_id = ${runId}
+        `.execute(trx);
+        return;
+      case "flow.canceled":
+        // `tryStartRun` is the canonical writer of `flow.canceled` and does
+        // its own UPDATE there. This branch is the safety net for callers
+        // that append the fact directly via `appendFact` (tests, custom
+        // tooling). DO NOTHING on race would leave status stale; instead
+        // do the UPDATE again — idempotent since canceled is terminal.
+        await sql`
+          UPDATE ${sql.raw(this.t("workflow_run"))}
+             SET status = 'canceled',
+                 canceled_by_run_id = ${fact.canceledByRunId},
+                 completed_at = ${fact.at}
            WHERE run_id = ${runId}
         `.execute(trx);
         return;

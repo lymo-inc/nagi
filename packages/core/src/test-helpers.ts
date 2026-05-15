@@ -228,8 +228,13 @@ export async function makeHarness(
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
         const state = await store.loadRunState(runId);
-        const last = state.facts[state.facts.length - 1];
-        if (last?.kind === "flow.completed" || last?.kind === "flow.failed") {
+        // Check via projected status so post-cancellation step facts (which
+        // may interleave after `flow.canceled`) don't trip the check.
+        if (
+          state.status === "completed" ||
+          state.status === "failed" ||
+          state.status === "canceled"
+        ) {
           return makeResult(state);
         }
         await new Promise((r) => setTimeout(r, 5));

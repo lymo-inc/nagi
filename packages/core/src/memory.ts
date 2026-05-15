@@ -2,7 +2,9 @@ import type {
   AttemptNumber,
   ClaimToken,
   Clock,
+  ConcurrencyMode,
   Fact,
+  FlowCanceledFact,
   FlowStartedFact,
   GlobalFact,
   Json,
@@ -46,6 +48,14 @@ export class InMemoryStore implements Store {
   >();
   private readonly refs = new Map<string, string>();
   private readonly globalFacts: GlobalFact[] = [];
+  /**
+   * The runId currently holding the active slot for `flowId::concurrencyKey`.
+   * Updated on `tryStartRun` (set when concurrency is supplied) and on
+   * terminal facts (cleared via {@link keyByActiveRun}).
+   */
+  private readonly activeByKey = new Map<string, RunId>();
+  /** Reverse lookup so terminal facts can free the slot in O(1). */
+  private readonly keyByActiveRun = new Map<RunId, string>();
   private readonly leaseMs: Millis;
 
   constructor(opts: InMemoryStoreOpts = {}) {
@@ -56,21 +66,65 @@ export class InMemoryStore implements Store {
     const list = this.facts.get(runId) ?? [];
     list.push(fact);
     this.facts.set(runId, list);
+    if (
+      fact.kind === "flow.completed" ||
+      fact.kind === "flow.failed" ||
+      fact.kind === "flow.canceled"
+    ) {
+      const slot = this.keyByActiveRun.get(runId);
+      if (slot !== undefined) {
+        this.keyByActiveRun.delete(runId);
+        if (this.activeByKey.get(slot) === runId) {
+          this.activeByKey.delete(slot);
+        }
+      }
+    }
   }
 
   async tryStartRun(
     runId: RunId,
     fact: FlowStartedFact,
-  ): Promise<{ readonly started: boolean }> {
+    concurrency?: {
+      readonly key: string;
+      readonly mode: ConcurrencyMode;
+    },
+  ): Promise<{
+    readonly started: boolean;
+    readonly canceled: ReadonlyArray<{
+      readonly runId: RunId;
+      readonly fact: FlowCanceledFact;
+    }>;
+  }> {
     // Single-process JS is cooperatively single-threaded between awaits, so
-    // this `has` + `set` pair is atomic with respect to any other call into
+    // these reads/writes are atomic with respect to any other call into
     // this Store. No locking primitive needed; the Postgres adapter is where
     // real cross-process race safety lives.
     if (this.facts.has(runId)) {
-      return { started: false };
+      return { started: false, canceled: [] };
     }
+
+    const canceled: Array<{ runId: RunId; fact: FlowCanceledFact }> = [];
+    if (concurrency !== undefined) {
+      const slot = `${fact.flowId}::${concurrency.key}`;
+      const priorRunId = this.activeByKey.get(slot);
+      if (priorRunId !== undefined) {
+        const cancelFact: FlowCanceledFact = {
+          kind: "flow.canceled",
+          runId: priorRunId,
+          at: fact.at,
+          canceledByRunId: runId,
+          concurrencyKey: concurrency.key,
+        };
+        // `appendFact` clears the activeByKey slot for terminal facts.
+        await this.appendFact(priorRunId, cancelFact);
+        canceled.push({ runId: priorRunId, fact: cancelFact });
+      }
+      this.activeByKey.set(slot, runId);
+      this.keyByActiveRun.set(runId, slot);
+    }
+
     this.facts.set(runId, [fact]);
-    return { started: true };
+    return { started: true, canceled };
   }
 
   async loadRunState(runId: RunId): Promise<RunState> {
@@ -212,6 +266,9 @@ export function projectRunState(
         break;
       case "flow.failed":
         status = "failed";
+        break;
+      case "flow.canceled":
+        status = "canceled";
         break;
       case "step.started":
         steps[fact.stepId] = {

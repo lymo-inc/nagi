@@ -1,6 +1,7 @@
 import {
   type CanonicalDag,
   canonicalize,
+  fingerprintFlows,
   sha256Canonical,
 } from "./canonicalize";
 import {
@@ -23,6 +24,7 @@ import type {
   ReplayOpts,
   RetryPolicy,
   RunId,
+  SerializedError,
   StandardSchemaV1,
   Store,
   Trigger,
@@ -41,11 +43,18 @@ export interface NagiConfig {
   readonly logger?: Logger;
   readonly defaultRetry?: RetryPolicy;
   /**
-   * Handler-code identifier — typically a git SHA from `process.env.GIT_SHA`
-   * or your build's bundle hash. Persisted on `workflow_run.code_version` and
-   * on every `flow.started` fact for runs started by this process. Captures
-   * handler-body drift orthogonally to the topology hash. See RFC 0001
-   * "Topology vs handler code."
+   * Process-wide identifier persisted on `workflow_run.code_version` and on
+   * every `flow.started` fact for runs started by this process.
+   *
+   * When omitted (default), nagi computes a structural fingerprint over the
+   * registered flows via {@link fingerprintFlows} and uses that — so the
+   * audit field is meaningful by default and shifts only when flow topology
+   * changes, not on every deploy. Supply an explicit string to override
+   * (e.g. for a forced cutover: `"cutover-2026-05-15"`).
+   *
+   * Drift detection at replay uses each flow's per-flow `flowHash`, not this
+   * value. See RFC 0001 "Topology vs handler code" and RFC 0003 "Auto-compute
+   * codeVersion."
    */
   readonly codeVersion?: string;
 }
@@ -100,6 +109,36 @@ export class NagiRuntimeError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "NagiRuntimeError";
+  }
+}
+
+/**
+ * Carried by `onFlowError` (both flow-local and cross-cutting) when a run is
+ * canceled because a newer `wf.start()` for the same concurrency group
+ * superseded it. The serialized form preserves `name` and a structured
+ * `cause` so observers can discriminate via `error.name === "NagiCanceledError"`
+ * and read `error.cause.canceledByRunId` / `error.cause.concurrencyKey`.
+ */
+export class NagiCanceledError extends Error {
+  readonly runId: RunId;
+  readonly canceledByRunId: RunId;
+  readonly concurrencyKey: string;
+  constructor(args: {
+    readonly runId: RunId;
+    readonly canceledByRunId: RunId;
+    readonly concurrencyKey: string;
+  }) {
+    super(
+      `Run ${args.runId} was canceled (superseded by run ${args.canceledByRunId} for concurrency key "${args.concurrencyKey}").`,
+    );
+    this.name = "NagiCanceledError";
+    this.runId = args.runId;
+    this.canceledByRunId = args.canceledByRunId;
+    this.concurrencyKey = args.concurrencyKey;
+    this.cause = {
+      canceledByRunId: args.canceledByRunId,
+      concurrencyKey: args.concurrencyKey,
+    };
   }
 }
 
@@ -169,6 +208,13 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
     }
   }
 
+  // Resolve codeVersion once. If the caller omitted it, derive a structural
+  // fingerprint over the registered flows so the audit field is meaningful
+  // by default. Stable across deploys that don't change topology; moves
+  // when any structural change (added step, edge, flipped `when`, etc.) lands.
+  const codeVersion =
+    config.codeVersion ?? (await fingerprintFlows(config.flows));
+
   async function flowFor(runId: RunId): Promise<Flow> {
     const runState = await config.store.loadRunState(runId);
     const flow = flowsById.get(runState.flowId);
@@ -232,12 +278,34 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
         input: validated,
         at: startedAt,
         ...(flowHash !== undefined ? { flowHash } : {}),
-        ...(config.codeVersion !== undefined
-          ? { codeVersion: config.codeVersion }
-          : {}),
+        codeVersion,
       };
 
-      const { started } = await config.store.tryStartRun(runId, fact);
+      // Derive the concurrency group key from validated input, if configured.
+      // `keyFn` is synchronous and pure per the FlowConcurrency contract.
+      // Non-string / empty return → validation error (catches typos like
+      // `(input) => input.dealId` where `dealId` doesn't exist on the schema).
+      let concurrencyArg:
+        | { readonly key: string; readonly mode: "cancel-in-progress" }
+        | undefined;
+      if (flow.concurrency !== undefined) {
+        const derived = flow.concurrency.keyFn(validated);
+        if (typeof derived !== "string" || derived.length === 0) {
+          throw new NagiValidationError([
+            {
+              message: `flow.concurrency.keyFn must return a non-empty string (got ${typeof derived === "string" ? '""' : typeof derived})`,
+              path: ["concurrency", "keyFn"],
+            },
+          ]);
+        }
+        concurrencyArg = { key: derived, mode: flow.concurrency.mode };
+      }
+
+      const { started, canceled } = await config.store.tryStartRun(
+        runId,
+        fact,
+        concurrencyArg,
+      );
       if (!started) {
         // Idempotent no-op: a run with this ID already exists. Per the contract
         // we do NOT re-append the fact, do NOT re-dispatch, and do NOT
@@ -245,6 +313,46 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
         // we did, callers asked for "use this runId" semantics — not "verify
         // the same input").
         return runId;
+      }
+
+      // Fire onError hooks for runs that were canceled atomically inside
+      // tryStartRun. We do this before the new run's onStart so observers
+      // see the supersede/start pair in the natural cause→effect order.
+      for (const c of canceled) {
+        const cancelError = new NagiCanceledError({
+          runId: c.runId,
+          canceledByRunId: runId,
+          concurrencyKey: c.fact.concurrencyKey,
+        });
+        const serialized: SerializedError = {
+          name: cancelError.name,
+          message: cancelError.message,
+          ...(cancelError.stack !== undefined
+            ? { stack: cancelError.stack }
+            : {}),
+          cause: {
+            canceledByRunId: runId,
+            concurrencyKey: c.fact.concurrencyKey,
+          },
+        };
+        const errorEvent = {
+          runId: c.runId,
+          flowId: flow.id,
+          error: serialized,
+          at: c.fact.at,
+        };
+        await fireRuntimeHook(
+          flow.onError,
+          errorEvent,
+          "flow.onError",
+          dispatchDeps,
+        );
+        await fireRuntimeHook(
+          config.hooks?.onFlowError,
+          errorEvent,
+          "onFlowError",
+          dispatchDeps,
+        );
       }
 
       const startEvent = {
@@ -363,6 +471,12 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       if (!liveFlow) {
         throw new NagiRuntimeError(
           `Run ${runId} references flow "${runState.flowId}" which is not registered with nagi().`,
+        );
+      }
+      if (runState.status === "canceled") {
+        throw new NagiRuntimeError(
+          `Run ${runId} was canceled (superseded by a newer run with the same concurrency key). ` +
+            `Replay is not supported for canceled runs — start a new run instead.`,
         );
       }
       if (opts.mode === "inspect") return;

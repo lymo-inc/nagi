@@ -416,6 +416,33 @@ export type AsStepMap<R> =
       ? R
       : never;
 
+/**
+ * Modes for `FlowConcurrency`. v1 implements only `cancel-in-progress`; the
+ * union is a single literal so adding `queue` / `reject` later is a
+ * non-breaking widening rather than a new discriminator.
+ */
+export type ConcurrencyMode = "cancel-in-progress";
+
+/**
+ * Per-flow concurrency control. When set, `wf.start()` derives a group key
+ * from the validated input and applies the configured `mode` against any
+ * prior run sharing the same `(flowId, key)` pair.
+ *
+ * `cancel-in-progress`: any active prior run with the same key transitions
+ * to the `canceled` terminal state before the new run is inserted. In-flight
+ * steps on the canceled run run to completion (their facts persist), but the
+ * dispatcher stops scheduling further steps for it.
+ */
+export interface FlowConcurrency<Input = Json> {
+  /**
+   * Derive the concurrency group key from the validated flow input.
+   * Synchronous + pure. Returning a non-string or an empty string throws
+   * `NagiValidationError` at `wf.start()` time.
+   */
+  readonly keyFn: (input: Input) => string;
+  readonly mode: ConcurrencyMode;
+}
+
 export interface FlowConfig<
   Id extends string,
   InputSchema extends StandardSchemaV1,
@@ -440,12 +467,24 @@ export interface FlowConfig<
   output?(steps: NeedsOutputs<AsStepMap<R>>): Output;
 
   /**
+   * Concurrency group config. See {@link FlowConcurrency}. `keyFn` is typed
+   * against the schema's parsed output — what `b.task`'s `run({ input })`
+   * receives — so refactors to the input schema break the key derivation
+   * at compile time.
+   */
+  readonly concurrency?: FlowConcurrency<InferSchemaOutput<InputSchema>>;
+
+  /**
    * Flow-level lifecycle hooks. Like step-local hooks (see {@link TaskConfig}),
    * these fire *before* the cross-cutting `FlowHooks` callbacks, and a thrown
    * hook is swallowed + logged rather than failing the run.
    *
    * `onComplete`'s event is typed against this flow's `Output` (whatever the
    * `output()` resolver returns).
+   *
+   * `onError` also fires when a run is canceled by a concurrency-group
+   * supersede; the event's `error.name` is `"NagiCanceledError"` and
+   * `error.cause` carries `{ canceledByRunId, concurrencyKey }`.
    */
   readonly onStart?: (event: FlowStartEvent) => void | Promise<void>;
   readonly onComplete?: (
@@ -476,6 +515,12 @@ export interface Flow<
   readonly onStart?: (event: FlowStartEvent) => void | Promise<void>;
   readonly onComplete?: (event: FlowCompleteEvent) => void | Promise<void>;
   readonly onError?: (event: FlowErrorEvent) => void | Promise<void>;
+  /**
+   * Forwarded from {@link FlowConfig.concurrency}. The runtime form widens
+   * `Input` to `Json` so a concrete `Flow<...{x: number}>` is assignable to
+   * `Flow<...unknown>` (the dispatcher's view).
+   */
+  readonly concurrency?: FlowConcurrency<Json>;
 }
 
 export type FlowInput<F> =
@@ -616,13 +661,24 @@ export interface Store {
   /**
    * Atomically begin a run. Inserts the `flow.started` fact and any
    * materialized run row keyed by `runId` IFF no run with this `runId` already
-   * exists. Returns `{ started: true }` if this call created the run,
-   * `{ started: false }` if the run already exists.
+   * exists. Returns `{ started: true, canceled: [...] }` if this call created
+   * the run, `{ started: false, canceled: [] }` if the run already exists.
    *
    * Two concurrent `tryStartRun(runId, ...)` calls with the same `runId` must
    * result in exactly one `flow.started` fact. Adapters enforce this at the
    * durability layer (e.g. Postgres `INSERT ... ON CONFLICT DO NOTHING` keyed
    * by `run_id`), NOT via app-level check-then-insert.
+   *
+   * When `concurrency` is supplied, the adapter ALSO atomically cancels any
+   * prior runs whose `(flowId, concurrency.key)` matches and whose status is
+   * still `pending` / `running`. Each canceled run gets a `flow.canceled`
+   * fact appended to its log and its materialized status updated to
+   * `canceled`. The returned `canceled` array carries the fact for each
+   * canceled run so the runtime can fire `onFlowError` post-commit.
+   *
+   * Adapters MUST serialize concurrent starts for the same
+   * `(flowId, concurrency.key)` (e.g. Postgres advisory-lock keyed on the
+   * pair) so the partial unique index on active runs is never violated.
    *
    * The runtime calls this exactly once at `wf.start()`. Subsequent facts go
    * through `appendFact` as usual.
@@ -630,7 +686,17 @@ export interface Store {
   tryStartRun(
     runId: RunId,
     fact: FlowStartedFact,
-  ): Promise<{ readonly started: boolean }>;
+    concurrency?: {
+      readonly key: string;
+      readonly mode: ConcurrencyMode;
+    },
+  ): Promise<{
+    readonly started: boolean;
+    readonly canceled: ReadonlyArray<{
+      readonly runId: RunId;
+      readonly fact: FlowCanceledFact;
+    }>;
+  }>;
 
   /**
    * Returns null if the step is already claimed under a live lease. Lease
@@ -797,6 +863,7 @@ export type FactKind =
   | "flow.started"
   | "flow.completed"
   | "flow.failed"
+  | "flow.canceled"
   | "step.started"
   | "step.completed"
   | "step.failed"
@@ -862,6 +929,20 @@ export interface FlowFailedFact extends FactBase {
   readonly error: SerializedError;
 }
 
+/**
+ * Recorded on a prior run when a new `wf.start()` with the same concurrency
+ * group supersedes it. The fact lives in the canceled run's fact log (not
+ * the new run's) — observers reading that run's history see exactly when and
+ * why it was canceled.
+ */
+export interface FlowCanceledFact extends FactBase {
+  readonly kind: "flow.canceled";
+  /** The new run that took over this run's concurrency slot. */
+  readonly canceledByRunId: RunId;
+  /** The shared concurrency key between this run and `canceledByRunId`. */
+  readonly concurrencyKey: string;
+}
+
 export interface StepStartedFact extends FactBase {
   readonly kind: "step.started";
   readonly stepId: StepId;
@@ -924,6 +1005,7 @@ export type Fact =
   | FlowStartedFact
   | FlowCompletedFact
   | FlowFailedFact
+  | FlowCanceledFact
   | StepStartedFact
   | StepCompletedFact
   | StepFailedFact
@@ -934,7 +1016,12 @@ export type Fact =
   | OnceRecordedFact
   | MatchArmSelectedFact;
 
-export type RunStatus = "pending" | "running" | "completed" | "failed";
+export type RunStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled";
 export type StepStatus =
   | "pending"
   | "running"
