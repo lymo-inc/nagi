@@ -2,10 +2,10 @@
 "@nagi-js/core": patch
 ---
 
-`b.signal({ ... })` can now accept multiple external names. Pass
+`b.signal({ ... })` can now accept one or more external names. Pass
 `names: ['audioReady', 'recordingReady']` to let one signal step resolve on
-the first arrival from any of N upstream sources, or `name: 'approval'` to
-decouple a single signal name from the step id. Omitting both keeps today's
+the first arrival from any of N upstream sources, or `names: ['approval']` to
+decouple a single signal name from the step id. Omitting `names` keeps today's
 behaviour — the step id is the signal name. Late-arriving losers (a recognized
 alias for an already-resolved step) are a no-op + logged, not a throw.
 

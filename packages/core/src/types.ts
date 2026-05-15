@@ -163,47 +163,20 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
   readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
-interface SignalConfigBase<
+/**
+ * One signal step accepts one or more external signal names. Omitting
+ * `names` defaults to `[stepId]` (back-compat behavior). Passing `names:
+ * [...]` accepts any listed name; first arrival wins, late losers are a
+ * no-op + logged. Non-empty tuple type so `names: []` is a compile error.
+ */
+export interface SignalConfig<
   Input,
   N extends NeedsMap,
   Schema extends StandardSchemaV1,
 > extends StepConfigBase<Input, N> {
   readonly schema: Schema;
+  readonly names?: readonly [string, ...string[]];
 }
-
-/**
- * Default — signal name defaults to the step id. `name` may be supplied to
- * decouple the external signal name from the step id; `names` is forbidden
- * in this variant (use {@link SignalConfigMulti}).
- */
-interface SignalConfigSingle<
-  Input,
-  N extends NeedsMap,
-  Schema extends StandardSchemaV1,
-> extends SignalConfigBase<Input, N, Schema> {
-  readonly name?: string;
-  readonly names?: never;
-}
-
-/**
- * Multi-name — this signal step accepts ANY of the listed names; first
- * arrival wins. Subsequent arrivals of a loser name are no-op + logged.
- * Non-empty tuple type so `names: []` is a compile error.
- */
-interface SignalConfigMulti<
-  Input,
-  N extends NeedsMap,
-  Schema extends StandardSchemaV1,
-> extends SignalConfigBase<Input, N, Schema> {
-  readonly names: readonly [string, ...string[]];
-  readonly name?: never;
-}
-
-export type SignalConfig<
-  Input,
-  N extends NeedsMap,
-  Schema extends StandardSchemaV1,
-> = SignalConfigSingle<Input, N, Schema> | SignalConfigMulti<Input, N, Schema>;
 
 /**
  * Discriminator mode — exhaustive at compile time. `cases` must cover every

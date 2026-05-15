@@ -44,12 +44,13 @@ Existing callers see no change — neither in source nor in snapshot hash.
 ### Single-name, explicit
 
 ```ts
-review: b.signal({ name: "approval", schema })
+review: b.signal({ names: ["approval"], schema })
 // → wf.signal(runId, "approval", payload). Step id stays "review".
 ```
 
 Useful when the natural step id (e.g. `review`) differs from the external
-signal name (`approval`).
+signal name (`approval`). The single-element list is the same primitive as
+multi-name, just with one entry — there is no separate singular `name` field.
 
 ### Multi-name
 
@@ -64,15 +65,6 @@ transcript: b.signal({
 Same downstream join; two upstream sources. The schema is the caller's
 discrimination mechanism — the runtime validates the payload against it
 unchanged.
-
-### Mutual exclusion is type-level
-
-```ts
-// Type error — `name` and `names` cannot both be set.
-b.signal({ name: "x", names: ["y"], schema })
-```
-
-Enforced via a discriminated union; bad combos are unrepresentable.
 
 ## Semantics
 
@@ -112,32 +104,25 @@ external name and a deploy starts misrouting webhooks.
 
 ## Detailed design
 
-### `SignalConfig` — discriminated union
+### `SignalConfig` — single interface
 
 `packages/core/src/types.ts:166–172`:
 
 ```ts
-interface SignalConfigBase<Input, N extends NeedsMap, Schema extends StandardSchemaV1>
+export interface SignalConfig<Input, N extends NeedsMap, Schema extends StandardSchemaV1>
   extends StepConfigBase<Input, N> {
   readonly schema: Schema;
+  /**
+   * Signal names this step accepts. Omitted → defaults to [stepId].
+   * Non-empty tuple type — `names: []` is a compile error.
+   */
+  readonly names?: readonly [string, ...string[]];
 }
-
-// Either no name fields (default to step id) or `name` (single, named) ...
-type SignalConfigDefault<Input, N, S> = SignalConfigBase<Input, N, S> & {
-  readonly name?: string;
-  readonly names?: never;
-};
-
-// ... or `names` (multi). Non-empty tuple type — empty arrays are a type error.
-type SignalConfigMulti<Input, N, S> = SignalConfigBase<Input, N, S> & {
-  readonly names: readonly [string, ...string[]];
-  readonly name?: never;
-};
-
-export type SignalConfig<Input, N extends NeedsMap, S extends StandardSchemaV1> =
-  | SignalConfigDefault<Input, N, S>
-  | SignalConfigMulti<Input, N, S>;
 ```
+
+One field, one optional. No discriminated union, no `name` / `names`
+mutual exclusion to enforce — the singular-explicit case is just
+`names: ["x"]`.
 
 ### `SignalDef` — normalized representation
 
@@ -157,9 +142,9 @@ interface SignalDef {
 ```
 
 Convention: the internal `names` field is **only** populated when the caller
-explicitly supplied `name` or `names`. The default case (no name field set)
-leaves `names` undefined and the lookup path resolves via step id. This keeps
-the canonical hash byte-identical for back-compat callers.
+explicitly supplied `names`. The default case (no `names` set) leaves it
+undefined and the lookup path resolves via step id. This keeps the canonical
+hash byte-identical for back-compat callers.
 
 ### Builder
 
@@ -169,19 +154,11 @@ the canonical hash byte-identical for back-compat callers.
 function signal<N extends NeedsMap, S extends StandardSchemaV1>(
   config: SignalConfig<Input, N, S>,
 ): Step<InferSchemaOutput<S>> {
-  // Caller may supply { name: 'x' } OR { names: [...] } OR neither.
-  const explicit: readonly [string, ...string[]] | undefined =
-    "names" in config && config.names !== undefined
-      ? config.names
-      : "name" in config && config.name !== undefined
-        ? [config.name]
-        : undefined;
-
   const def: SignalDef = {
     kind: "signal",
     needs: (config.needs ?? {}) as NeedsMap,
     schema: config.schema,
-    ...(explicit !== undefined ? { names: explicit } : {}),
+    ...(config.names !== undefined ? { names: config.names } : {}),
     ...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
     ...(config.when !== undefined ? { when: config.when as ... } : {}),
   };
@@ -189,45 +166,47 @@ function signal<N extends NeedsMap, S extends StandardSchemaV1>(
 }
 ```
 
-### `flow()` — uniqueness check
+One conditional spread. `config.names` is already the right shape (or
+undefined). No normalization, no discrimination of input shapes.
+
+### `flow()` — uniqueness check (validate-only, no persistence)
 
 Add a pass after `walkAndRewrite` in `flow()` (`builder.ts:301–343`) that
-builds a `Map<string, string>` of `(name → "stepId:<id>" | "alias:<id>")` and
-throws on collision. Naming the source in the error lets the caller jump
-straight to the bad code:
-
-```
-Flow "videoAnalysis": signal name "audioReady" is declared as both
-    step "transcript"'s alias  and  step "audioReady"'s id.
-Pick one. (Signal names share a namespace with step ids.)
-```
-
-### `nagi()` — name index
-
-Build a `Map<flowId, Map<signalName, stepId>>` at boot. `wf.signal()` reads
-from it. Computing it once at boot is O(steps) and re-amortizes the cost
-across all subsequent `wf.signal()` calls.
+walks `(stepId, ...signal aliases)` and throws on collision. The `claimed`
+map is **local to the check** — it falls out of scope when `flow()` returns.
+No long-lived index is built; we trust that the same iteration happens
+freshly inside `wf.signal()` when needed.
 
 ```ts
-// in nagi(), after the per-flow canonicalize loop
-const signalNameIndex = new Map<string, Map<string, string>>();
-for (const flow of config.flows) {
-  const m = new Map<string, string>();
-  for (const [stepId, step] of Object.entries(flow.steps)) {
-    const def = getDef(step);
-    if (def.kind !== "signal") continue;
-    const names = def.names ?? [stepId];
-    for (const name of names) {
-      m.set(name, stepId);
+const claimed = new Map<string, string>(); // name → "step:<id>" | "alias:<id>"
+for (const [stepId, step] of Object.entries(flatSteps)) {
+  const def = getDef(step);
+  const isSignal = def.kind === "signal";
+  const aliases = isSignal && def.names ? def.names : null;
+  const names = aliases ?? [stepId];
+  for (const name of names) {
+    const prior = claimed.get(name);
+    if (prior !== undefined) {
+      throw new NagiBuildError(
+        `Flow "${flowId}": signal name "${name}" is claimed by both ` +
+          `${prior} and ${aliases ? `alias:${stepId}` : `step:${stepId}`}. ` +
+          `Pick one. (Signal names share a namespace with step ids.)`,
+      );
     }
+    claimed.set(name, aliases ? `alias:${stepId}` : `step:${stepId}`);
   }
-  signalNameIndex.set(flow.id, m);
 }
 ```
 
-(Uniqueness is already enforced in `flow()` — this loop trusts that.)
+Naming the source in the error lets the caller jump straight to the bad
+code:
 
-### `wf.signal()` — lookup + late-loser path
+```
+Flow "videoAnalysis": signal name "audioReady" is claimed by both
+    alias:transcript and step:audioReady. Pick one.
+```
+
+### `wf.signal()` — inline lookup + late-loser path
 
 `packages/core/src/runtime.ts:381–454`:
 
@@ -237,25 +216,41 @@ async signal(runId, name, payload): Promise<void> {
   const flow = flowsById.get(runState.flowId);
   if (!flow) throw new NagiRuntimeError(...);
 
-  const stepId = signalNameIndex.get(flow.id)?.get(name);
-  if (stepId === undefined) {
+  // Fast path: name === step id and that step is a signal.
+  // Slow path: scan for a signal step whose explicit `names` includes `name`.
+  let matchedStepId: string | undefined;
+  const direct = flow.steps[name];
+  if (direct && getDef(direct).kind === "signal") {
+    matchedStepId = name;
+  } else {
+    for (const [stepId, step] of Object.entries(flow.steps)) {
+      const def = getDef(step);
+      if (def.kind === "signal" && def.names?.includes(name)) {
+        matchedStepId = stepId;
+        break;
+      }
+    }
+  }
+
+  if (matchedStepId === undefined) {
     throw new NagiRuntimeError(
       `Flow "${flow.id}" has no signal step accepting "${name}".`,
     );
   }
-  const def = getDef(flow.steps[stepId]);   // guaranteed signal by index
-  const stepState = runState.steps[stepId];
+  const def = getDef(flow.steps[matchedStepId]);   // narrowed to signal above
+  const stepState = runState.steps[matchedStepId];
 
   if (stepState?.status !== "running") {
     // Late loser? `running` is the only state a signal can resolve in.
     if (stepState?.status === "completed") {
       logger.info("nagi: signal arrived after step resolved", {
-        runId, stepId, signalName: name,
+        runId, stepId: matchedStepId, signalName: name,
       });
       return;
     }
     throw new NagiRuntimeError(
-      `Step "${stepId}" is not waiting for signal (status: ${stepState?.status ?? "pending"}).`,
+      `Step "${matchedStepId}" is not waiting for signal ` +
+        `(status: ${stepState?.status ?? "pending"}).`,
     );
   }
 
@@ -263,17 +258,23 @@ async signal(runId, name, payload): Promise<void> {
   const fact: SignalReceivedFact = {
     kind: "signal.received",
     runId,
-    stepId,
+    stepId: matchedStepId,
     payload: validated,
     at: clock.now(),
-    ...(name !== stepId ? { signalName: name } : {}),
+    ...(name !== matchedStepId ? { signalName: name } : {}),
   };
   await store.appendFact(runId, fact);
-  await store.completeStep(runId, stepId, validated, completedFact);
+  await store.completeStep(runId, matchedStepId, validated, completedFact);
   await fireRuntimeHook(config.hooks?.onSignalReceived, {...});
   await advance(dispatchDeps, runId);
 }
 ```
+
+The scan is O(steps) per webhook arrival. At LLM-workflow scale (tens of
+steps per flow, single-digit webhook arrivals per run), this is microseconds
+and not on any hot path. Pre-building a boot-time `Map<flowId, Map<name,
+stepId>>` was rejected as premature optimization that would have
+double-bookkept against `flow.steps`.
 
 ### `SignalReceivedFact` — optional `signalName`
 
@@ -335,9 +336,9 @@ Pinned behaviors:
 
 1. **Default (no name field).** `b.signal({ schema })` → `wf.signal(runId,
    stepId, payload)` resolves as today.
-2. **Single explicit name.** `b.signal({ name: "x", schema })` →
-   `wf.signal(runId, "x", payload)` resolves; sending the step id instead
-   does NOT resolve (throws "no signal step accepting ...").
+2. **Single explicit name.** `b.signal({ names: ["x"], schema })` (step id
+   `review`) → `wf.signal(runId, "x", payload)` resolves; sending the step id
+   `review` instead does NOT resolve (throws "no signal step accepting ...").
 3. **Multi-name: first wins.** `names: ["a", "b"]`, send `a` first → step
    resolves with `a`'s payload. Subsequent `wf.signal(runId, "b", payload2)`
    is a no-op (no second `signal.received` fact, no throw).
@@ -352,16 +353,20 @@ Pinned behaviors:
    throws at `flow()` build time.
 8. **Construction-time uniqueness — alias vs alias.** Two signal steps with
    overlapping `names` throws at `flow()` time.
-9. **Type-level mutual exclusion.** `// @ts-expect-error` smoke test:
-   `b.signal({ name: "x", names: ["y"], schema })` is a type error.
+9. **Type-level empty-tuple rejection.** `// @ts-expect-error` smoke test:
+   `b.signal({ names: [], schema })` is a type error (the non-empty tuple
+   type forbids it).
 10. **Hash invariants (extend `fingerprint.test.ts` or a new
     `canonicalize.test.ts` case):**
     - `b.signal({ schema })` vs `b.signal({ schema })` (same flow id, same
       step id) → same hash. **No movement vs pre-RFC behavior.**
-    - `b.signal({ schema })` (step id `x`) vs `b.signal({ name: "x", schema })`
+    - `b.signal({ schema })` (step id `x`) vs `b.signal({ names: ["x"] })`
       (step id `y`) → different hash even though the resolved single name
-      `"x"` is the same. The presence of an explicit `name` is a structural
+      `"x"` is the same. The presence of an explicit `names` is a structural
       signal.
+    - `b.signal({ schema })` (step id `x`) vs `b.signal({ names: ["x"] })`
+      (step id `x`) → different hash. Same routing surface, but the explicit
+      declaration is a structural intent signal worth preserving.
     - `b.signal({ names: ["a", "b"] })` vs `b.signal({ names: ["b", "a"] })`
       → same hash (sorted before folding).
     - `b.signal({ names: ["a", "b"] })` vs `b.signal({ names: ["a", "c"] })`
@@ -422,20 +427,20 @@ strictly worse. Rejected.
 
 ## Implementation order
 
-1. **Types** — `SignalConfig` discriminated union, `SignalDef.names`,
-   `SignalReceivedFact.signalName?`, `CanonicalStep.signalNames?`.
-2. **Builder** — normalize `name | names | (neither)` into `SignalDef.names`
+1. **Types** — `SignalConfig.names?` (single optional field),
+   `SignalDef.names?`, `SignalReceivedFact.signalName?`,
+   `CanonicalStep.signalNames?`.
+2. **Builder** — one conditional spread of `config.names` into `SignalDef`
    (only set when explicit).
-3. **`flow()` uniqueness pass** — single pass collecting
-   `(stepId, ...signal aliases)` and throwing on collision.
+3. **`flow()` uniqueness pass** — single validate-only pass over
+   `(stepId, ...signal aliases)` throwing on collision; nothing persisted.
 4. **`canonicalize.ts`** — fold `signalNames` into `CanonicalStep` when
    present.
-5. **`nagi()` boot** — build `signalNameIndex: Map<flowId, Map<name, stepId>>`.
-6. **`wf.signal()`** — replace `flow.steps[stepName]` with index lookup;
-   add late-loser branch (log + return); attach `signalName` to fact when
-   name != stepId.
-7. **Tests** — new file (or extend `runtime.test.ts` + `canonicalize.test.ts`).
-8. **Changeset** — `patch` for `@nagi-js/core` documenting the new fields
+5. **`wf.signal()`** — fast-path `flow.steps[name]` for `name === stepId`,
+   slow-path scan for `def.names?.includes(name)`; add late-loser branch
+   (log + return); attach `signalName` to fact when name != stepId.
+6. **Tests** — new file (or extend `runtime.test.ts` + `canonicalize.test.ts`).
+7. **Changeset** — `patch` for `@nagi-js/core` documenting the new fields
    (additive; no breaking changes).
 
 README and public docs are Jay's to write.

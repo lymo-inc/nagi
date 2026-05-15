@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { canonicalize, sha256Canonical } from "./canonicalize";
+import { NagiRuntimeError } from "./runtime";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 import type { Logger, SignalReceivedFact } from "./types";
 
@@ -65,7 +66,7 @@ describe("b.signal — single-name back-compat", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         review: b.signal({
-          name: "approval",
+          names: ["approval"],
           schema: passthroughSchema<{ ok: boolean }>(),
         }),
       }),
@@ -92,7 +93,7 @@ describe("b.signal — single-name back-compat", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         review: b.signal({
-          name: "approval",
+          names: ["approval"],
           schema: passthroughSchema<{ ok: boolean }>(),
         }),
       }),
@@ -182,25 +183,32 @@ describe("b.signal — multi-name", () => {
       const state = await h.store.loadRunState(runId);
       const received = state.facts.filter((f) => f.kind === "signal.received");
       expect(received).toHaveLength(1);
-      expect(
-        entries.some(
-          (e) =>
-            e.level === "info" &&
-            e.msg.includes("signal arrived after step resolved"),
-        ),
-      ).toBe(true);
+      const lateLoserLog = entries.find(
+        (e) =>
+          e.level === "info" &&
+          e.msg.includes("signal arrived after step resolved"),
+      );
+      expect(lateLoserLog).toBeDefined();
+      expect(lateLoserLog?.attrs).toMatchObject({
+        runId,
+        stepId: "transcript",
+        signalName: "recordingReady",
+      });
     } finally {
       await w.stop();
     }
   });
 
-  it("unknown signal name throws", async () => {
+  it("unknown signal name throws NagiRuntimeError", async () => {
     const f = dualSourceFlow();
     const h = await makeHarness(f);
     const w = h.startWorker();
     try {
       const runId = await h.wf.start(f, {});
       await h.waitForStep(runId, "transcript", "running");
+      await expect(
+        h.wf.signal(runId, "nopeNotADeclaredAlias", { audioUrl: "u" }),
+      ).rejects.toThrowError(NagiRuntimeError);
       await expect(
         h.wf.signal(runId, "nopeNotADeclaredAlias", { audioUrl: "u" }),
       ).rejects.toThrow(/no signal step accepting "nopeNotADeclaredAlias"/);
@@ -267,7 +275,7 @@ describe("b.signal — construction-time uniqueness", () => {
 });
 
 describe("b.signal — canonical hash invariants", () => {
-  function withSchema(name: string | undefined, names?: readonly string[]) {
+  function withSchema(names?: readonly string[]) {
     return flow({
       id: "hash-target",
       input: passthroughSchema<Record<string, never>>(),
@@ -278,54 +286,94 @@ describe("b.signal — canonical hash invariants", () => {
                 names: names as readonly [string, ...string[]],
                 schema: passthroughSchema<{ v: number }>(),
               }
-            : name !== undefined
-              ? {
-                  name,
-                  schema: passthroughSchema<{ v: number }>(),
-                }
-              : {
-                  schema: passthroughSchema<{ v: number }>(),
-                },
+            : {
+                schema: passthroughSchema<{ v: number }>(),
+              },
         ),
       }),
     });
   }
 
-  it("default (no name) hashes identically to itself (pre-RFC byte-stability)", async () => {
-    const a = await sha256Canonical(await canonicalize(withSchema(undefined)));
-    const b = await sha256Canonical(await canonicalize(withSchema(undefined)));
+  it("default (no names) hashes identically to itself (pre-RFC byte-stability)", async () => {
+    const a = await sha256Canonical(await canonicalize(withSchema()));
+    const b = await sha256Canonical(await canonicalize(withSchema()));
     expect(a).toBe(b);
   });
 
-  it("default vs explicit single name (same value as step id) → different hash", async () => {
-    // Explicitly setting name === stepId still moves the hash, because the
-    // declaration itself is structural: the caller has opted into named routing.
-    const noName = await sha256Canonical(
-      await canonicalize(withSchema(undefined)),
-    );
+  it("default vs explicit names: [stepId] (same routing) → different hash", async () => {
+    // Explicitly listing the step id in `names` still moves the hash, because
+    // the declaration itself is structural: the caller has opted into named
+    // routing.
+    const noNames = await sha256Canonical(await canonicalize(withSchema()));
     const explicit = await sha256Canonical(
-      await canonicalize(withSchema("only")),
+      await canonicalize(withSchema(["only"])),
     );
-    expect(noName).not.toBe(explicit);
+    expect(noNames).not.toBe(explicit);
   });
 
   it("multi-name list is order-independent in the hash", async () => {
     const ab = await sha256Canonical(
-      await canonicalize(withSchema(undefined, ["a", "b"])),
+      await canonicalize(withSchema(["a", "b"])),
     );
     const ba = await sha256Canonical(
-      await canonicalize(withSchema(undefined, ["b", "a"])),
+      await canonicalize(withSchema(["b", "a"])),
     );
     expect(ab).toBe(ba);
   });
 
   it("changing the set of accepted names moves the hash", async () => {
     const ab = await sha256Canonical(
-      await canonicalize(withSchema(undefined, ["a", "b"])),
+      await canonicalize(withSchema(["a", "b"])),
     );
     const ac = await sha256Canonical(
-      await canonicalize(withSchema(undefined, ["a", "c"])),
+      await canonicalize(withSchema(["a", "c"])),
     );
     expect(ab).not.toBe(ac);
+  });
+
+  it("different step id with same resolved single name → different hash", async () => {
+    // Step `x` with default vs step `y` with `names: ["x"]`. Both resolve
+    // the external name "x" but the step id differs (and so the canonical
+    // shape differs): the second declares routing explicitly while the
+    // first inherits it from the step id.
+    const stepXDefault = flow({
+      id: "hash-target",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        x: b.signal({ schema: passthroughSchema<{ v: number }>() }),
+      }),
+    });
+    const stepYAliasedToX = flow({
+      id: "hash-target",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        y: b.signal({
+          names: ["x"],
+          schema: passthroughSchema<{ v: number }>(),
+        }),
+      }),
+    });
+    const a = await sha256Canonical(await canonicalize(stepXDefault));
+    const b = await sha256Canonical(await canonicalize(stepYAliasedToX));
+    expect(a).not.toBe(b);
+  });
+});
+
+describe("b.signal — type-level constraints", () => {
+  it("rejects empty `names` tuple at compile time", () => {
+    // The non-empty tuple type `readonly [string, ...string[]]` should
+    // make `names: []` a type error. This test exists to fail the build
+    // if the constraint regresses to `readonly string[]`.
+    flow({
+      id: "type-check-empty-names",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        bad: b.signal({
+          // @ts-expect-error - empty tuple is rejected by the non-empty type
+          names: [],
+          schema: passthroughSchema<{ v: number }>(),
+        }),
+      }),
+    });
   });
 });

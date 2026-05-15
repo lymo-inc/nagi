@@ -112,24 +112,14 @@ function makeBuilder<Input>(): Builder<Input> {
   function signal<N extends NeedsMap, S extends StandardSchemaV1>(
     config: SignalConfig<Input, N, S>,
   ): Step<InferSchemaOutput<S>> {
-    // `name` xor `names` is a type-level constraint (see SignalConfig union);
-    // normalize to a single internal `names` field. Leave it undefined when
-    // the caller supplied neither — the lookup path resolves via step id for
-    // that case, preserving byte-identical hashes for pre-RFC-0004 flows.
-    const namedAs = "names" in config ? config.names : undefined;
-    const namedAsSingle = "name" in config ? config.name : undefined;
-    const explicit: readonly [string, ...string[]] | undefined =
-      namedAs !== undefined
-        ? namedAs
-        : namedAsSingle !== undefined
-          ? [namedAsSingle]
-          : undefined;
-
+    // `names` is only stored when the caller passed it explicitly. Leaving
+    // it undefined for the default case keeps pre-RFC-0004 flows byte-stable
+    // in the canonical hash.
     const def: SignalDef = {
       kind: "signal",
       needs: (config.needs ?? {}) as NeedsMap,
       schema: config.schema,
-      ...(explicit !== undefined ? { names: explicit } : {}),
+      ...(config.names !== undefined ? { names: config.names } : {}),
       ...(config.timeoutMs !== undefined
         ? { timeoutMs: config.timeoutMs }
         : {}),
@@ -495,8 +485,8 @@ function walkAndRewrite(args: WalkArgs): void {
 
 /**
  * Signal names share a namespace with step ids: every step's id is implicitly
- * an accepted signal name, and explicit `name` / `names` on a signal step
- * adds aliases to that same namespace. Two declarations of the same name —
+ * an accepted signal name, and explicit `names` on a signal step adds aliases
+ * to that same namespace. Two declarations of the same name —
  * step-id-vs-alias OR alias-vs-alias — make `wf.signal(runId, name, ...)`
  * ambiguous. We catch that at construction so a bad flow can't boot.
  */

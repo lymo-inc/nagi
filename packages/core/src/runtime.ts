@@ -10,7 +10,7 @@ import {
   dispatchMessage,
   fireHook as fireRuntimeHook,
 } from "./dispatch";
-import { attachDef, getDef, type StepDef } from "./internal";
+import { attachDef, getDef, type SignalDef, type StepDef } from "./internal";
 import { InMemoryClock } from "./memory";
 import type {
   Clock,
@@ -215,24 +215,6 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
   const codeVersion =
     config.codeVersion ?? (await fingerprintFlows(config.flows));
 
-  // Map<flowId, Map<signalName, stepId>>. Built once at boot so `wf.signal()`
-  // can resolve `(flowId, name)` → step id in O(1). Each signal step
-  // contributes its step id (always) plus any explicit `names` aliases.
-  // Construction-time uniqueness is enforced in `flow()` (`builder.ts`).
-  const signalNameIndex = new Map<string, Map<string, string>>();
-  for (const f of config.flows) {
-    const m = new Map<string, string>();
-    for (const [stepId, step] of Object.entries(f.steps)) {
-      const def = getDef(step);
-      if (def.kind !== "signal") continue;
-      const names = def.names ?? [stepId];
-      for (const name of names) {
-        m.set(name, stepId);
-      }
-    }
-    signalNameIndex.set(f.id, m);
-  }
-
   async function flowFor(runId: RunId): Promise<Flow> {
     const runState = await config.store.loadRunState(runId);
     const flow = flowsById.get(runState.flowId);
@@ -408,28 +390,38 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
           `Run ${runId} references flow "${runState.flowId}" which is not registered with nagi().`,
         );
       }
-      // Resolve the incoming signal name → step id via the boot-time index.
-      // The index covers both each signal step's id (always) and any explicit
-      // `names` aliases. Anything not in the index is a genuine call-site bug.
-      const stepId = signalNameIndex.get(flow.id)?.get(signalName);
+      // Resolve signalName → (stepId, def).
+      //   Fast path: signalName === step id and the step is a signal with NO
+      //     explicit `names` (so the step id is the implicit accepted name).
+      //   Slow path: scan for a signal step whose explicit `names` includes
+      //     signalName. A step that opted into `names` rejects its own step id
+      //     unless the id is also listed in `names`.
+      // Construction-time uniqueness (`assertSignalNameUniqueness` in
+      // builder.ts) guarantees at most one match across both paths. O(steps)
+      // is fine — webhook frequency is single-digit per run.
+      let stepId: string | undefined;
+      let def: SignalDef | undefined;
+      const direct = flow.steps[signalName];
+      if (direct !== undefined) {
+        const d = getDef(direct);
+        if (d.kind === "signal" && d.names === undefined) {
+          stepId = signalName;
+          def = d;
+        }
+      }
       if (stepId === undefined) {
+        for (const [id, s] of Object.entries(flow.steps)) {
+          const d = getDef(s);
+          if (d.kind === "signal" && d.names?.includes(signalName)) {
+            stepId = id;
+            def = d;
+            break;
+          }
+        }
+      }
+      if (stepId === undefined || def === undefined) {
         throw new NagiRuntimeError(
           `Flow "${flow.id}" has no signal step accepting "${signalName}".`,
-        );
-      }
-      const step = flow.steps[stepId];
-      if (step === undefined) {
-        // Unreachable: the index was built from `flow.steps` at boot. Throw
-        // loudly rather than crash on `getDef(undefined)` if invariants slip.
-        throw new NagiRuntimeError(
-          `Flow "${flow.id}" lost step "${stepId}" referenced by signal name "${signalName}".`,
-        );
-      }
-      const def = getDef(step);
-      if (def.kind !== "signal") {
-        // Unreachable: the index only contains signal steps. Same as above.
-        throw new NagiRuntimeError(
-          `Step "${stepId}" is a ${def.kind}, not a signal.`,
         );
       }
       const stepState = runState.steps[stepId];
