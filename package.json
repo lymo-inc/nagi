@@ -22,7 +22,7 @@
     "verify:publint": "pnpm -r --parallel exec publint",
     "verify:attw": "pnpm -r --parallel exec attw --pack . --profile esm-only",
     "changeset": "changeset",
-    "version": "changeset version",
+    "version-packages": "changeset version",
     "release": "pnpm verify && changeset publish",
     "prepare": "husky"
   },
