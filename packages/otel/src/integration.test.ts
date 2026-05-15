@@ -43,7 +43,7 @@ function passthroughSchema<T>() {
 }
 
 async function runToEnd(
-  wf: ReturnType<typeof nagi>,
+  wf: Awaited<ReturnType<typeof nagi>>,
   store: InMemoryStore,
   runId: RunId,
   timeoutMs = 5_000,
