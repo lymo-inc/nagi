@@ -58,6 +58,13 @@ export interface SignalDef {
   readonly kind: "signal";
   readonly needs: NeedsMap;
   readonly schema: StandardSchemaV1;
+  /**
+   * Resolved external signal names this step accepts. ONLY populated when
+   * the caller supplied `name` or `names` explicitly — the back-compat
+   * "default to step id" path leaves this undefined so older flows hash
+   * byte-identically.
+   */
+  readonly names?: readonly [string, ...string[]];
   readonly timeoutMs?: Millis;
   readonly when?: (args: {
     input: unknown;

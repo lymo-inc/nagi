@@ -215,6 +215,24 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
   const codeVersion =
     config.codeVersion ?? (await fingerprintFlows(config.flows));
 
+  // Map<flowId, Map<signalName, stepId>>. Built once at boot so `wf.signal()`
+  // can resolve `(flowId, name)` → step id in O(1). Each signal step
+  // contributes its step id (always) plus any explicit `names` aliases.
+  // Construction-time uniqueness is enforced in `flow()` (`builder.ts`).
+  const signalNameIndex = new Map<string, Map<string, string>>();
+  for (const f of config.flows) {
+    const m = new Map<string, string>();
+    for (const [stepId, step] of Object.entries(f.steps)) {
+      const def = getDef(step);
+      if (def.kind !== "signal") continue;
+      const names = def.names ?? [stepId];
+      for (const name of names) {
+        m.set(name, stepId);
+      }
+    }
+    signalNameIndex.set(f.id, m);
+  }
+
   async function flowFor(runId: RunId): Promise<Flow> {
     const runState = await config.store.loadRunState(runId);
     const flow = flowsById.get(runState.flowId);
@@ -380,7 +398,7 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
 
     async signal(
       runId: RunId,
-      stepName: string,
+      signalName: string,
       payload: unknown,
     ): Promise<void> {
       const runState = await config.store.loadRunState(runId);
@@ -390,57 +408,77 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
           `Run ${runId} references flow "${runState.flowId}" which is not registered with nagi().`,
         );
       }
-      const step = flow.steps[stepName];
-      if (!step) {
+      // Resolve the incoming signal name → step id via the boot-time index.
+      // The index covers both each signal step's id (always) and any explicit
+      // `names` aliases. Anything not in the index is a genuine call-site bug.
+      const stepId = signalNameIndex.get(flow.id)?.get(signalName);
+      if (stepId === undefined) {
         throw new NagiRuntimeError(
-          `Flow "${flow.id}" has no step named "${stepName}".`,
+          `Flow "${flow.id}" has no signal step accepting "${signalName}".`,
+        );
+      }
+      const step = flow.steps[stepId];
+      if (step === undefined) {
+        // Unreachable: the index was built from `flow.steps` at boot. Throw
+        // loudly rather than crash on `getDef(undefined)` if invariants slip.
+        throw new NagiRuntimeError(
+          `Flow "${flow.id}" lost step "${stepId}" referenced by signal name "${signalName}".`,
         );
       }
       const def = getDef(step);
       if (def.kind !== "signal") {
+        // Unreachable: the index only contains signal steps. Same as above.
         throw new NagiRuntimeError(
-          `Step "${stepName}" is a ${def.kind}, not a signal.`,
+          `Step "${stepId}" is a ${def.kind}, not a signal.`,
         );
       }
-      const stepState = runState.steps[stepName];
+      const stepState = runState.steps[stepId];
       if (stepState?.status !== "running") {
+        // Late loser: the step already resolved via another alias (or the
+        // same name on a second delivery). With multi-name signals this is
+        // operationally normal — log it and ack, don't throw.
+        if (stepState?.status === "completed") {
+          config.logger?.info("nagi: signal arrived after step resolved", {
+            runId,
+            stepId,
+            signalName,
+          });
+          return;
+        }
         throw new NagiRuntimeError(
-          `Step "${stepName}" is not waiting for signal (status: ${stepState?.status ?? "pending"}).`,
+          `Step "${stepId}" is not waiting for signal (status: ${stepState?.status ?? "pending"}).`,
         );
       }
 
       const validated = (await validate(def.schema, payload)) as Json;
       const attempt = stepState.attempts > 0 ? stepState.attempts : 1;
+      const carriesAlias = signalName !== stepId;
 
       await config.store.appendFact(runId, {
         kind: "signal.received",
         runId,
-        stepId: stepName,
+        stepId,
         payload: validated,
         at: clock.now(),
+        ...(carriesAlias ? { signalName } : {}),
       });
 
       const completedFact: Fact = {
         kind: "step.completed",
         runId,
-        stepId: stepName,
+        stepId,
         attempt,
         output: validated,
         at: clock.now(),
       };
-      await config.store.completeStep(
-        runId,
-        stepName,
-        validated,
-        completedFact,
-      );
+      await config.store.completeStep(runId, stepId, validated, completedFact);
 
       await fireRuntimeHook(
         config.hooks?.onSignalReceived,
         {
           runId,
           flowId: flow.id,
-          stepId: stepName,
+          stepId,
           attempt,
           kind: "signal",
           payload: validated,

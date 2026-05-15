@@ -112,10 +112,24 @@ function makeBuilder<Input>(): Builder<Input> {
   function signal<N extends NeedsMap, S extends StandardSchemaV1>(
     config: SignalConfig<Input, N, S>,
   ): Step<InferSchemaOutput<S>> {
+    // `name` xor `names` is a type-level constraint (see SignalConfig union);
+    // normalize to a single internal `names` field. Leave it undefined when
+    // the caller supplied neither — the lookup path resolves via step id for
+    // that case, preserving byte-identical hashes for pre-RFC-0004 flows.
+    const namedAs = "names" in config ? config.names : undefined;
+    const namedAsSingle = "name" in config ? config.name : undefined;
+    const explicit: readonly [string, ...string[]] | undefined =
+      namedAs !== undefined
+        ? namedAs
+        : namedAsSingle !== undefined
+          ? [namedAsSingle]
+          : undefined;
+
     const def: SignalDef = {
       kind: "signal",
       needs: (config.needs ?? {}) as NeedsMap,
       schema: config.schema,
+      ...(explicit !== undefined ? { names: explicit } : {}),
       ...(config.timeoutMs !== undefined
         ? { timeoutMs: config.timeoutMs }
         : {}),
@@ -322,6 +336,8 @@ export function flow<
     out: finalSteps,
   });
 
+  assertSignalNameUniqueness(config.id, finalSteps);
+
   return {
     id: config.id,
     input: config.input,
@@ -474,5 +490,46 @@ function walkAndRewrite(args: WalkArgs): void {
       ? ({ ...baseRewritten, parentMatch } as StepDef)
       : baseRewritten;
     out[id] = attachDef({ kind: finalizedDef.kind, id }, finalizedDef);
+  }
+}
+
+/**
+ * Signal names share a namespace with step ids: every step's id is implicitly
+ * an accepted signal name, and explicit `name` / `names` on a signal step
+ * adds aliases to that same namespace. Two declarations of the same name —
+ * step-id-vs-alias OR alias-vs-alias — make `wf.signal(runId, name, ...)`
+ * ambiguous. We catch that at construction so a bad flow can't boot.
+ */
+function assertSignalNameUniqueness(
+  flowId: string,
+  finalSteps: Record<string, Step<unknown>>,
+): void {
+  // Map<name, "<sourceKind>:<sourceStepId>"> — first writer wins, second hit throws.
+  const owners = new Map<string, string>();
+
+  for (const stepId of Object.keys(finalSteps)) {
+    owners.set(stepId, `step id "${stepId}"`);
+  }
+
+  for (const [stepId, step] of Object.entries(finalSteps)) {
+    const def = (step as { __def?: StepDef }).__def;
+    if (def === undefined || def.kind !== "signal") continue;
+    if (def.names === undefined) continue;
+
+    for (const alias of def.names) {
+      // An alias listing the step's own id is a no-op (deduped), not a clash.
+      if (alias === stepId) continue;
+
+      const prior = owners.get(alias);
+      const here = `alias of step "${stepId}"`;
+      if (prior !== undefined && prior !== here) {
+        throw new Error(
+          `Flow "${flowId}": signal name "${alias}" is declared as both ` +
+            `${prior} and ${here}. ` +
+            `Pick one — signal names share a namespace with step ids.`,
+        );
+      }
+      owners.set(alias, here);
+    }
   }
 }

@@ -59,6 +59,13 @@ export interface CanonicalStep {
   readonly timeoutMs?: Millis;
   // signal-only
   readonly signalSchema?: CanonicalSchema;
+  /**
+   * External signal names this step accepts, sorted lexicographically. Only
+   * present when the caller supplied `name` / `names` on `b.signal`; absent
+   * for the default "name == step id" case so pre-RFC-0004 flows hash
+   * byte-identically.
+   */
+  readonly signalNames?: readonly string[];
   // match-only
   readonly matchMode?: "discriminator" | "guard";
   readonly matchOnHash?: string;
@@ -154,6 +161,9 @@ async function canonicalizeSignal(
   if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);
   if (def.timeoutMs !== undefined) out.timeoutMs = def.timeoutMs;
   out.signalSchema = await canonicalizeSchema(def.schema);
+  if (def.names !== undefined) {
+    out.signalNames = [...def.names].sort();
+  }
   return out;
 }
 
