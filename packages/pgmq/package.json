@@ -1,6 +1,6 @@
 {
   "name": "@nagi-js/pgmq",
-  "version": "0.1.1-rc.0",
+  "version": "0.1.1-rc.1",
   "description": "PGMQ Queue adapter for nagi.",
   "license": "MIT",
   "type": "module",

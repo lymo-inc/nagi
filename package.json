@@ -1,7 +1,6 @@
 {
   "name": "nagi-js",
   "private": true,
-  "version": "0.0.1-rc.2",
   "description": "A lightweight, type-safe declarative workflow library for TypeScript.",
   "license": "MIT",
   "type": "module",
