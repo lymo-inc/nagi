@@ -1,14 +1,8 @@
 # @nagi-js/core
 
-## 0.2.0-rc.3
+## 0.1.1-rc.3
 
 ### Patch Changes
-
-- fix rc tagging
-
-## 0.2.0-rc.2
-
-### Minor Changes
 
 - d67d361: `nagi({ codeVersion })` now auto-defaults to a structural fingerprint of the
   registered flows when omitted. The audit field on `workflow_run.code_version`
@@ -21,6 +15,8 @@
   `code_version` flip from `NULL` to a SHA-256 hex string for runs started
   after upgrading. Any dashboard filtering on `code_version IS NULL` to detect
   un-tagged deploys should be updated.
+
+- fix rc tagging
 
 ## 0.1.1-rc.1
 

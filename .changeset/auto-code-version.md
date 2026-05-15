@@ -1,5 +1,5 @@
 ---
-"@nagi-js/core": minor
+"@nagi-js/core": patch
 ---
 
 `nagi({ codeVersion })` now auto-defaults to a structural fingerprint of the
