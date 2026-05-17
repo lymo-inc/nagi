@@ -1,10 +1,12 @@
 import {
   getDef,
+  matchArms,
+  needsStepIds,
   readSelectedArm,
   resolveNeeds,
   type StepDef,
 } from "./internal";
-import type { Flow, Json, RunState, StepState } from "./types";
+import type { Flow, Json, RunState, StepId, StepState } from "./types";
 
 export type SkipReason = "when-false" | "transitive";
 
@@ -218,6 +220,63 @@ export function flowTermination(
     if (state.status === "failed") failed = true;
   }
   return { done, failed };
+}
+
+/**
+ * Compute the transitive closure of steps that should reset when `stepId` is
+ * reset by `wf.replay({ from })`. The returned set INCLUDES `stepId` itself;
+ * callers append one `step.reset` fact per returned id.
+ *
+ * Edges walked:
+ *   - Forward `needs`: any step `Y` whose `def.needs` references `X` is a
+ *     descendant of `X` (running `Y` without `X`'s output would be stale).
+ *   - Match → arm: when `X` is a match step, every step inside its arms is a
+ *     descendant — they only run after `X` selects an arm, so resetting `X`
+ *     invalidates the selection (see `readSelectedArm` reset handling) and
+ *     every arm step downstream.
+ *
+ * Edges NOT walked:
+ *   - Sibling arm steps (no needs edge between siblings → no cascade).
+ *   - The parent match when an arm step is reset (the arm step is downstream
+ *     of the match, not the other way around).
+ *
+ * Returns ids in deterministic order (BFS from `stepId`) so the resulting
+ * `step.reset` fact log is stable across runs.
+ */
+export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {
+  // Forward-edge adjacency: parent → children (steps that should reset when
+  // parent resets). Built once per call; cheap relative to dispatch cost.
+  const children = new Map<StepId, StepId[]>();
+  const addEdge = (from: StepId, to: StepId) => {
+    const bucket = children.get(from);
+    if (bucket) bucket.push(to);
+    else children.set(from, [to]);
+  };
+  for (const [id, step] of Object.entries(flow.steps) as Array<
+    [StepId, (typeof flow.steps)[string]]
+  >) {
+    const def = getDef(step);
+    for (const upstreamId of needsStepIds(def)) addEdge(upstreamId, id);
+    if (def.kind === "match") {
+      for (const arm of matchArms(def)) {
+        for (const armStepId of arm.stepIds) addEdge(id, armStepId);
+      }
+    }
+  }
+
+  const out: StepId[] = [stepId];
+  const seen = new Set<StepId>([stepId]);
+  for (let i = 0; i < out.length; i++) {
+    const current = out[i];
+    if (current === undefined) continue;
+    for (const child of children.get(current) ?? []) {
+      if (seen.has(child)) continue;
+      if (!(child in flow.steps)) continue;
+      seen.add(child);
+      out.push(child);
+    }
+  }
+  return out;
 }
 
 /**

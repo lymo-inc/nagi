@@ -8,8 +8,12 @@ import type {
   GlobalFact,
   Json,
   Millis,
+  QueryRunsOpts,
+  QueryRunsResult,
   RunId,
   RunState,
+  RunStatus,
+  RunSummary,
   SerializedError,
   StepCompletedFact,
   StepFailedFact,
@@ -433,6 +437,16 @@ class PostgresStore<DB = unknown> implements Store {
           ON CONFLICT (run_id, step_id, attempt) DO UPDATE SET status = 'skipped'
         `.execute(trx);
         return;
+      case "step.reset":
+        // Clear materialized step_run rows so read-side queries reflect the
+        // forgotten state, and free the lease (any attempt) so the next
+        // dispatch can re-claim and re-execute.
+        await sql`
+          DELETE FROM ${sql.raw(this.t("step_run"))}
+           WHERE run_id = ${runId} AND step_id = ${fact.stepId}
+        `.execute(trx);
+        await this.deleteLease(trx, runId, fact.stepId);
+        return;
       case "once.recorded":
         await sql`
           INSERT INTO ${sql.raw(this.t("dedupe"))} (run_id, step_id, scope, value)
@@ -552,6 +566,131 @@ class PostgresStore<DB = unknown> implements Store {
       INSERT INTO ${sql.raw(this.t("global_fact"))} (fact_id, kind, at, payload)
       VALUES (${uuidv7()}, ${fact.kind}, ${fact.at}, ${jsonb(serializeGlobalFactPayload(fact))})
     `.execute(this.db);
+  }
+
+  async queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult> {
+    const where = opts.where ?? {};
+    const flowId = where.flowId;
+    const statuses =
+      where.status === undefined
+        ? undefined
+        : Array.isArray(where.status)
+          ? Array.from(where.status)
+          : [where.status as RunStatus];
+    const inputFilter = where.input;
+
+    // `latest: true` short-circuits limit/cursor (validated upstream in
+    // `wf.queryRuns`). Still safe at the SQL layer — `latest` collapses to
+    // a 1-row fetch with no cursor returned.
+    const isLatest = opts.latest === true;
+    const limit = isLatest ? 1 : clampLimit(opts.limit);
+    const cursor =
+      !isLatest && opts.cursor !== undefined ? decodeCursor(opts.cursor) : null;
+
+    // Fetch limit+1 to detect whether a next page exists without a COUNT(*).
+    const fetchLimit = isLatest ? 1 : limit + 1;
+
+    const rows = await sql<{
+      run_id: string;
+      flow_id: string;
+      status: RunStatus;
+      input: Json;
+      started_at: Date;
+      completed_at: Date | null;
+    }>`
+      SELECT run_id, flow_id, status, input, started_at, completed_at
+        FROM ${sql.raw(this.t("workflow_run"))}
+       WHERE (${flowId ?? null}::text IS NULL OR flow_id = ${flowId ?? null})
+         AND (${statuses === undefined ? null : statuses}::text[] IS NULL
+              OR status = ANY(${statuses === undefined ? null : statuses}::text[]))
+         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)} IS NULL
+              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)})
+         AND (${cursor === null ? null : new Date(cursor.t)}::timestamptz IS NULL
+              OR (started_at, run_id) <
+                 (${cursor === null ? null : new Date(cursor.t)}::timestamptz,
+                  ${cursor === null ? null : cursor.r}::text))
+       ORDER BY started_at DESC, run_id DESC
+       LIMIT ${fetchLimit}
+    `.execute(this.db);
+
+    const summaries: RunSummary[] = rows.rows.map((r) => ({
+      runId: r.run_id as RunId,
+      flowId: r.flow_id,
+      status: r.status,
+      startedAt:
+        r.started_at instanceof Date ? r.started_at : new Date(r.started_at),
+      completedAt:
+        r.completed_at === null
+          ? null
+          : r.completed_at instanceof Date
+            ? r.completed_at
+            : new Date(r.completed_at),
+      input: r.input,
+    }));
+
+    if (isLatest) {
+      return { runs: summaries.slice(0, 1), cursor: null };
+    }
+
+    const hasMore = summaries.length > limit;
+    const page = hasMore ? summaries.slice(0, limit) : summaries;
+    const last = page[page.length - 1];
+    const nextCursor =
+      hasMore && last !== undefined
+        ? encodeCursor({ t: last.startedAt.getTime(), r: last.runId })
+        : null;
+    return { runs: page, cursor: nextCursor };
+  }
+}
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 500;
+
+function clampLimit(limit: number | undefined): number {
+  if (limit === undefined) return DEFAULT_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1) return DEFAULT_LIMIT;
+  return Math.min(limit, MAX_LIMIT);
+}
+
+interface DecodedCursor {
+  readonly t: number;
+  readonly r: string;
+}
+
+function encodeCursor(c: DecodedCursor): string {
+  // Isomorphic base64url — same as @nagi-js/core, so cursors round-trip
+  // between the two adapters byte-for-byte.
+  const bytes = new TextEncoder().encode(JSON.stringify(c));
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i] as number);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function decodeCursor(s: string): DecodedCursor {
+  try {
+    const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof (parsed as DecodedCursor).t === "number" &&
+      typeof (parsed as DecodedCursor).r === "string"
+    ) {
+      return parsed as DecodedCursor;
+    }
+    throw new Error("malformed cursor body");
+  } catch (err) {
+    throw new Error(
+      `queryRuns: invalid cursor — ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 

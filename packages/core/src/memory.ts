@@ -9,6 +9,8 @@ import type {
   GlobalFact,
   Json,
   Millis,
+  QueryRunsOpts,
+  QueryRunsResult,
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
@@ -16,6 +18,7 @@ import type {
   RunId,
   RunState,
   RunStatus,
+  RunSummary,
   SerializedError,
   StepCompletedFact,
   StepFailedFact,
@@ -78,6 +81,16 @@ export class InMemoryStore implements Store {
           this.activeByKey.delete(slot);
         }
       }
+    }
+    if (fact.kind === "step.reset") {
+      // The projector forgets the step's status, but per-attempt leases and
+      // the cached output are stored outside the fact log. Release them so
+      // the next dispatch can re-claim and re-execute at the same attempt.
+      const leasePrefix = `${runId}::${fact.stepId}::`;
+      for (const key of this.leases.keys()) {
+        if (key.startsWith(leasePrefix)) this.leases.delete(key);
+      }
+      this.outputs.delete(`${runId}::${fact.stepId}`);
     }
   }
 
@@ -236,6 +249,176 @@ export class InMemoryStore implements Store {
   readGlobalFacts(): ReadonlyArray<GlobalFact> {
     return this.globalFacts;
   }
+
+  async queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult> {
+    const where = opts.where ?? {};
+    const statuses =
+      where.status === undefined
+        ? undefined
+        : Array.isArray(where.status)
+          ? where.status
+          : [where.status as RunStatus];
+
+    const summaries: RunSummary[] = [];
+    for (const [runId, factList] of this.facts) {
+      const summary = summarize(runId as RunId, factList);
+      if (summary === null) continue;
+      if (where.flowId !== undefined && summary.flowId !== where.flowId)
+        continue;
+      if (statuses !== undefined && !statuses.includes(summary.status))
+        continue;
+      if (
+        where.input !== undefined &&
+        !containsJson(summary.input, where.input)
+      )
+        continue;
+      summaries.push(summary);
+    }
+
+    // Stable order: (startedAt DESC, runId DESC). Matches the Postgres
+    // adapter so cursors interoperate semantically.
+    summaries.sort((a, b) => {
+      const t = b.startedAt.getTime() - a.startedAt.getTime();
+      if (t !== 0) return t;
+      return a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0;
+    });
+
+    if (opts.latest === true) {
+      return { runs: summaries.slice(0, 1), cursor: null };
+    }
+
+    const limit = clampLimit(opts.limit);
+    let start = 0;
+    if (opts.cursor !== undefined) {
+      const c = decodeCursor(opts.cursor);
+      start = summaries.findIndex(
+        (s) =>
+          s.startedAt.getTime() < c.t ||
+          (s.startedAt.getTime() === c.t && s.runId < c.r),
+      );
+      if (start === -1) start = summaries.length;
+    }
+
+    const page = summaries.slice(start, start + limit);
+    const hasMore = start + limit < summaries.length;
+    const last = page[page.length - 1];
+    const cursor =
+      hasMore && last !== undefined
+        ? encodeCursor({ t: last.startedAt.getTime(), r: last.runId })
+        : null;
+    return { runs: page, cursor };
+  }
+}
+
+function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
+  // `tryStartRun` guarantees the first fact is `flow.started`. Defensive
+  // null when the invariant is violated (tests poking facts directly).
+  const first = facts[0];
+  if (first === undefined || first.kind !== "flow.started") return null;
+  const projected = projectRunState(runId, facts);
+  let completedAt: Date | null = null;
+  for (let i = facts.length - 1; i >= 0; i--) {
+    const f = facts[i];
+    if (f === undefined) continue;
+    if (
+      f.kind === "flow.completed" ||
+      f.kind === "flow.failed" ||
+      f.kind === "flow.canceled"
+    ) {
+      completedAt = f.at;
+      break;
+    }
+  }
+  return {
+    runId,
+    flowId: first.flowId,
+    status: projected.status,
+    startedAt: first.at,
+    completedAt,
+    input: first.input,
+  };
+}
+
+const DEFAULT_LIMIT = 50;
+const MAX_LIMIT = 500;
+
+function clampLimit(limit: number | undefined): number {
+  if (limit === undefined) return DEFAULT_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1) return DEFAULT_LIMIT;
+  return Math.min(limit, MAX_LIMIT);
+}
+
+interface DecodedCursor {
+  readonly t: number;
+  readonly r: string;
+}
+
+function encodeCursor(c: DecodedCursor): string {
+  // base64url of JSON. Opaque to callers but human-readable in logs.
+  // Isomorphic: TextEncoder + btoa work on Node, Bun, Deno, Workers, browsers.
+  const bytes = new TextEncoder().encode(JSON.stringify(c));
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i] as number);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function decodeCursor(s: string): DecodedCursor {
+  try {
+    const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof (parsed as DecodedCursor).t === "number" &&
+      typeof (parsed as DecodedCursor).r === "string"
+    ) {
+      return parsed as DecodedCursor;
+    }
+    throw new Error("malformed cursor body");
+  } catch (err) {
+    throw new Error(
+      `queryRuns: invalid cursor — ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
+ * Recursive JSONB containment — `haystack` is a superset of `needle`.
+ *
+ * Mirrors Postgres `jsonb @> jsonb` semantics (§9.16.3):
+ *   - Objects: every key in `needle` exists in `haystack` AND each value
+ *     matches recursively. Extra keys in `haystack` are allowed.
+ *   - Arrays: every element in `needle` is contained in some element of
+ *     `haystack` (set-like; duplicates in `needle` don't require
+ *     duplicates in `haystack`).
+ *   - Scalars / null: strict equality.
+ *   - Type mismatch (object vs array, string vs number, …): false.
+ */
+function containsJson(haystack: Json, needle: Json): boolean {
+  if (Array.isArray(needle)) {
+    if (!Array.isArray(haystack)) return false;
+    return needle.every((n) => haystack.some((h) => containsJson(h, n)));
+  }
+  if (needle !== null && typeof needle === "object") {
+    if (
+      haystack === null ||
+      Array.isArray(haystack) ||
+      typeof haystack !== "object"
+    )
+      return false;
+    return Object.entries(needle).every(
+      ([k, v]) => k in haystack && containsJson(haystack[k] as Json, v as Json),
+    );
+  }
+  return haystack === needle;
 }
 
 /**
@@ -299,6 +482,9 @@ export function projectRunState(
           status: "skipped",
           attempts: 0,
         };
+        break;
+      case "step.reset":
+        delete steps[fact.stepId];
         break;
       case "step.retried":
       case "signal.sent":

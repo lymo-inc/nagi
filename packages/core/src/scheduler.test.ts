@@ -5,7 +5,12 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { InMemoryStore } from "./memory";
-import { extractInput, flowTermination, nextRunnable } from "./scheduler";
+import {
+  descendantsOf,
+  extractInput,
+  flowTermination,
+  nextRunnable,
+} from "./scheduler";
 import { passthroughSchema } from "./test-helpers";
 import type { Fact, Flow, RunId, RunState } from "./types";
 
@@ -238,5 +243,84 @@ describe("extractInput", () => {
   it("throws when no flow.started fact exists", async () => {
     const state = await projectFacts([]);
     expect(() => extractInput(state)).toThrow(/No flow.started/);
+  });
+});
+
+describe("descendantsOf", () => {
+  it("linear chain — reset bubbles down only", () => {
+    const f = flow({
+      id: "linear",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const a = b.task({ run: async () => null });
+        const bStep = b.task({ needs: { a }, run: async () => null });
+        const c = b.task({ needs: { b: bStep }, run: async () => null });
+        const d = b.task({ needs: { c }, run: async () => null });
+        return { a, b: bStep, c, d };
+      },
+    });
+    expect(descendantsOf(f, "b")).toEqual(["b", "c", "d"]);
+    expect(descendantsOf(f, "a")).toEqual(["a", "b", "c", "d"]);
+    expect(descendantsOf(f, "d")).toEqual(["d"]);
+  });
+
+  it("diamond — a → {b, c} → d, reset of b cascades to d only", () => {
+    const f = flow({
+      id: "diamond",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const a = b.task({ run: async () => null });
+        const bStep = b.task({ needs: { a }, run: async () => null });
+        const c = b.task({ needs: { a }, run: async () => null });
+        const d = b.task({
+          needs: { b: bStep, c },
+          run: async () => null,
+        });
+        return { a, b: bStep, c, d };
+      },
+    });
+    expect([...descendantsOf(f, "b")].sort()).toEqual(["b", "d"]);
+    expect([...descendantsOf(f, "c")].sort()).toEqual(["c", "d"]);
+    expect([...descendantsOf(f, "a")].sort()).toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("match — resetting the match step cascades into all arm steps", () => {
+    const f = flow({
+      id: "match-cascade",
+      input: passthroughSchema<{ kind: "a" | "b" }>(),
+      build: (b) =>
+        ({
+          m: b.match({
+            on: ({ input }) => input.kind,
+            cases: {
+              a: (b1) => ({ x: b1.task({ run: async () => null }) }),
+              b: (b1) => ({ y: b1.task({ run: async () => null }) }),
+            },
+          }),
+        }) as never,
+    });
+    const desc = descendantsOf(f, "m");
+    expect(desc[0]).toBe("m");
+    expect([...desc].slice(1).sort()).toEqual(["m.a.x", "m.b.y"]);
+  });
+
+  it("arm step — resetting an arm step does NOT cascade to siblings or parent", () => {
+    const f = flow({
+      id: "match-arm-reset",
+      input: passthroughSchema<{ kind: "a" }>(),
+      build: (b) =>
+        ({
+          m: b.match({
+            on: ({ input }) => input.kind,
+            cases: {
+              a: (b1) => ({
+                x: b1.task({ run: async () => null }),
+                y: b1.task({ run: async () => null }),
+              }),
+            },
+          }),
+        }) as never,
+    });
+    expect(descendantsOf(f, "m.a.x")).toEqual(["m.a.x"]);
   });
 });

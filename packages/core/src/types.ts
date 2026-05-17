@@ -817,6 +817,71 @@ export interface Store {
    * Currently only `flow_ref.updated` events flow through this method.
    */
   appendGlobalFact(fact: GlobalFact): Promise<void>;
+
+  /**
+   * Discover runs by their input + flow + status. See {@link QueryRunsOpts}
+   * and {@link Wf.queryRuns} (in `runtime.ts`) for the public contract.
+   *
+   * Adapters MUST order results by `(startedAt DESC, runId DESC)` so cursor
+   * pagination is stable across calls. Adapters MUST treat
+   * `opts.where.input` as JSONB containment (Postgres `@>` semantics —
+   * the row's input is a superset of the filter object, recursively).
+   */
+  queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult>;
+}
+
+export interface QueryRunsWhere {
+  readonly flowId?: string;
+  readonly status?: RunStatus | ReadonlyArray<RunStatus>;
+  /**
+   * JSONB containment against `flow.started.input`. The stored input is a
+   * superset of this object — recursive on nested objects, exact on
+   * arrays/scalars. Example: `{ videoId: 'abc' }` matches
+   * `{ videoId: 'abc', userId: 7 }`.
+   *
+   * Containment only — no JSONPath, no operators. Combine keys for AND.
+   */
+  readonly input?: Record<string, Json>;
+}
+
+/**
+ * Options for {@link Wf.queryRuns}.
+ *
+ * Encoded as a discriminated union on `latest` so the type system rejects
+ * `{ latest: true, limit, cursor }` at compile time — those fields are
+ * meaningless when only one row is requested. Adapters still validate at
+ * runtime as defense-in-depth.
+ */
+export type QueryRunsOpts =
+  | {
+      readonly where?: QueryRunsWhere;
+      /** Return at most one run — the most recently started match. */
+      readonly latest: true;
+      readonly limit?: never;
+      readonly cursor?: never;
+    }
+  | {
+      readonly where?: QueryRunsWhere;
+      readonly latest?: false;
+      /** Page size. Default 50, max 500. */
+      readonly limit?: number;
+      /** Opaque cursor from a previous `queryRuns` call. */
+      readonly cursor?: string;
+    };
+
+export interface RunSummary {
+  readonly runId: RunId;
+  readonly flowId: string;
+  readonly status: RunStatus;
+  readonly startedAt: Date;
+  readonly completedAt: Date | null;
+  readonly input: Json;
+}
+
+export interface QueryRunsResult {
+  readonly runs: ReadonlyArray<RunSummary>;
+  /** Pass to the next `queryRuns` to resume. `null` when no more rows. */
+  readonly cursor: string | null;
 }
 
 export interface QueueMessage {
@@ -876,6 +941,7 @@ export type FactKind =
   | "step.failed"
   | "step.retried"
   | "step.skipped"
+  | "step.reset"
   | "signal.sent"
   | "signal.received"
   | "once.recorded"
@@ -1014,6 +1080,21 @@ export interface MatchArmSelectedFact extends FactBase {
   readonly arm: string;
 }
 
+/**
+ * Marks a step as cleared from the projected `RunState.steps` so the next
+ * `nextRunnable()` pass treats it (and any cascaded descendants) as runnable
+ * again. Emitted by `wf.replay(runId, { from })` — one fact per step that the
+ * runtime resolved as part of the cascade. The user-named step has
+ * `cascadedFrom === undefined`; transitively reset descendants record the
+ * originating step so read-side UIs can group them.
+ */
+export interface StepResetFact extends FactBase {
+  readonly kind: "step.reset";
+  readonly stepId: StepId;
+  /** The user-named `from` step that caused this reset, when this fact is a cascaded descendant. */
+  readonly cascadedFrom?: StepId;
+}
+
 export type Fact =
   | FlowStartedFact
   | FlowCompletedFact
@@ -1024,6 +1105,7 @@ export type Fact =
   | StepFailedFact
   | StepRetriedFact
   | StepSkippedFact
+  | StepResetFact
   | SignalSentFact
   | SignalReceivedFact
   | OnceRecordedFact
@@ -1084,4 +1166,18 @@ export interface ReplayOpts {
    * dual-publish.
    */
   readonly fireHooks?: boolean;
+  /**
+   * Replay starting from a specific step instead of the default "first
+   * incomplete" behavior. The runtime appends `step.reset` facts for `from`
+   * and every transitive descendant, then re-dispatches — completed steps
+   * downstream of `from` re-run, completed steps upstream are preserved.
+   *
+   * - Throws `NagiValidationError` if `from` is not a registered step in the
+   *   effective flow (the snapshot topology under drift + `allowDrift`, else
+   *   the live flow).
+   * - Throws `NagiRuntimeError` if the run is still `running` — resetting
+   *   mid-flight races in-flight workers.
+   * - Ignored under `mode: "inspect"` (inspect remains side-effect-free).
+   */
+  readonly from?: StepId;
 }

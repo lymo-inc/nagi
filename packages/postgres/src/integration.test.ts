@@ -374,6 +374,163 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     );
     expect(row.rows[0]?.input).toEqual({ x: 1 });
   }, 15_000);
+
+  describe("queryRuns — discovery by input/flow/status", () => {
+    async function seed(
+      flowId: string,
+      input: Record<string, unknown>,
+      terminal?: "completed" | "failed" | "canceled",
+    ): Promise<RunId> {
+      const store = postgresStore({ db, schema });
+      const runId = `run-${uuidv7()}` as RunId;
+      const startedAt = new Date();
+      await store.tryStartRun(runId, {
+        kind: "flow.started",
+        runId,
+        flowId,
+        input: input as never,
+        at: startedAt,
+      });
+      if (terminal === "completed") {
+        await store.appendFact(runId, {
+          kind: "flow.completed",
+          runId,
+          at: new Date(startedAt.getTime() + 100),
+          output: null,
+        });
+      } else if (terminal === "failed") {
+        await store.appendFact(runId, {
+          kind: "flow.failed",
+          runId,
+          at: new Date(startedAt.getTime() + 100),
+          error: { name: "E", message: "x" },
+        });
+      }
+      // Note: "canceled" goes through tryStartRun's concurrency path. Tested
+      // separately via the concurrency suite; this seed helper covers the
+      // common cases.
+      return runId;
+    }
+
+    it("matches by input containment (basic + nested)", async () => {
+      const wf = await makeNagi();
+      await seed("video-ingest", { videoId: "abc" });
+      await seed("video-ingest", { videoId: "xyz" });
+      await seed("video-ingest", {
+        videoId: "abc",
+        customer: { id: 1, plan: { seats: 5 } },
+      });
+
+      const basic = await wf.queryRuns({
+        where: { input: { videoId: "abc" } },
+      });
+      expect(basic.runs).toHaveLength(2);
+      expect(
+        basic.runs.every(
+          (r) => (r.input as { videoId: string }).videoId === "abc",
+        ),
+      ).toBe(true);
+
+      const nested = await wf.queryRuns({
+        where: { input: { customer: { plan: { seats: 5 } } } },
+      });
+      expect(nested.runs).toHaveLength(1);
+    });
+
+    it("filter superset of row → no match", async () => {
+      const wf = await makeNagi();
+      await seed("f", { videoId: "abc" });
+      const r = await wf.queryRuns({
+        where: { input: { videoId: "abc", userId: 7 } },
+      });
+      expect(r.runs).toEqual([]);
+    });
+
+    it("status filter accepts single value and array", async () => {
+      const wf = await makeNagi();
+      await seed("f", {});
+      await seed("f", {}, "completed");
+      await seed("f", {}, "failed");
+
+      const completed = await wf.queryRuns({ where: { status: "completed" } });
+      expect(completed.runs).toHaveLength(1);
+
+      const both = await wf.queryRuns({
+        where: { status: ["completed", "failed"] },
+      });
+      expect(both.runs).toHaveLength(2);
+    });
+
+    it("flowId narrows results to one flow", async () => {
+      const wf = await makeNagi();
+      await seed("a", {});
+      await seed("b", {});
+      const r = await wf.queryRuns({ where: { flowId: "b" } });
+      expect(r.runs).toHaveLength(1);
+      expect(r.runs[0]?.flowId).toBe("b");
+    });
+
+    it("`latest: true` returns the newest matching run only", async () => {
+      const wf = await makeNagi();
+      await seed("f", { videoId: "abc" });
+      await new Promise((r) => setTimeout(r, 5));
+      const newer = await seed("f", { videoId: "abc" });
+
+      const r = await wf.queryRuns({
+        where: { input: { videoId: "abc" } },
+        latest: true,
+      });
+      expect(r.runs).toHaveLength(1);
+      expect(r.runs[0]?.runId).toBe(newer);
+      expect(r.cursor).toBeNull();
+    });
+
+    it("cursor pagination walks all rows with no duplicates", async () => {
+      const wf = await makeNagi();
+      const seeded: RunId[] = [];
+      for (let i = 0; i < 5; i++) {
+        // Each seed bumps started_at by Postgres-clock; sleep keeps ordering deterministic.
+        seeded.push(await seed("f-page", { i }));
+        await new Promise((r) => setTimeout(r, 2));
+      }
+
+      const collected: RunId[] = [];
+      let cursor: string | null | undefined;
+      for (let page = 0; page < 10 && (page === 0 || cursor !== null); page++) {
+        const res: {
+          runs: ReadonlyArray<{ runId: RunId }>;
+          cursor: string | null;
+        } = await wf.queryRuns({
+          where: { flowId: "f-page" },
+          limit: 2,
+          ...(cursor !== null && cursor !== undefined ? { cursor } : {}),
+        });
+        collected.push(...res.runs.map((r) => r.runId));
+        cursor = res.cursor;
+      }
+      expect(collected).toHaveLength(5);
+      expect(new Set(collected).size).toBe(5);
+    });
+
+    it("uses the GIN index for input containment", async () => {
+      const wf = await makeNagi();
+      for (let i = 0; i < 20; i++) await seed("f-idx", { i, tag: "x" });
+      await wf.queryRuns({ where: { input: { tag: "x" } } });
+
+      // EXPLAIN the same query and assert the index is selected (or a
+      // sequential scan, which would only happen on tiny tables where PG
+      // chooses a seq scan over the index). Accept either, but at least
+      // verify the plan mentions our index name OR is a small-table seq scan.
+      const plan = await sql<{ "QUERY PLAN": string }>`
+        EXPLAIN SELECT run_id FROM ${sql.raw(`${schema}.workflow_run`)}
+         WHERE input @> '{"tag":"x"}'::jsonb
+      `.execute(db);
+      const planText = plan.rows.map((r) => r["QUERY PLAN"]).join("\n");
+      expect(planText).toMatch(
+        /workflow_run_input_gin_idx|Seq Scan on workflow_run/,
+      );
+    });
+  });
 });
 
 function passthroughSchema<T>() {

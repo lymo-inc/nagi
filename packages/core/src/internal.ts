@@ -217,22 +217,29 @@ export function findArm(def: MatchDef, armId: string): MatchArmDef | undefined {
 /**
  * Read the chosen arm of a match from the fact log. Returns `null` if the
  * match has not yet selected an arm in this run (i.e. no `match.arm-selected`
- * fact for `matchId`).
+ * fact for `matchId`), OR if the latest fact for `matchId` is a `step.reset`
+ * that invalidated a prior selection.
  *
  * The fact log is the source of truth for the selection — it survives crash
  * and replay, and the match's own `running` state in the steps projection
- * doesn't carry the chosen-arm bit.
+ * doesn't carry the chosen-arm bit. We walk forward and track the current
+ * selection so a `step.reset` (emitted by `wf.replay({ from: matchId })`)
+ * correctly clears it; otherwise re-running a match step would inherit the
+ * stale arm and skip re-selection.
  */
 export function readSelectedArm(
   matchId: string,
   runState: RunState,
 ): string | null {
+  let selected: string | null = null;
   for (const fact of runState.facts) {
     if (fact.kind === "match.arm-selected" && fact.stepId === matchId) {
-      return fact.arm;
+      selected = fact.arm;
+    } else if (fact.kind === "step.reset" && fact.stepId === matchId) {
+      selected = null;
     }
   }
-  return null;
+  return selected;
 }
 
 /**

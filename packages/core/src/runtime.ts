@@ -12,6 +12,7 @@ import {
 } from "./dispatch";
 import { attachDef, getDef, type SignalDef, type StepDef } from "./internal";
 import { InMemoryClock } from "./memory";
+import { descendantsOf } from "./scheduler";
 import type {
   Clock,
   Fact,
@@ -20,6 +21,8 @@ import type {
   FlowInput,
   Json,
   Logger,
+  QueryRunsOpts,
+  QueryRunsResult,
   Queue,
   ReplayOpts,
   RetryPolicy,
@@ -94,6 +97,20 @@ export interface Wf {
    * effects (idempotency protects); `mode: "inspect"` is a no-op probe.
    */
   replay(runId: RunId, opts?: ReplayOpts): Promise<void>;
+
+  /**
+   * Discover runs by flow / status / input. Read-only — does not create or
+   * mutate runs. Use this to power read-side surfaces like "current run for
+   * video X" without coupling consumers to nagi's storage schema.
+   *
+   * Filtering on `input` is JSONB containment: the stored input is a
+   * superset of the filter object (recursive on nested objects).
+   *
+   * Pagination is keyset on `(startedAt, runId)` DESC. Pass the returned
+   * `cursor` to the next call. `latest: true` returns at most one run and
+   * forbids `limit` / `cursor` at the type level.
+   */
+  queryRuns(opts?: QueryRunsOpts): Promise<QueryRunsResult>;
 }
 
 export class NagiValidationError extends Error {
@@ -523,6 +540,7 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       // pinned snapshot, handlers from live code). Without drift, the
       // run replays against baseDeps unchanged.
       let replayDeps = baseDeps;
+      let effectiveFlow: Flow = liveFlow;
       const pinned = runState.flowHash;
       if (pinned !== undefined) {
         const liveHash = flowHashById.get(liveFlow.id);
@@ -546,6 +564,44 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
             liveFlow,
           );
           replayDeps = { ...baseDeps, flowFor: async () => synthesized };
+          effectiveFlow = synthesized;
+        }
+      }
+
+      // Step-scoped replay: append `step.reset` facts for `from` and every
+      // transitive descendant so the projector forgets their state and
+      // `nextRunnable` re-picks them. `from` resolves against the effective
+      // flow (snapshot topology under drift + allowDrift, else live) so
+      // validation stays consistent with what advance() will actually run.
+      if (opts.from !== undefined) {
+        if (runState.status === "running") {
+          throw new NagiRuntimeError(
+            `Run ${runId} is still running — replay({ from }) would race in-flight workers. ` +
+              `Wait for the run to settle (completed / failed) before resetting from a step.`,
+          );
+        }
+        if (!(opts.from in effectiveFlow.steps)) {
+          throw new NagiValidationError([
+            {
+              message: `replay({ from }): step "${opts.from}" is not a step in flow "${effectiveFlow.id}".`,
+              path: ["from"],
+            },
+          ]);
+        }
+        const cascade = descendantsOf(effectiveFlow, opts.from);
+        const at = clock.now();
+        for (const stepId of cascade) {
+          const fact: Fact =
+            stepId === opts.from
+              ? { kind: "step.reset", runId, at, stepId }
+              : {
+                  kind: "step.reset",
+                  runId,
+                  at,
+                  stepId,
+                  cascadedFrom: opts.from,
+                };
+          await config.store.appendFact(runId, fact);
         }
       }
 
@@ -555,6 +611,24 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       // and a worker would later run those dispatches with worker-scoped
       // deps (no suppression) — defeating the flag's purpose.
       if (!fireHooks) await drainInline(replayDeps);
+    },
+
+    async queryRuns(opts: QueryRunsOpts = {}): Promise<QueryRunsResult> {
+      // The discriminated-union type rejects `{ latest: true, limit, cursor }`
+      // at compile time. This runtime check catches JS-only callers and the
+      // `as any` escape hatch — same contract, defense in depth.
+      if (opts.latest === true) {
+        if (opts.limit !== undefined || opts.cursor !== undefined) {
+          throw new NagiValidationError([
+            {
+              message:
+                "queryRuns: `latest: true` is incompatible with `limit` / `cursor` — `latest` returns at most one row.",
+              path: ["latest"],
+            },
+          ]);
+        }
+      }
+      return config.store.queryRuns(opts);
     },
   };
 }

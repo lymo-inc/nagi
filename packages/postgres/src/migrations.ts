@@ -147,6 +147,17 @@ export const migrations: readonly Migration[] = [
           AND status IN ('pending','running');
     `,
   },
+  {
+    id: "0004_query_runs_input_idx",
+    sql: (schema) => `
+      -- Backs \`wf.queryRuns({ where: { input } })\`. \`jsonb_path_ops\` is the
+      -- smaller, faster GIN opclass for containment-only queries — we never
+      -- expose ?/?&/?| existence operators, so dropping support for them is
+      -- the right trade.
+      CREATE INDEX IF NOT EXISTS workflow_run_input_gin_idx
+        ON ${schema}.workflow_run USING gin (input jsonb_path_ops);
+    `,
+  },
 ];
 
 export interface MigrateOpts {
