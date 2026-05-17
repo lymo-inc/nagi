@@ -10,8 +10,10 @@
   "changesets": [
     "auto-code-version",
     "eight-dolls-rescue",
+    "great-geese-look",
     "hip-peaches-win",
     "multi-name-signal-waits",
-    "realign-core-0-1-x"
+    "realign-core-0-1-x",
+    "step-scoped-replay-from"
   ]
 }
