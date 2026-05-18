@@ -116,7 +116,32 @@ export interface GuardMatchDef extends MatchDefBase {
 
 export type MatchDef = DiscriminatorMatchDef | GuardMatchDef;
 
-export type StepDef = TaskDef | SignalDef | MatchDef;
+/**
+ * A subflow step. Holds the child flow's id (lookup at dispatch time via
+ * the runtime's `flowsById` registry) and the user's `buildInput` callback
+ * that derives the child's input from `(parentInput, needs)`.
+ *
+ * `kind: "subflow"` parks the step in `running` after the child run is
+ * spawned; completion arrives via the child's `finalizeFlowCompletion`
+ * hook, not via a queue message redelivery.
+ */
+export interface SubflowDef {
+  readonly kind: "subflow";
+  readonly needs: NeedsMap;
+  readonly childFlowId: string;
+  readonly buildInput: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+  }) => unknown;
+  readonly timeoutMs?: Millis;
+  readonly when?: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+  }) => boolean;
+  readonly parentMatch?: ParentMatchRef;
+}
+
+export type StepDef = TaskDef | SignalDef | MatchDef | SubflowDef;
 
 const DEF = "__def" as const;
 

@@ -154,28 +154,12 @@ export async function makeHarness(
 
   if (flowList.length === 0) throw new Error("makeHarness: no flows provided");
 
-  const flowsById = new Map(flowList.map((f) => [f.id, f]));
-
-  const deps: DispatchDeps = {
-    flowFor: async (runId) => {
-      const runState = await store.loadRunState(runId);
-      const flow = flowsById.get(runState.flowId);
-      if (!flow) {
-        throw new Error(
-          `makeHarness: run ${runId} references flow "${runState.flowId}" which is not registered.`,
-        );
-      }
-      return flow;
-    },
-    store,
-    queue,
-    clock,
-    ...(opts?.defaultRetry !== undefined
-      ? { defaultRetry: opts.defaultRetry }
-      : {}),
-    ...(opts?.logger !== undefined ? { logger: opts.logger } : {}),
-    ...(opts?.hooks !== undefined ? { hooks: opts.hooks } : {}),
-  };
+  // Reuse the runtime's dispatchDeps so that the harness's `drainOnce` path
+  // sees the same `lookupFlow` / `startChildRun` wiring as the worker. Tests
+  // that call `dispatchMessage(deps, msg)` directly are then equivalent to
+  // tests that run via `startWorker()`.
+  const deps = (wf as unknown as { __dispatchDeps: DispatchDeps })
+    .__dispatchDeps;
 
   async function drainOnce(count = 32): Promise<number> {
     const messages = await queue.dequeue({ count });

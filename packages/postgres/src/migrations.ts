@@ -158,6 +158,50 @@ export const migrations: readonly Migration[] = [
         ON ${schema}.workflow_run USING gin (input jsonb_path_ops);
     `,
   },
+  {
+    id: "0005_subflow_parent_link",
+    sql: (schema) => `
+      -- Subflow back-pointer for b.subflow() child runs. Populated by
+      -- tryStartRun when flow.started.parentRunId is set. NULL for runs
+      -- started directly via wf.start(). The btree index backs
+      -- Store.listChildren(parentRunId) used by wf.cancel cascade.
+      ALTER TABLE ${schema}.workflow_run
+        ADD COLUMN IF NOT EXISTS parent_run_id  text;
+      ALTER TABLE ${schema}.workflow_run
+        ADD COLUMN IF NOT EXISTS parent_step_id text;
+      CREATE INDEX IF NOT EXISTS workflow_run_parent_run_id_idx
+        ON ${schema}.workflow_run (parent_run_id)
+        WHERE parent_run_id IS NOT NULL;
+    `,
+  },
+  {
+    id: "0006_step_canceled_status",
+    sql: (schema) => `
+      -- Widen step_run.status to accept 'canceled'. Recorded when a run
+      -- transitions to canceled status (cancel-in-progress supersede)
+      -- while a step is mid-flight: the boundary check in the dispatcher
+      -- reclassifies the in-flight step from completed/failed to canceled.
+      ALTER TABLE ${schema}.step_run
+        DROP CONSTRAINT IF EXISTS step_run_status_check;
+      ALTER TABLE ${schema}.step_run
+        ADD CONSTRAINT step_run_status_check
+        CHECK (status IN ('pending','running','completed','failed','canceled','skipped'));
+    `,
+  },
+  {
+    id: "0007_prune_completed_at_idx",
+    sql: (schema) => `
+      -- Backs \`wf.pruneFacts({ olderThan })\` scanning terminal runs by
+      -- completion time. Partial index: pending/running rows have
+      -- completed_at IS NULL and are never prune candidates. Rows
+      -- transition to terminal exactly once, so write amplification is
+      -- minimal.
+      CREATE INDEX IF NOT EXISTS workflow_run_completed_at_idx
+        ON ${schema}.workflow_run (completed_at)
+        WHERE completed_at IS NOT NULL
+          AND status IN ('completed','failed','canceled');
+    `,
+  },
 ];
 
 export interface MigrateOpts {

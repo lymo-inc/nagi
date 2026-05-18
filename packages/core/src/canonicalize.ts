@@ -6,6 +6,7 @@ import {
   needsStepIds,
   type SignalDef,
   type StepDef,
+  type SubflowDef,
   type TaskDef,
 } from "./internal";
 import type {
@@ -70,6 +71,17 @@ export interface CanonicalStep {
   readonly matchMode?: "discriminator" | "guard";
   readonly matchOnHash?: string;
   readonly matchArms?: readonly CanonicalMatchArm[];
+  // subflow-only
+  /**
+   * The referenced child flow's id. Topology changes in the child do NOT
+   * propagate into the parent's hash — child carries its own `flowHash` on
+   * its own `flow.started` fact. The parent's hash captures only the
+   * structural fact "this step starts a child of this flow id with this
+   * input mapping."
+   */
+  readonly childFlowId?: string;
+  /** Hash of the `input: ({ input, needs }) => ChildInput` callback source. */
+  readonly subflowInputHash?: string;
 }
 
 export interface CanonicalDag {
@@ -139,6 +151,7 @@ async function canonicalizeStep(
   const base: CanonicalStep = { id, kind: def.kind, needs };
   if (def.kind === "task") return canonicalizeTask(base, def);
   if (def.kind === "signal") return canonicalizeSignal(base, def);
+  if (def.kind === "subflow") return canonicalizeSubflow(base, def);
   return canonicalizeMatch(base, def);
 }
 
@@ -164,6 +177,18 @@ async function canonicalizeSignal(
   if (def.names !== undefined) {
     out.signalNames = [...def.names].sort();
   }
+  return out;
+}
+
+async function canonicalizeSubflow(
+  base: CanonicalStep,
+  def: SubflowDef,
+): Promise<CanonicalStep> {
+  const out: Mutable<CanonicalStep> = { ...base };
+  if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);
+  if (def.timeoutMs !== undefined) out.timeoutMs = def.timeoutMs;
+  out.childFlowId = def.childFlowId;
+  out.subflowInputHash = await hashFnSource(def.buildInput);
   return out;
 }
 

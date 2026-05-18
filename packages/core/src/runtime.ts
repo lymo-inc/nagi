@@ -9,6 +9,7 @@ import {
   type DispatchDeps,
   dispatchMessage,
   fireHook as fireRuntimeHook,
+  propagateToParent,
 } from "./dispatch";
 import { attachDef, getDef, type SignalDef, type StepDef } from "./internal";
 import { InMemoryClock } from "./memory";
@@ -17,10 +18,15 @@ import type {
   Clock,
   Fact,
   Flow,
+  FlowCanceledFact,
   FlowHooks,
   FlowInput,
+  FlowStartedFact,
   Json,
   Logger,
+  PrunableStatus,
+  PruneOpts,
+  PruneResult,
   QueryRunsOpts,
   QueryRunsResult,
   Queue,
@@ -29,6 +35,7 @@ import type {
   RunId,
   SerializedError,
   StandardSchemaV1,
+  StepId,
   Store,
   Trigger,
   Worker,
@@ -78,6 +85,15 @@ export interface StartOpts {
   readonly runId?: RunId;
 }
 
+export interface CancelOpts {
+  /**
+   * Caller-supplied reason recorded on the `flow.canceled` fact. Surfaces in
+   * the cascaded `step.failed` error message for any parent waiting on this
+   * run via `b.subflow()`. Default: "explicit wf.cancel()".
+   */
+  readonly reason?: string;
+}
+
 export interface Wf {
   /** Begin a new run. Returns the runId. */
   start<F extends Flow>(
@@ -88,6 +104,18 @@ export interface Wf {
 
   /** Resolve a `b.signal()` step waiting on external input. */
   signal(runId: RunId, stepName: string, payload: unknown): Promise<void>;
+
+  /**
+   * Cancel a pending or running run. Writes `flow.canceled` to the run's
+   * fact log and cascades transitively to every child run spawned by
+   * `b.subflow()`. Idempotent: cancelling a run that's already terminal
+   * (`completed` / `failed` / `canceled`) is a logged no-op.
+   *
+   * For canceled child runs, the parent's subflow step (if still running)
+   * transitions to `failed` with a structured cancel error — the parent
+   * doesn't hang waiting for a child that will never finish.
+   */
+  cancel(runId: RunId, opts?: CancelOpts): Promise<void>;
 
   /** Construct a worker; call `run` / `runOnce` / `runUntilEmpty` on it. */
   worker(config?: WorkerConfig): Worker;
@@ -111,6 +139,24 @@ export interface Wf {
    * forbids `limit` / `cursor` at the type level.
    */
   queryRuns(opts?: QueryRunsOpts): Promise<QueryRunsResult>;
+
+  /**
+   * Retention sweep over terminal runs. Deletes facts (and per-step rows,
+   * leases, timers, dedupes) for runs whose `completedAt < olderThan` and
+   * whose status is in `statuses` (default `["completed"]`). `pending` /
+   * `running` runs are excluded at compile time via {@link PrunableStatus}
+   * and re-validated at runtime.
+   *
+   * `keepSummary: true` (default) retains a summary row so `queryRuns` still
+   * lists the pruned run; the postgres adapter keeps the `workflow_run` row
+   * and the in-memory adapter keeps a shadow {@link RunSummary}. After a
+   * prune, `loadRunState` and `replay` for that run return an empty state —
+   * documented trade-off: you traded fact-fidelity for storage.
+   *
+   * Idempotent and safe under concurrent callers (postgres uses
+   * `FOR UPDATE SKIP LOCKED` on the victim set).
+   */
+  pruneFacts(opts: PruneOpts): Promise<PruneResult>;
 }
 
 export class NagiValidationError extends Error {
@@ -243,8 +289,249 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
     return flow;
   }
 
+  function lookupFlow(flowId: string): Flow | undefined {
+    return flowsById.get(flowId);
+  }
+
+  /**
+   * Atomically insert `flow.started` + handle concurrency-supersede cancels +
+   * fire onStart/onError hooks + kick off `advance`. Shared between
+   * `wf.start()` (caller-driven) and `startChildRun` (subflow-driven).
+   *
+   * Returns `started: false` if a run with the same id already exists — the
+   * caller decides whether that's idempotent success (wf.start) or a hard
+   * error (startChildRun, where the runId was freshly minted).
+   */
+  async function startRunInternal(args: {
+    readonly flow: Flow;
+    readonly validatedInput: Json;
+    readonly runId: RunId;
+    readonly parentRunId?: RunId;
+    readonly parentStepId?: StepId;
+  }): Promise<{ readonly started: boolean }> {
+    const { flow, validatedInput, runId, parentRunId, parentStepId } = args;
+    const startedAt = clock.now();
+    const flowHash = flowHashById.get(flow.id);
+    const fact: FlowStartedFact = {
+      kind: "flow.started",
+      runId,
+      flowId: flow.id,
+      input: validatedInput,
+      at: startedAt,
+      ...(flowHash !== undefined ? { flowHash } : {}),
+      codeVersion,
+      ...(parentRunId !== undefined ? { parentRunId } : {}),
+      ...(parentStepId !== undefined ? { parentStepId } : {}),
+    };
+
+    let concurrencyArg:
+      | { readonly key: string; readonly mode: "cancel-in-progress" }
+      | undefined;
+    if (flow.concurrency !== undefined) {
+      const derived = flow.concurrency.keyFn(validatedInput);
+      if (typeof derived !== "string" || derived.length === 0) {
+        throw new NagiValidationError([
+          {
+            message: `flow.concurrency.keyFn must return a non-empty string (got ${typeof derived === "string" ? '""' : typeof derived})`,
+            path: ["concurrency", "keyFn"],
+          },
+        ]);
+      }
+      concurrencyArg = { key: derived, mode: flow.concurrency.mode };
+    }
+
+    const { started, canceled } = await config.store.tryStartRun(
+      runId,
+      fact,
+      concurrencyArg,
+    );
+    if (!started) return { started: false };
+
+    for (const c of canceled) {
+      const cancelError = new NagiCanceledError({
+        runId: c.runId,
+        canceledByRunId: runId,
+        concurrencyKey: c.fact.concurrencyKey,
+      });
+      const serialized: SerializedError = {
+        name: cancelError.name,
+        message: cancelError.message,
+        ...(cancelError.stack !== undefined
+          ? { stack: cancelError.stack }
+          : {}),
+        cause: {
+          canceledByRunId: runId,
+          concurrencyKey: c.fact.concurrencyKey,
+        },
+      };
+      const errorEvent = {
+        runId: c.runId,
+        flowId: flow.id,
+        error: serialized,
+        at: c.fact.at,
+      };
+      await fireRuntimeHook(
+        flow.onError,
+        errorEvent,
+        "flow.onError",
+        dispatchDeps,
+      );
+      await fireRuntimeHook(
+        config.hooks?.onFlowError,
+        errorEvent,
+        "onFlowError",
+        dispatchDeps,
+      );
+      // If the canceled sibling was itself a subflow child of some parent,
+      // surface the cancellation as that parent's subflow step.failed so the
+      // parent doesn't hang waiting forever.
+      await propagateToParent(dispatchDeps, c.runId, {
+        kind: "canceled",
+        error: serialized,
+      });
+    }
+
+    const startEvent = {
+      runId,
+      flowId: flow.id,
+      input: validatedInput,
+      at: startedAt,
+    };
+    await fireRuntimeHook(
+      flow.onStart,
+      startEvent,
+      "flow.onStart",
+      dispatchDeps,
+    );
+    await fireRuntimeHook(
+      config.hooks?.onFlowStart,
+      startEvent,
+      "onFlowStart",
+      dispatchDeps,
+    );
+
+    await advance(dispatchDeps, runId);
+    return { started: true };
+  }
+
+  /**
+   * Spawn a child run from a parent's `b.subflow()` step. The child runs
+   * independently on the same store/queue; its eventual terminal state
+   * wakes the parent via `finalizeFlowCompletion` / `finalizeFlowFailure`
+   * (see dispatch.ts).
+   */
+  async function startChildRun(args: {
+    readonly child: Flow;
+    readonly childInput: unknown;
+    readonly parentRunId: RunId;
+    readonly parentStepId: StepId;
+  }): Promise<RunId> {
+    const { child, childInput, parentRunId, parentStepId } = args;
+    if (!flowsById.has(child.id)) {
+      throw new NagiRuntimeError(
+        `Subflow child "${child.id}" not registered with nagi(). Pass it to flows[].`,
+      );
+    }
+    const validated = (await validate(child.input, childInput)) as Json;
+    const childRunId = mintRunId();
+    const { started } = await startRunInternal({
+      flow: child,
+      validatedInput: validated,
+      runId: childRunId,
+      parentRunId,
+      parentStepId,
+    });
+    if (!started) {
+      // mintRunId() collisions are vanishingly unlikely; treat as a runtime
+      // invariant break rather than silently retrying.
+      throw new NagiRuntimeError(
+        `startChildRun: minted child runId collided with an existing run (${childRunId})`,
+      );
+    }
+    return childRunId;
+  }
+
+  /**
+   * Cancel a run and all of its descendants. Order matters:
+   *
+   * 1. Write `flow.canceled` to self FIRST. This flips self's projected
+   *    status to `canceled`, so any cascade-driven `propagateToParent`
+   *    calls bubbling up from children see self as terminal and short-circuit.
+   * 2. Cascade depth-first through children via the indexed
+   *    `store.listChildren` lookup. Each child's cancellation in turn
+   *    walks its own children.
+   * 3. Surface self-cancellation to a higher parent (if this run was itself
+   *    a subflow child). That parent's subflow step transitions to `failed`.
+   *
+   * Idempotent: skips runs that are already terminal.
+   */
+  async function cancelRunRecursive(
+    runId: RunId,
+    reason: string,
+  ): Promise<void> {
+    const state = await config.store.loadRunState(runId);
+    if (
+      state.status === "completed" ||
+      state.status === "failed" ||
+      state.status === "canceled"
+    ) {
+      config.logger?.info("nagi: cancel skipped — run already terminal", {
+        runId,
+        status: state.status,
+      });
+      return;
+    }
+    const flow = flowsById.get(state.flowId);
+    const canceledFact: FlowCanceledFact = {
+      kind: "flow.canceled",
+      runId,
+      at: clock.now(),
+      // For explicit cancels we record the SAME runId as the canceler — the
+      // existing fact shape requires `canceledByRunId`. Operators distinguish
+      // explicit cancels from concurrency-supersede by `canceledByRunId === runId`.
+      canceledByRunId: runId,
+      concurrencyKey: reason,
+    };
+    await config.store.appendFact(runId, canceledFact);
+    if (flow !== undefined) {
+      const cancelError: SerializedError = {
+        name: "NagiCanceledError",
+        message: `Run ${runId} was canceled: ${reason}`,
+      };
+      const event = {
+        runId,
+        flowId: flow.id,
+        error: cancelError,
+        at: clock.now(),
+      };
+      await fireRuntimeHook(flow.onError, event, "flow.onError", dispatchDeps);
+      await fireRuntimeHook(
+        config.hooks?.onFlowError,
+        event,
+        "onFlowError",
+        dispatchDeps,
+      );
+    }
+
+    const children = await config.store.listChildren(runId);
+    for (const childId of children) {
+      await cancelRunRecursive(childId, `parent ${runId} canceled: ${reason}`);
+    }
+
+    const cancelError: SerializedError = {
+      name: "NagiCanceledError",
+      message: `Run ${runId} was canceled: ${reason}`,
+    };
+    await propagateToParent(dispatchDeps, runId, {
+      kind: "canceled",
+      error: cancelError,
+    });
+  }
+
   const dispatchDeps: DispatchDeps = {
     flowFor,
+    lookupFlow,
+    startChildRun,
     store: config.store,
     queue: config.queue,
     clock,
@@ -255,7 +542,7 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       : {}),
   };
 
-  return {
+  const wf: Wf = {
     async start<F extends Flow>(
       flow: F,
       input: FlowInput<F>,
@@ -286,112 +573,11 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       }
 
       const validated = (await validate(flow.input, input)) as Json;
-      const startedAt = clock.now();
-      const flowHash = flowHashById.get(flow.id);
-      const fact = {
-        kind: "flow.started" as const,
-        runId,
-        flowId: flow.id,
-        input: validated,
-        at: startedAt,
-        ...(flowHash !== undefined ? { flowHash } : {}),
-        codeVersion,
-      };
-
-      // Derive the concurrency group key from validated input, if configured.
-      // `keyFn` is synchronous and pure per the FlowConcurrency contract.
-      // Non-string / empty return → validation error (catches typos like
-      // `(input) => input.dealId` where `dealId` doesn't exist on the schema).
-      let concurrencyArg:
-        | { readonly key: string; readonly mode: "cancel-in-progress" }
-        | undefined;
-      if (flow.concurrency !== undefined) {
-        const derived = flow.concurrency.keyFn(validated);
-        if (typeof derived !== "string" || derived.length === 0) {
-          throw new NagiValidationError([
-            {
-              message: `flow.concurrency.keyFn must return a non-empty string (got ${typeof derived === "string" ? '""' : typeof derived})`,
-              path: ["concurrency", "keyFn"],
-            },
-          ]);
-        }
-        concurrencyArg = { key: derived, mode: flow.concurrency.mode };
-      }
-
-      const { started, canceled } = await config.store.tryStartRun(
-        runId,
-        fact,
-        concurrencyArg,
-      );
-      if (!started) {
-        // Idempotent no-op: a run with this ID already exists. Per the contract
-        // we do NOT re-append the fact, do NOT re-dispatch, and do NOT
-        // re-validate against the prior input (we don't have it, and even if
-        // we did, callers asked for "use this runId" semantics — not "verify
-        // the same input").
-        return runId;
-      }
-
-      // Fire onError hooks for runs that were canceled atomically inside
-      // tryStartRun. We do this before the new run's onStart so observers
-      // see the supersede/start pair in the natural cause→effect order.
-      for (const c of canceled) {
-        const cancelError = new NagiCanceledError({
-          runId: c.runId,
-          canceledByRunId: runId,
-          concurrencyKey: c.fact.concurrencyKey,
-        });
-        const serialized: SerializedError = {
-          name: cancelError.name,
-          message: cancelError.message,
-          ...(cancelError.stack !== undefined
-            ? { stack: cancelError.stack }
-            : {}),
-          cause: {
-            canceledByRunId: runId,
-            concurrencyKey: c.fact.concurrencyKey,
-          },
-        };
-        const errorEvent = {
-          runId: c.runId,
-          flowId: flow.id,
-          error: serialized,
-          at: c.fact.at,
-        };
-        await fireRuntimeHook(
-          flow.onError,
-          errorEvent,
-          "flow.onError",
-          dispatchDeps,
-        );
-        await fireRuntimeHook(
-          config.hooks?.onFlowError,
-          errorEvent,
-          "onFlowError",
-          dispatchDeps,
-        );
-      }
-
-      const startEvent = {
-        runId,
-        flowId: flow.id,
-        input: validated,
-        at: startedAt,
-      };
-      await fireRuntimeHook(
-        flow.onStart,
-        startEvent,
-        "flow.onStart",
-        dispatchDeps,
-      );
-      await fireRuntimeHook(
-        config.hooks?.onFlowStart,
-        startEvent,
-        "onFlowStart",
-        dispatchDeps,
-      );
-
-      await advance(dispatchDeps, runId);
+      // `startRunInternal` returns `started: false` if the runId already
+      // exists. For wf.start() that's idempotent success — per contract we
+      // do NOT re-append the fact, re-dispatch, or re-validate against the
+      // prior input. Caller asked for "use this runId" semantics.
+      await startRunInternal({ flow, validatedInput: validated, runId });
       return runId;
     },
 
@@ -498,6 +684,10 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       );
 
       await advance(dispatchDeps, runId);
+    },
+
+    async cancel(runId: RunId, opts?: CancelOpts): Promise<void> {
+      await cancelRunRecursive(runId, opts?.reason ?? "explicit wf.cancel()");
     },
 
     worker(workerConfig?: WorkerConfig): Worker {
@@ -630,7 +820,66 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       }
       return config.store.queryRuns(opts);
     },
+
+    async pruneFacts(opts: PruneOpts): Promise<PruneResult> {
+      // `olderThan` is the only required field; everything else has a
+      // sensible default applied here so adapters receive a fully-specified
+      // opts object — same delegation pattern as `queryRuns`.
+      if (
+        !(opts.olderThan instanceof Date) ||
+        Number.isNaN(opts.olderThan.getTime())
+      ) {
+        throw new NagiValidationError([
+          {
+            message: "pruneFacts: `olderThan` must be a valid Date.",
+            path: ["olderThan"],
+          },
+        ]);
+      }
+      // `PrunableStatus` blocks `'pending'` / `'running'` at compile time.
+      // Re-validate at runtime for JS-only callers / `as any` escapes.
+      const statuses: ReadonlyArray<PrunableStatus> = opts.statuses ?? [
+        "completed",
+      ];
+      for (const s of statuses) {
+        if (s !== "completed" && s !== "failed" && s !== "canceled") {
+          throw new NagiValidationError([
+            {
+              message: `pruneFacts: status "${s}" is not prunable. Allowed: "completed" | "failed" | "canceled".`,
+              path: ["statuses"],
+            },
+          ]);
+        }
+      }
+      const batchSize = opts.batchSize ?? 1000;
+      if (!Number.isInteger(batchSize) || batchSize < 1) {
+        throw new NagiValidationError([
+          {
+            message: "pruneFacts: `batchSize` must be a positive integer.",
+            path: ["batchSize"],
+          },
+        ]);
+      }
+      const keepSummary = opts.keepSummary ?? true;
+      return config.store.pruneFacts({
+        olderThan: opts.olderThan,
+        statuses,
+        batchSize,
+        keepSummary,
+      });
+    },
   };
+  // Internal hook for the in-process test harness (`makeHarness`) so it
+  // can drive `dispatchMessage` directly with the same deps that the
+  // runtime's own worker uses. Non-enumerable to keep it out of the public
+  // API surface; not part of the `Wf` interface.
+  Object.defineProperty(wf, "__dispatchDeps", {
+    value: dispatchDeps,
+    enumerable: false,
+    writable: false,
+    configurable: false,
+  });
+  return wf;
 }
 
 function mintRunId(): RunId {

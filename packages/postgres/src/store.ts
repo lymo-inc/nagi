@@ -8,6 +8,9 @@ import type {
   GlobalFact,
   Json,
   Millis,
+  PrunableStatus,
+  PruneOpts,
+  PruneResult,
   QueryRunsOpts,
   QueryRunsResult,
   RunId,
@@ -15,6 +18,7 @@ import type {
   RunStatus,
   RunSummary,
   SerializedError,
+  StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
   StepId,
@@ -102,9 +106,9 @@ class PostgresStore<DB = unknown> implements Store {
       const started = await this.db.transaction().execute(async (trx) => {
         const insert = await sql<{ run_id: string }>`
           INSERT INTO ${sql.raw(this.t("workflow_run"))}
-            (run_id, flow_id, status, input, started_at, flow_hash, code_version)
+            (run_id, flow_id, status, input, started_at, flow_hash, code_version, parent_run_id, parent_step_id)
           VALUES
-            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null})
+            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${fact.parentRunId ?? null}, ${fact.parentStepId ?? null})
           ON CONFLICT (run_id) DO NOTHING
           RETURNING run_id
         `.execute(trx);
@@ -187,9 +191,9 @@ class PostgresStore<DB = unknown> implements Store {
       // the partial unique index slot is free.
       await sql`
         INSERT INTO ${sql.raw(this.t("workflow_run"))}
-          (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key)
+          (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key, parent_run_id, parent_step_id)
         VALUES
-          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key})
+          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parentRunId ?? null}, ${fact.parentStepId ?? null})
       `.execute(trx);
       await this.insertFact(trx, runId, fact);
 
@@ -329,7 +333,7 @@ class PostgresStore<DB = unknown> implements Store {
     attempt: AttemptNumber,
     body: (tx: Tx) => Promise<{
       readonly output: T;
-      readonly fact: StepCompletedFact | StepFailedFact;
+      readonly fact: StepCompletedFact | StepFailedFact | StepCanceledFact;
     }>,
   ): Promise<T> {
     // The handler runs inside this Kysely tx; its ctx.tx points to the same
@@ -346,8 +350,19 @@ class PostgresStore<DB = unknown> implements Store {
           attempt,
           result.fact.output,
         );
-      } else {
+      } else if (result.fact.kind === "step.failed") {
         await this.upsertStepFailed(
+          trx,
+          runId,
+          stepId,
+          attempt,
+          result.fact.error,
+        );
+      } else {
+        // step.canceled: handler returned normally but the run was canceled
+        // mid-flight (boundary check in dispatcher). Domain writes still
+        // commit; the materialized row records the canceled classification.
+        await this.upsertStepCanceled(
           trx,
           runId,
           stepId,
@@ -454,6 +469,20 @@ class PostgresStore<DB = unknown> implements Store {
           ON CONFLICT (run_id, step_id, scope) DO NOTHING
         `.execute(trx);
         return;
+      case "step.canceled":
+        // Materialize when handleStepError records via appendFact (handler
+        // threw mid-flight on a canceled run). The runStep body path
+        // materializes via `upsertStepCanceled` directly, in which case this
+        // branch is the no-op idempotent fallback.
+        await this.upsertStepCanceled(
+          trx,
+          runId,
+          fact.stepId,
+          fact.attempt,
+          fact.error,
+        );
+        await this.deleteLease(trx, runId, fact.stepId);
+        return;
       // step.completed / step.failed are materialized by runStep / completeStep / failStep
       // before insertFact, so applyFactToMaterialized is a no-op for them.
       case "step.completed":
@@ -497,6 +526,25 @@ class PostgresStore<DB = unknown> implements Store {
         (${runId}, ${stepId}, ${attempt}, 'failed', ${jsonb(error as unknown as Json)}, now(), now())
       ON CONFLICT (run_id, step_id, attempt) DO UPDATE
         SET status = 'failed', error = EXCLUDED.error, completed_at = now()
+    `.execute(trx);
+  }
+
+  private async upsertStepCanceled(
+    trx: Kysely<DB>,
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+    error: SerializedError | undefined,
+  ): Promise<void> {
+    const errorJson =
+      error === undefined ? null : jsonb(error as unknown as Json);
+    await sql`
+      INSERT INTO ${sql.raw(this.t("step_run"))}
+        (run_id, step_id, attempt, status, error, started_at, completed_at)
+      VALUES
+        (${runId}, ${stepId}, ${attempt}, 'canceled', ${errorJson}, now(), now())
+      ON CONFLICT (run_id, step_id, attempt) DO UPDATE
+        SET status = 'canceled', error = EXCLUDED.error, completed_at = now()
     `.execute(trx);
   }
 
@@ -640,6 +688,99 @@ class PostgresStore<DB = unknown> implements Store {
         ? encodeCursor({ t: last.startedAt.getTime(), r: last.runId })
         : null;
     return { runs: page, cursor: nextCursor };
+  }
+
+  async listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>> {
+    const rows = await sql<{ run_id: string }>`
+      SELECT run_id
+        FROM ${sql.raw(this.t("workflow_run"))}
+       WHERE parent_run_id = ${parentRunId}
+    `.execute(this.db);
+    return rows.rows.map((r) => r.run_id as RunId);
+  }
+
+  async pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult> {
+    // Statuses are validated as `PrunableStatus` at the runtime boundary;
+    // copy into a mutable array so kysely's parameter binder accepts it as a
+    // text[] (it rejects `readonly` array types).
+    const statuses: PrunableStatus[] = Array.from(opts.statuses);
+    let runsPruned = 0;
+    let factsPruned = 0;
+
+    // Batch loop: each iteration runs one transaction that locks-and-deletes
+    // up to `batchSize` victims. `FOR UPDATE SKIP LOCKED` makes concurrent
+    // pruners share work without contention; partially-completed prunes
+    // simply leave the rest for the next call.
+    for (;;) {
+      const batch = await this.db.transaction().execute(async (trx) => {
+        // The EXISTS check is what terminates the loop when `keepSummary` is
+        // true: a previously-pruned run still matches the status / date
+        // predicates because we keep the `workflow_run` row, so without
+        // requiring "at least one fact still present" the SELECT would
+        // re-return the same rows forever and `runsPruned` would inflate
+        // without bound. When `keepSummary` is false the EXISTS is harmless
+        // (the row is gone after the first pass and the predicate is moot).
+        const victimRows = await sql<{ run_id: string }>`
+          SELECT w.run_id
+            FROM ${sql.raw(this.t("workflow_run"))} w
+           WHERE w.status = ANY(${statuses}::text[])
+             AND w.completed_at IS NOT NULL
+             AND w.completed_at < ${opts.olderThan}
+             AND EXISTS (
+                   SELECT 1 FROM ${sql.raw(this.t("fact"))} f
+                    WHERE f.run_id = w.run_id
+                 )
+           ORDER BY w.completed_at ASC, w.run_id ASC
+           LIMIT ${opts.batchSize}
+           FOR UPDATE SKIP LOCKED
+        `.execute(trx);
+
+        const victims = victimRows.rows.map((r) => r.run_id);
+        if (victims.length === 0) {
+          return { runs: 0, facts: 0 };
+        }
+
+        // Delete order is bottom-up so an interrupted prune leaves no
+        // orphaned references in higher tables. None of these are FK-linked
+        // (the schema has no CASCADE), so app-level ordering is required.
+        const factDel = await sql<{ run_id: string }>`
+          DELETE FROM ${sql.raw(this.t("fact"))}
+           WHERE run_id = ANY(${victims}::text[])
+           RETURNING run_id
+        `.execute(trx);
+        await sql`
+          DELETE FROM ${sql.raw(this.t("step_run"))}
+           WHERE run_id = ANY(${victims}::text[])
+        `.execute(trx);
+        await sql`
+          DELETE FROM ${sql.raw(this.t("lease"))}
+           WHERE run_id = ANY(${victims}::text[])
+        `.execute(trx);
+        await sql`
+          DELETE FROM ${sql.raw(this.t("timer"))}
+           WHERE run_id = ANY(${victims}::text[])
+        `.execute(trx);
+        await sql`
+          DELETE FROM ${sql.raw(this.t("dedupe"))}
+           WHERE run_id = ANY(${victims}::text[])
+        `.execute(trx);
+
+        if (!opts.keepSummary) {
+          await sql`
+            DELETE FROM ${sql.raw(this.t("workflow_run"))}
+             WHERE run_id = ANY(${victims}::text[])
+          `.execute(trx);
+        }
+
+        return { runs: victims.length, facts: factDel.rows.length };
+      });
+
+      if (batch.runs === 0) break;
+      runsPruned += batch.runs;
+      factsPruned += batch.facts;
+    }
+
+    return { runsPruned, factsPruned };
   }
 }
 

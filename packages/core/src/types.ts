@@ -65,7 +65,7 @@ export interface Register {}
 
 export type Tx = Register extends { tx: infer T } ? T : unknown;
 
-export type StepKind = "task" | "signal" | "match";
+export type StepKind = "task" | "signal" | "match" | "subflow";
 
 export interface Step<Output = unknown> {
   readonly kind: StepKind;
@@ -258,6 +258,36 @@ export type MatchArmOutput<M extends StepMap> = {
   readonly [K in keyof M]: StepOutput<M[K]>;
 };
 
+/**
+ * Config for `b.subflow(child, config)`. The `input` callback derives the
+ * child flow's input from the parent's own input + resolved needs. Typed
+ * against `FlowInput<Child>` so the child's input schema is honored at
+ * compile time.
+ *
+ * The child flow runs as an independent run on the same store/queue. Its
+ * `flow.started` fact records `parentRunId` + `parentStepId`, which links
+ * its eventual `flow.completed` back to this subflow step (see RFC 0006
+ * for the wake-parent mechanism).
+ */
+export interface SubflowConfig<Input, N extends NeedsMap, Child extends Flow>
+  extends StepConfigBase<Input, N> {
+  readonly input: (args: {
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<NeedsOutputs<N>>;
+  }) => FlowInput<Child>;
+}
+
+/**
+ * The structural output of a subflow step. `childRunId` lets callers
+ * correlate to the child run for debugging / OTel tracing; `output` carries
+ * the child flow's own final output (whatever its `flow({ output })` reducer
+ * produced).
+ */
+export interface SubflowStepOutput<ChildOutput> {
+  readonly childRunId: RunId;
+  readonly output: ChildOutput;
+}
+
 /** Across all cases of a discriminator match — the union of arm outputs. */
 export type MatchDiscriminatorOutput<
   D extends string,
@@ -329,6 +359,26 @@ export interface Builder<
   signal<N extends NeedsMap, S extends StandardSchemaV1>(
     config: SignalConfig<Input, N, S>,
   ): Step<InferSchemaOutput<S>>;
+
+  /**
+   * Embed another flow as a step. The child flow runs as an independent
+   * run on the same store/queue; this step parks in `running` until the
+   * child reaches a terminal state, then completes with the child's output.
+   *
+   *   const transcript = b.subflow(transcriptionFlow, {
+   *     needs: { audio },
+   *     input: ({ needs }) => ({ audioUrl: needs.audio.url }),
+   *   });
+   *   // typed: Step<{ childRunId: RunId; output: FlowOutput<typeof transcriptionFlow> }>
+   *
+   * The child must be registered with `nagi({ flows: [parent, child] })` —
+   * subflow registration is strict, not auto-include. A child failure
+   * bubbles up as this step's failure with the child's error.
+   */
+  subflow<N extends NeedsMap, Child extends Flow>(
+    child: Child,
+    config: SubflowConfig<Input, N, Child>,
+  ): Step<SubflowStepOutput<FlowOutput<Child>>>;
 
   // Discriminator mode — TS picks this overload when `on:` and `cases:` are present.
   // `Cases` is captured as a free generic over the literal config shape so that
@@ -768,7 +818,7 @@ export interface Store {
     attempt: AttemptNumber,
     body: (tx: Tx) => Promise<{
       readonly output: T;
-      readonly fact: StepCompletedFact | StepFailedFact;
+      readonly fact: StepCompletedFact | StepFailedFact | StepCanceledFact;
     }>,
   ): Promise<T>;
 
@@ -828,6 +878,36 @@ export interface Store {
    * the row's input is a superset of the filter object, recursively).
    */
   queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult>;
+
+  /**
+   * Return the run ids of every direct child run spawned by `parentRunId`
+   * via `b.subflow()`. Identified by `flow.started.parentRunId === parentRunId`.
+   * Order is unspecified.
+   *
+   * Used by `wf.cancel(runId)` to cascade cancellation transitively. Indexed
+   * lookup: Postgres adapter persists `parent_run_id` as a column on
+   * `workflow_run` with a btree index; in-memory adapter maintains a
+   * `parent → set<children>` map updated on `tryStartRun`.
+   */
+  listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>>;
+
+  /**
+   * Retention prune. Deletes facts (and run-scoped per-step rows) for terminal
+   * runs whose `completed_at < opts.olderThan` and whose status is in
+   * `opts.statuses`. See {@link PruneOpts} and {@link Wf.pruneFacts} (in
+   * `runtime.ts`) for the public contract.
+   *
+   * Adapters MUST:
+   * - Never prune runs in non-terminal status (`pending` / `running`). The
+   *   public type forbids it; this is defense-in-depth.
+   * - Delete in batches of `opts.batchSize` until no more victims remain.
+   *   Postgres uses `FOR UPDATE SKIP LOCKED` so concurrent pruners share work
+   *   safely; in-memory is single-process and atomic between awaits.
+   * - When `opts.keepSummary` is true, retain a summary row visible to
+   *   `queryRuns` (postgres keeps the `workflow_run` row; in-memory keeps a
+   *   `RunSummary` shadow). When false, the run is fully removed.
+   */
+  pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult>;
 }
 
 export interface QueryRunsWhere {
@@ -882,6 +962,53 @@ export interface QueryRunsResult {
   readonly runs: ReadonlyArray<RunSummary>;
   /** Pass to the next `queryRuns` to resume. `null` when no more rows. */
   readonly cursor: string | null;
+}
+
+/**
+ * Statuses {@link Wf.pruneFacts} accepts. Restricted to terminal statuses —
+ * `pending` and `running` are excluded at the type level so the compiler
+ * rejects `statuses: ["running"]`. The runtime re-validates as defense in
+ * depth for JS callers / `as any` escape hatches.
+ */
+export type PrunableStatus = Extract<
+  RunStatus,
+  "completed" | "failed" | "canceled"
+>;
+
+/**
+ * Options for {@link Wf.pruneFacts}. Retention sweep over terminal runs.
+ *
+ * The prune is keyed on `workflow_run.completed_at`. Runs whose
+ * `completed_at` is null (still active) are skipped regardless of `statuses`.
+ */
+export interface PruneOpts {
+  /** Prune runs whose `completed_at < olderThan`. */
+  readonly olderThan: Date;
+  /**
+   * Terminal statuses to prune. Default: `["completed"]`. `pending` /
+   * `running` are never prunable (compile-time and runtime).
+   */
+  readonly statuses?: ReadonlyArray<PrunableStatus>;
+  /**
+   * Per-batch deletion size. Default: 1000. Postgres uses one transaction
+   * per batch so a large prune doesn't hold locks across the whole table.
+   */
+  readonly batchSize?: number;
+  /**
+   * When true (default), retain a summary row so the run is still visible to
+   * `queryRuns` — facts/steps/leases/timers/dedupes are still deleted. When
+   * false, the run is fully removed (and `queryRuns` no longer finds it).
+   *
+   * Trade-off: kept summaries cost ~80 bytes per run (postgres) / one
+   * `RunSummary` (in-memory). Use `false` only if `queryRuns` history is
+   * not needed past the retention window.
+   */
+  readonly keepSummary?: boolean;
+}
+
+export interface PruneResult {
+  readonly runsPruned: number;
+  readonly factsPruned: number;
 }
 
 export interface QueueMessage {
@@ -939,6 +1066,7 @@ export type FactKind =
   | "step.started"
   | "step.completed"
   | "step.failed"
+  | "step.canceled"
   | "step.retried"
   | "step.skipped"
   | "step.reset"
@@ -970,6 +1098,16 @@ export interface FlowStartedFact extends FactBase {
    * "Topology vs handler code."
    */
   readonly codeVersion?: string;
+  /**
+   * For runs spawned by `b.subflow()`: the parent run that started this
+   * child, and the parent step id awaiting its completion. The pair forms a
+   * back-pointer the runtime uses to wake the parent step when this run
+   * reaches `flow.completed` / `flow.failed`. See RFC 0006 (issue #10).
+   *
+   * Both undefined for runs started directly via `wf.start()`.
+   */
+  readonly parentRunId?: RunId;
+  readonly parentStepId?: StepId;
 }
 
 /**
@@ -1034,6 +1172,26 @@ export interface StepFailedFact extends FactBase {
   readonly stepId: StepId;
   readonly attempt: AttemptNumber;
   readonly error: SerializedError;
+}
+
+/**
+ * Terminal classification for a step whose attempt did not produce a
+ * `step.completed` output because the run was canceled while it was in
+ * flight — either because a newer `wf.start()` superseded this run via a
+ * concurrency group, or because the handler honored `ctx.signal` (composed
+ * with a user-supplied timeout, etc.) and threw an `AbortError`.
+ *
+ * Recorded in place of `step.completed` / `step.failed` so observers can
+ * discriminate "canceled mid-execution" from "handler errored". Not retried.
+ * `error` is preserved when the cancellation surfaced as a thrown
+ * `AbortError`; absent when classification happened at the boundary (handler
+ * returned normally on an already-canceled run).
+ */
+export interface StepCanceledFact extends FactBase {
+  readonly kind: "step.canceled";
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly error?: SerializedError;
 }
 
 export interface StepRetriedFact extends FactBase {
@@ -1103,6 +1261,7 @@ export type Fact =
   | StepStartedFact
   | StepCompletedFact
   | StepFailedFact
+  | StepCanceledFact
   | StepRetriedFact
   | StepSkippedFact
   | StepResetFact
@@ -1122,6 +1281,7 @@ export type StepStatus =
   | "running"
   | "completed"
   | "failed"
+  | "canceled"
   | "skipped";
 
 export interface StepState {

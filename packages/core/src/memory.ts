@@ -9,6 +9,9 @@ import type {
   GlobalFact,
   Json,
   Millis,
+  PrunableStatus,
+  PruneOpts,
+  PruneResult,
   QueryRunsOpts,
   QueryRunsResult,
   Queue,
@@ -20,6 +23,7 @@ import type {
   RunStatus,
   RunSummary,
   SerializedError,
+  StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
   StepId,
@@ -59,6 +63,20 @@ export class InMemoryStore implements Store {
   private readonly activeByKey = new Map<string, RunId>();
   /** Reverse lookup so terminal facts can free the slot in O(1). */
   private readonly keyByActiveRun = new Map<RunId, string>();
+  /**
+   * Index: parentRunId → set of child run ids spawned by `b.subflow()`.
+   * Populated in `tryStartRun` when `fact.parentRunId` is set. Used by
+   * `listChildren()` to power transitive cancel cascade in O(children).
+   */
+  private readonly childrenByParent = new Map<RunId, Set<RunId>>();
+  /**
+   * Pruned-but-kept summaries. Populated by `pruneFacts` when `keepSummary`
+   * is true so that `queryRuns` still surfaces runs whose facts were dropped.
+   * Mirrors the postgres adapter's retained `workflow_run` row after a prune.
+   * Also blocks `tryStartRun` from reusing a pruned runId — matching the
+   * postgres `INSERT ... ON CONFLICT DO NOTHING` semantic on `run_id`.
+   */
+  private readonly summaries = new Map<RunId, RunSummary>();
   private readonly leaseMs: Millis;
 
   constructor(opts: InMemoryStoreOpts = {}) {
@@ -112,7 +130,11 @@ export class InMemoryStore implements Store {
     // these reads/writes are atomic with respect to any other call into
     // this Store. No locking primitive needed; the Postgres adapter is where
     // real cross-process race safety lives.
-    if (this.facts.has(runId)) {
+    //
+    // `summaries` covers the post-prune case: the run's facts are gone but
+    // we retained its summary row (matching postgres `workflow_run` PK
+    // conflict semantics).
+    if (this.facts.has(runId) || this.summaries.has(runId)) {
       return { started: false, canceled: [] };
     }
 
@@ -137,7 +159,19 @@ export class InMemoryStore implements Store {
     }
 
     this.facts.set(runId, [fact]);
+    if (fact.parentRunId !== undefined) {
+      const set =
+        this.childrenByParent.get(fact.parentRunId) ?? new Set<RunId>();
+      set.add(runId);
+      this.childrenByParent.set(fact.parentRunId, set);
+    }
     return { started: true, canceled };
+  }
+
+  async listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>> {
+    const set = this.childrenByParent.get(parentRunId);
+    if (set === undefined) return [];
+    return Array.from(set);
   }
 
   async loadRunState(runId: RunId): Promise<RunState> {
@@ -206,14 +240,16 @@ export class InMemoryStore implements Store {
     _attempt: AttemptNumber,
     body: (tx: Tx) => Promise<{
       readonly output: T;
-      readonly fact: StepCompletedFact | StepFailedFact;
+      readonly fact: StepCompletedFact | StepFailedFact | StepCanceledFact;
     }>,
   ): Promise<T> {
     const result = await body(undefined as unknown as Tx);
     if (result.fact.kind === "step.completed") {
       await this.completeStep(runId, stepId, result.output, result.fact);
-    } else {
+    } else if (result.fact.kind === "step.failed") {
       await this.failStep(runId, stepId, result.fact.error, result.fact);
+    } else {
+      await this.appendFact(runId, result.fact);
     }
     return result.output;
   }
@@ -259,20 +295,28 @@ export class InMemoryStore implements Store {
           ? where.status
           : [where.status as RunStatus];
 
-    const summaries: RunSummary[] = [];
-    for (const [runId, factList] of this.facts) {
-      const summary = summarize(runId as RunId, factList);
-      if (summary === null) continue;
+    const matches = (summary: RunSummary): boolean => {
       if (where.flowId !== undefined && summary.flowId !== where.flowId)
-        continue;
+        return false;
       if (statuses !== undefined && !statuses.includes(summary.status))
-        continue;
+        return false;
       if (
         where.input !== undefined &&
         !containsJson(summary.input, where.input)
       )
-        continue;
-      summaries.push(summary);
+        return false;
+      return true;
+    };
+
+    const summaries: RunSummary[] = [];
+    for (const [runId, factList] of this.facts) {
+      const summary = summarize(runId as RunId, factList);
+      if (summary === null) continue;
+      if (matches(summary)) summaries.push(summary);
+    }
+    // Pruned-but-kept runs (no facts; summary retained on prune).
+    for (const summary of this.summaries.values()) {
+      if (matches(summary)) summaries.push(summary);
     }
 
     // Stable order: (startedAt DESC, runId DESC). Matches the Postgres
@@ -307,6 +351,74 @@ export class InMemoryStore implements Store {
         ? encodeCursor({ t: last.startedAt.getTime(), r: last.runId })
         : null;
     return { runs: page, cursor };
+  }
+
+  async pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult> {
+    const olderThanMs = opts.olderThan.getTime();
+    const statusSet = new Set<PrunableStatus>(opts.statuses);
+
+    // Pass 1: collect victims without mutating `facts` mid-iteration.
+    interface Victim {
+      readonly runId: RunId;
+      readonly summary: RunSummary;
+      readonly factCount: number;
+      readonly parentRunId: RunId | undefined;
+    }
+    const victims: Victim[] = [];
+    for (const [runId, factList] of this.facts) {
+      const summary = summarize(runId as RunId, factList);
+      if (summary === null) continue;
+      if (summary.completedAt === null) continue;
+      if (!statusSet.has(summary.status as PrunableStatus)) continue;
+      if (summary.completedAt.getTime() >= olderThanMs) continue;
+      const first = factList[0];
+      const parentRunId =
+        first !== undefined && first.kind === "flow.started"
+          ? first.parentRunId
+          : undefined;
+      victims.push({
+        runId: runId as RunId,
+        summary,
+        factCount: factList.length,
+        parentRunId,
+      });
+    }
+
+    // Pass 2: delete per-run state. `batchSize` exists in the cross-adapter
+    // contract to bound transaction scope in postgres; in-memory has no
+    // transactions so a single call drains all matching victims.
+    let runsPruned = 0;
+    let factsPruned = 0;
+    for (const v of victims) {
+      this.facts.delete(v.runId);
+      deleteByRunPrefix(this.outputs, v.runId);
+      deleteByRunPrefix(this.onces, v.runId);
+      deleteByRunPrefix(this.leases, v.runId);
+      this.childrenByParent.delete(v.runId);
+      if (v.parentRunId !== undefined) {
+        const siblings = this.childrenByParent.get(v.parentRunId);
+        if (siblings !== undefined) {
+          siblings.delete(v.runId);
+          if (siblings.size === 0) this.childrenByParent.delete(v.parentRunId);
+        }
+      }
+      if (opts.keepSummary) {
+        this.summaries.set(v.runId, v.summary);
+      } else {
+        this.summaries.delete(v.runId);
+      }
+      runsPruned += 1;
+      factsPruned += v.factCount;
+    }
+
+    return { runsPruned, factsPruned };
+  }
+}
+
+function deleteByRunPrefix<V>(map: Map<string, V>, runId: RunId): void {
+  const prefix = `${runId}::`;
+  for (const key of map.keys()) {
+    if (key.startsWith(prefix)) map.delete(key);
   }
 }
 
@@ -474,6 +586,14 @@ export function projectRunState(
           status: "failed",
           attempts: fact.attempt,
           error: fact.error,
+        };
+        break;
+      case "step.canceled":
+        steps[fact.stepId] = {
+          stepId: fact.stepId,
+          status: "canceled",
+          attempts: fact.attempt,
+          ...(fact.error !== undefined ? { error: fact.error } : {}),
         };
         break;
       case "step.skipped":

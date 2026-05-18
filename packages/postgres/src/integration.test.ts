@@ -19,7 +19,7 @@ import {
 } from "@nagi-js/core";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { migrate } from "./migrations";
 import { postgresStore } from "./store";
 import { uuidv7 } from "./uuidv7";
@@ -529,6 +529,440 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(planText).toMatch(
         /workflow_run_input_gin_idx|Seq Scan on workflow_run/,
       );
+    });
+  });
+
+  describe("b.subflow — end-to-end via PG", () => {
+    it("starts a child run, surfaces { childRunId, output }, persists parent_run_id", async () => {
+      const child = flow({
+        id: "pg-sub-child",
+        input: passthroughSchema<{ x: number }>(),
+        build: (b) => ({
+          double: b.task({
+            run: async ({ input }) => ({ doubled: input.x * 2 }),
+          }),
+        }),
+        output(s) {
+          return s.double;
+        },
+      });
+      const parent = flow({
+        id: "pg-sub-parent",
+        input: passthroughSchema<{ n: number }>(),
+        build: (b) => ({
+          sub: b.subflow(child, { input: ({ input }) => ({ x: input.n }) }),
+        }),
+      });
+
+      const wf = await makeNagi(parent, child);
+      const parentRunId = await wf.start(parent, { n: 21 });
+      await runToEnd(wf, parentRunId);
+
+      expect(await loadStatus(db, schema, parentRunId)).toBe("completed");
+
+      // Child run is persisted with parent_run_id = parentRunId.
+      const row = await sql<{
+        run_id: string;
+        parent_run_id: string | null;
+        parent_step_id: string | null;
+        status: string;
+      }>`
+        SELECT run_id, parent_run_id, parent_step_id, status
+          FROM ${sql.raw(`${schema}.workflow_run`)}
+         WHERE parent_run_id = ${parentRunId}
+      `.execute(db);
+      expect(row.rows.length).toBe(1);
+      const childRow = row.rows[0];
+      if (childRow === undefined) throw new Error("missing child row");
+      expect(childRow.parent_run_id).toBe(parentRunId);
+      expect(childRow.parent_step_id).toBe("sub");
+      expect(childRow.status).toBe("completed");
+
+      // Parent's output (computed by flow.output reducer) — none declared,
+      // so the workflow_run.output column is null. Verify via fact log.
+      const factRows = await sql<{ payload: { output: unknown } }>`
+        SELECT payload FROM ${sql.raw(`${schema}.fact`)}
+         WHERE run_id = ${parentRunId} AND kind = 'step.completed'
+         ORDER BY fact_id ASC
+      `.execute(db);
+      expect(factRows.rows.length).toBe(1);
+      const stepCompleted = factRows.rows[0];
+      if (stepCompleted === undefined) {
+        throw new Error("missing step.completed fact");
+      }
+      const subOutput = stepCompleted.payload.output as {
+        childRunId: string;
+        output: { doubled: number };
+      };
+      expect(subOutput.childRunId).toBe(childRow.run_id);
+      expect(subOutput.output).toEqual({ doubled: 42 });
+    }, 20_000);
+
+    it("Store.listChildren returns the child run ids for a parent", async () => {
+      const child = flow({
+        id: "pg-listc-child",
+        input: passthroughSchema<{ x: number }>(),
+        build: (b) => ({
+          echo: b.task({ run: async ({ input }) => ({ x: input.x }) }),
+        }),
+      });
+      const parent = flow({
+        id: "pg-listc-parent",
+        input: passthroughSchema<{ n: number }>(),
+        build: (b) => ({
+          sub: b.subflow(child, { input: ({ input }) => ({ x: input.n }) }),
+        }),
+      });
+      const wf = await makeNagi(parent, child);
+      const parentRunId = await wf.start(parent, { n: 1 });
+      await runToEnd(wf, parentRunId);
+      const store = postgresStore({ db, schema });
+      const children = await store.listChildren(parentRunId);
+      expect(children.length).toBe(1);
+    }, 20_000);
+
+    it("wf.cancel transitively cancels children", async () => {
+      const grandchild = flow({
+        id: "pg-cancel-gc",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        }),
+        output: (s) => s.wait,
+      });
+      const childF = flow({
+        id: "pg-cancel-child",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          gc: b.subflow(grandchild, { input: () => ({}) }),
+        }),
+      });
+      const parent = flow({
+        id: "pg-cancel-parent",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          sub: b.subflow(childF, { input: () => ({}) }),
+        }),
+      });
+
+      const wf = await makeNagi(parent, childF, grandchild);
+      const parentRunId = await wf.start(parent, {});
+
+      // Pump until all three runs exist + grandchild signal is parked.
+      const ac = new AbortController();
+      const worker = wf.worker({ pollIntervalMs: 5, signal: ac.signal });
+      const done = worker.run();
+      try {
+        const start = Date.now();
+        while (Date.now() - start < 5_000) {
+          const r = await sql<{ count: string }>`
+            SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.workflow_run`)}
+             WHERE flow_id IN ('pg-cancel-parent','pg-cancel-child','pg-cancel-gc')
+               AND status = 'running'
+          `.execute(db);
+          const n = Number(r.rows[0]?.count ?? "0");
+          if (n === 3) break;
+          await new Promise((res) => setTimeout(res, 20));
+        }
+        await wf.cancel(parentRunId, { reason: "test cancel" });
+      } finally {
+        ac.abort();
+        await done;
+      }
+
+      const statuses = await sql<{ status: string }>`
+        SELECT status FROM ${sql.raw(`${schema}.workflow_run`)}
+         WHERE flow_id IN ('pg-cancel-parent','pg-cancel-child','pg-cancel-gc')
+      `.execute(db);
+      expect(statuses.rows.length).toBe(3);
+      for (const row of statuses.rows) {
+        expect(row.status).toBe("canceled");
+      }
+    }, 30_000);
+  });
+
+  describe("pruneFacts — retention", () => {
+    // Prune has no flowId filter — it operates globally over the schema.
+    // Each test asserts on `runsPruned` and on the survival or removal of
+    // specific run rows. Wipe every table the prune touches between tests
+    // so prior tests' (kept) summary rows don't inflate global counts.
+    beforeEach(async () => {
+      await sql
+        .raw(
+          `DELETE FROM ${schema}.fact;
+           DELETE FROM ${schema}.step_run;
+           DELETE FROM ${schema}.lease;
+           DELETE FROM ${schema}.timer;
+           DELETE FROM ${schema}.dedupe;
+           DELETE FROM ${schema}.workflow_run;`,
+        )
+        .execute(db);
+    });
+
+    async function seedTerminal(args: {
+      readonly flowId: string;
+      readonly status: "completed" | "failed" | "canceled";
+      readonly startedAtMs: number;
+      readonly completedAtMs: number;
+      readonly input?: Record<string, unknown>;
+    }): Promise<RunId> {
+      const store = postgresStore({ db, schema });
+      const runId = `run-${uuidv7()}` as RunId;
+      await store.tryStartRun(runId, {
+        kind: "flow.started",
+        runId,
+        flowId: args.flowId,
+        input: (args.input ?? {}) as never,
+        at: new Date(args.startedAtMs),
+      });
+      const at = new Date(args.completedAtMs);
+      if (args.status === "completed") {
+        await store.appendFact(runId, {
+          kind: "flow.completed",
+          runId,
+          at,
+          output: null,
+        });
+      } else if (args.status === "failed") {
+        await store.appendFact(runId, {
+          kind: "flow.failed",
+          runId,
+          at,
+          error: { name: "E", message: "x" },
+        });
+      } else {
+        await store.appendFact(runId, {
+          kind: "flow.canceled",
+          runId,
+          at,
+          canceledByRunId: runId,
+          concurrencyKey: "k",
+        });
+      }
+      return runId;
+    }
+
+    async function countRows(table: string, runId: RunId): Promise<number> {
+      const r = await sql<{ c: string }>`
+        SELECT count(*)::text AS c FROM ${sql.raw(`${schema}.${table}`)}
+         WHERE run_id = ${runId}
+      `.execute(db);
+      return Number(r.rows[0]?.c ?? 0);
+    }
+
+    it("prunes completed terminal runs older than the cutoff; leaves running rows alone", async () => {
+      const wf = await makeNagi();
+      const oldRun = await seedTerminal({
+        flowId: "pf-1",
+        status: "completed",
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+      });
+      const recentRun = await seedTerminal({
+        flowId: "pf-1",
+        status: "completed",
+        startedAtMs: Date.now() - 1000,
+        completedAtMs: Date.now(),
+      });
+      // A running row (no completed_at) — must survive any prune.
+      const runningRun = `run-${uuidv7()}` as RunId;
+      await postgresStore({ db, schema }).tryStartRun(runningRun, {
+        kind: "flow.started",
+        runId: runningRun,
+        flowId: "pf-1",
+        input: null as never,
+        at: new Date(1000),
+      });
+
+      const result = await wf.pruneFacts({
+        olderThan: new Date(Date.now() - 60_000),
+      });
+      expect(result.runsPruned).toBe(1);
+      expect(result.factsPruned).toBeGreaterThanOrEqual(2);
+
+      // Old run: facts gone, workflow_run kept (keepSummary defaults true).
+      expect(await countRows("fact", oldRun)).toBe(0);
+      expect(await countRows("workflow_run", oldRun)).toBe(1);
+      // Recent run untouched.
+      expect(await countRows("fact", recentRun)).toBeGreaterThan(0);
+      // Running run untouched.
+      expect(await countRows("fact", runningRun)).toBeGreaterThan(0);
+    });
+
+    it("default statuses prunes only completed; failed/canceled stay", async () => {
+      const wf = await makeNagi();
+      const c = await seedTerminal({
+        flowId: "pf-default",
+        status: "completed",
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+      });
+      const f = await seedTerminal({
+        flowId: "pf-default",
+        status: "failed",
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+      });
+      const x = await seedTerminal({
+        flowId: "pf-default",
+        status: "canceled",
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+      });
+      const r = await wf.pruneFacts({ olderThan: new Date() });
+      expect(r.runsPruned).toBe(1);
+      expect(await countRows("fact", c)).toBe(0);
+      expect(await countRows("fact", f)).toBeGreaterThan(0);
+      expect(await countRows("fact", x)).toBeGreaterThan(0);
+    });
+
+    it("statuses array prunes every listed terminal status", async () => {
+      const wf = await makeNagi();
+      const ids = await Promise.all([
+        seedTerminal({
+          flowId: "pf-multi",
+          status: "completed",
+          startedAtMs: 1000,
+          completedAtMs: 2000,
+        }),
+        seedTerminal({
+          flowId: "pf-multi",
+          status: "failed",
+          startedAtMs: 1000,
+          completedAtMs: 2000,
+        }),
+        seedTerminal({
+          flowId: "pf-multi",
+          status: "canceled",
+          startedAtMs: 1000,
+          completedAtMs: 2000,
+        }),
+      ]);
+      const r = await wf.pruneFacts({
+        olderThan: new Date(),
+        statuses: ["completed", "failed", "canceled"],
+      });
+      expect(r.runsPruned).toBe(3);
+      for (const id of ids) {
+        expect(await countRows("fact", id)).toBe(0);
+      }
+    });
+
+    it("cascades cleanup to fact / step_run / lease / timer / dedupe", async () => {
+      const wf = await makeNagi();
+      const runId = await seedTerminal({
+        flowId: "pf-cascade",
+        status: "completed",
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+      });
+      // Insert per-run rows in the secondary tables directly. These have no
+      // FK to workflow_run, so the prune must clean them up by app code.
+      await sql`
+        INSERT INTO ${sql.raw(`${schema}.step_run`)}
+          (run_id, step_id, attempt, status, started_at, completed_at)
+        VALUES (${runId}, 's1', 1, 'completed', now(), now())
+      `.execute(db);
+      await sql`
+        INSERT INTO ${sql.raw(`${schema}.lease`)}
+          (run_id, step_id, attempt, token, expires_at)
+        VALUES (${runId}, 's1', 1, 'tok', now())
+      `.execute(db);
+      await sql`
+        INSERT INTO ${sql.raw(`${schema}.timer`)} (run_id, step_id, fire_at)
+        VALUES (${runId}, 's1', now())
+      `.execute(db);
+      await sql`
+        INSERT INTO ${sql.raw(`${schema}.dedupe`)}
+          (run_id, step_id, scope, value)
+        VALUES (${runId}, 's1', 'sc', '{}'::jsonb)
+      `.execute(db);
+
+      await wf.pruneFacts({ olderThan: new Date() });
+
+      expect(await countRows("fact", runId)).toBe(0);
+      expect(await countRows("step_run", runId)).toBe(0);
+      expect(await countRows("lease", runId)).toBe(0);
+      expect(await countRows("timer", runId)).toBe(0);
+      expect(await countRows("dedupe", runId)).toBe(0);
+      // workflow_run kept by default (keepSummary: true).
+      expect(await countRows("workflow_run", runId)).toBe(1);
+    });
+
+    it("keepSummary: false removes the workflow_run row too", async () => {
+      const wf = await makeNagi();
+      const runId = await seedTerminal({
+        flowId: "pf-nosummary",
+        status: "completed",
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+      });
+      await wf.pruneFacts({ olderThan: new Date(), keepSummary: false });
+      expect(await countRows("workflow_run", runId)).toBe(0);
+      // The cross-adapter `queryRuns` semantic — pruned run not surfaced —
+      // is covered by the InMemoryStore conformance tests; here we assert
+      // the postgres row-level effect directly.
+    });
+
+    it("batchSize < total drains everything via the internal loop", async () => {
+      const wf = await makeNagi();
+      for (let i = 0; i < 5; i++) {
+        await seedTerminal({
+          flowId: "pf-batch",
+          status: "completed",
+          startedAtMs: 1000 + i,
+          completedAtMs: 2000 + i,
+        });
+      }
+      const r = await wf.pruneFacts({
+        olderThan: new Date(),
+        batchSize: 2,
+      });
+      expect(r.runsPruned).toBe(5);
+    });
+
+    it("uses the workflow_run_completed_at_idx for the victim selection", async () => {
+      // Seed enough rows that PG should prefer the partial index over a seq
+      // scan. As with the queryRuns GIN test, this is a smoke check that the
+      // index is *eligible*, not a hard assertion.
+      for (let i = 0; i < 50; i++) {
+        await seedTerminal({
+          flowId: "pf-explain",
+          status: "completed",
+          startedAtMs: 1000 + i,
+          completedAtMs: 2000 + i,
+        });
+      }
+      const plan = await sql<{ "QUERY PLAN": string }>`
+        EXPLAIN SELECT run_id FROM ${sql.raw(`${schema}.workflow_run`)}
+         WHERE status = ANY(ARRAY['completed','failed','canceled']::text[])
+           AND completed_at IS NOT NULL
+           AND completed_at < now()
+         ORDER BY completed_at ASC, run_id ASC
+         LIMIT 1000
+      `.execute(db);
+      const planText = plan.rows.map((r) => r["QUERY PLAN"]).join("\n");
+      expect(planText).toMatch(
+        /workflow_run_completed_at_idx|Seq Scan on workflow_run/,
+      );
+    });
+
+    it("concurrent pruners share work without errors (FOR UPDATE SKIP LOCKED)", async () => {
+      const wf = await makeNagi();
+      for (let i = 0; i < 12; i++) {
+        await seedTerminal({
+          flowId: "pf-concurrent",
+          status: "completed",
+          startedAtMs: 1000 + i,
+          completedAtMs: 2000 + i,
+        });
+      }
+      const [a, b] = await Promise.all([
+        wf.pruneFacts({ olderThan: new Date(), batchSize: 3 }),
+        wf.pruneFacts({ olderThan: new Date(), batchSize: 3 }),
+      ]);
+      // Together they prune everything matching, with no double-counting.
+      expect(a.runsPruned + b.runsPruned).toBe(12);
     });
   });
 });

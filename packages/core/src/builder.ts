@@ -8,6 +8,7 @@ import {
   type ParentMatchRef,
   type SignalDef,
   type StepDef,
+  type SubflowDef,
   type TaskDef,
 } from "./internal";
 import type {
@@ -17,6 +18,7 @@ import type {
   FlowCompleteEvent,
   FlowConcurrency,
   FlowConfig,
+  FlowOutput,
   InferSchemaOutput,
   Json,
   MatchArm,
@@ -29,6 +31,8 @@ import type {
   StepCompleteEvent,
   StepEntryConfig,
   StepMap,
+  SubflowConfig,
+  SubflowStepOutput,
   TaskConfig,
 } from "./types";
 
@@ -133,6 +137,33 @@ function makeBuilder<Input>(): Builder<Input> {
         : {}),
     };
     return attachDef<InferSchemaOutput<S>>({ kind: "signal", id: "" }, def);
+  }
+
+  function subflow<N extends NeedsMap, Child extends Flow>(
+    child: Child,
+    config: SubflowConfig<Input, N, Child>,
+  ): Step<SubflowStepOutput<FlowOutput<Child>>> {
+    const def: SubflowDef = {
+      kind: "subflow",
+      needs: (config.needs ?? {}) as NeedsMap,
+      childFlowId: child.id,
+      buildInput: config.input as SubflowDef["buildInput"],
+      ...(config.timeoutMs !== undefined
+        ? { timeoutMs: config.timeoutMs }
+        : {}),
+      ...(config.when !== undefined
+        ? {
+            when: config.when as (args: {
+              input: unknown;
+              needs: Record<string, unknown>;
+            }) => boolean,
+          }
+        : {}),
+    };
+    return attachDef<SubflowStepOutput<FlowOutput<Child>>>(
+      { kind: "subflow", id: "" },
+      def,
+    );
   }
 
   function match(config: object): Step<unknown> {
@@ -276,6 +307,7 @@ function makeBuilder<Input>(): Builder<Input> {
   const builder = {
     task,
     signal,
+    subflow,
     match: match as Builder<Input>["match"],
     step: step as Builder<Input>["step"],
     include: include as Builder<Input>["include"],
