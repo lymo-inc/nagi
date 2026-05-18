@@ -1,5 +1,16 @@
 # @nagi-js/pgmq
 
+## 0.1.1-rc.7
+
+### Patch Changes
+
+- Implement RFCs #7 #9 #10
+- Updated dependencies [c4e1459]
+- Updated dependencies
+- Updated dependencies [c4e1459]
+- Updated dependencies [c4e1459]
+  - @nagi-js/core@0.1.1-rc.7
+
 ## 0.1.1-rc.6
 
 ### Patch Changes

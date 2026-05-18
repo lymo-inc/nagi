@@ -1,5 +1,105 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.7
+
+### Patch Changes
+
+- c4e1459: `ctx.signal` and a new `step.canceled` fact kind for cancel-aware step
+  classification. `StepCtx.signal: AbortSignal` is now constructed per step run
+  and threaded into handlers — pass it to `fetch` or
+  `anthropic.messages.create({ signal })` so handlers can be composed with
+  user-supplied timeout signals (`AbortSignal.any([ctx.signal, AbortSignal.timeout(60_000)])`).
+  The wakeup that fires `ctx.signal.abort()` on `cancel-in-progress` is a
+  follow-up; today the signal aborts only when the user composes it.
+
+  When a run transitions to `canceled` while a step is in flight (a newer
+  `wf.start()` superseded it via a concurrency group), the dispatcher
+  reclassifies the step at the boundary:
+
+  - **Handler returns normally on a canceled run** → records `step.canceled`
+    instead of `step.completed`. Domain writes from the handler still commit
+    atomically with the canceled fact; read-side projection no longer leaks
+    a "completed" status onto a canceled run.
+  - **Handler throws on a canceled run** → records `step.canceled` instead of
+    `step.failed`. Retry is suppressed (the run is terminal) and `onStepError`
+    does not fire — it's a relabel, not an error. `AbortError`-shaped throws
+    preserve the error on the canceled fact for downstream observability.
+
+  `FactKind` gains `"step.canceled"`; `StepStatus` gains `"canceled"`;
+  `Fact` widens to include `StepCanceledFact` (optional `error` field).
+  `Store.runStep`'s body return type widens to accept
+  `StepCanceledFact` so adapters can record the boundary classification
+  atomically with the handler's transaction.
+
+  `@nagi-js/postgres`: new migration `0006_step_canceled_status` widens the
+  `step_run.status` CHECK constraint to accept `'canceled'`. Existing rows are
+  unaffected; the constraint is reapplied with the added value.
+
+- Implement RFCs #7 #9 #10
+- c4e1459: Implement issue #9 — `wf.pruneFacts({ olderThan, statuses })` for fact-log
+  retention. Deletes facts (and per-step rows, leases, timers, dedupes) for
+  terminal runs whose `completedAt < olderThan`. `pending` / `running` runs are
+  excluded at the type level via `PrunableStatus` and re-validated at runtime.
+
+  Defaults: `statuses: ["completed"]`, `batchSize: 1000`, `keepSummary: true`
+  (retains a summary row so `queryRuns` still lists the pruned run; both
+  adapters honor this — postgres keeps the `workflow_run` row, in-memory keeps
+  a shadow `RunSummary`). After a prune, `loadRunState` and `replay` for that
+  run return an empty state — documented trade-off: fact-fidelity traded for
+  storage.
+
+  Postgres uses `FOR UPDATE SKIP LOCKED` on the victim CTE so concurrent
+  pruners share work without contention. New partial index
+  `workflow_run_completed_at_idx` (migration `0007`) backs the per-batch
+  victim selection on `(completed_at)` filtered to terminal-status rows. The
+  SELECT requires `EXISTS (SELECT 1 FROM fact WHERE run_id = ...)` so the
+  batch loop terminates when `keepSummary: true` (otherwise it would
+  re-select the same kept summary rows forever).
+
+  See `docs/rfcs/0009-prune-facts.research.md`.
+
+- c4e1459: `b.subflow(child, { input })` now embeds another flow as a step. The child
+  runs as an independent run on the same store/queue; the parent's subflow
+  step parks in `running` until the child reaches terminal state, then resumes
+  with `step.output = { childRunId, output }`. The wake-up mechanism mirrors
+  `wf.signal()` — child's `flow.completed` / `flow.failed` writes the parent's
+  `step.completed` / `step.failed` directly via the `finalizeFlowCompletion` /
+  `finalizeFlowFailure` hooks; no parent-side dispatch re-trip.
+
+  `wf.cancel(runId, opts?)` is now a public API. It writes `flow.canceled` to
+  the run, transitively cancels every child run spawned via `b.subflow()`, and
+  surfaces the cancellation to a higher parent (if any) as a `step.failed`
+  with a structured `NagiCanceledError`. Idempotent on already-terminal runs.
+
+  Child flows must be passed explicitly to `nagi({ flows: [parent, child] })` —
+  referencing an unregistered child throws at dispatch with an actionable error.
+  Parent linkage is recorded on the child's `flow.started` fact via two new
+  optional fields `parentRunId` + `parentStepId`, and on the in-memory Store
+  via a `parent → children` index that backs `Store.listChildren(parentRunId)`.
+
+  Postgres adapter migration `0005_subflow_parent_link` adds
+  `workflow_run.parent_run_id` + `workflow_run.parent_step_id` columns with a
+  partial btree index on `parent_run_id WHERE parent_run_id IS NOT NULL`. The
+  index backs the cancel cascade query and stays empty for non-subflow runs.
+
+  Sibling cancellations triggered by a child's own `concurrency` config now
+  propagate to that sibling's parent's subflow step (no more silent hangs when
+  two children share a concurrency key). Canonical flow hash gains
+  `childFlowId` + `subflowInputHash` fields for subflow steps; pre-existing
+  flows hash byte-identically.
+
+  Replay-memo for subflow children is intentionally out of scope for this
+  release — a parent replay will re-execute its child rather than memoizing
+  the prior child's output. Handler idempotency at the child level is the
+  correctness story for now; explicit memoization will land in a follow-up
+  RFC. See `docs/research/issue-10-subflow-runtime.md`.
+
+- Updated dependencies [c4e1459]
+- Updated dependencies
+- Updated dependencies [c4e1459]
+- Updated dependencies [c4e1459]
+  - @nagi-js/core@0.1.1-rc.7
+
 ## 0.1.1-rc.6
 
 ### Patch Changes
