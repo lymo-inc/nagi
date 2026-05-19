@@ -83,10 +83,10 @@ describe("dispatchMessage — driver", () => {
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
-    expect(await h.drainOnce()).toBe(1); // dispatches `a`
+    expect(await h.drainOnce()).toBe(1);
     expect((await h.result(runId)).stepStatus("a")).toBe("completed");
 
-    expect(await h.drainOnce()).toBe(1); // dispatches `c`
+    expect(await h.drainOnce()).toBe(1);
     const result = await h.result(runId);
     expect(result.output("c")).toEqual({ doubled: 20 });
     expect(result.status).toBe("completed");
@@ -111,7 +111,7 @@ describe("dispatchMessage — driver", () => {
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
-    await h.drain(); // delay is 0, so all retries drain in one pass
+    await h.drain();
 
     expect(attempts).toBe(3);
     const result = await h.result(runId);
@@ -165,13 +165,13 @@ describe("dispatchMessage — driver", () => {
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
-    expect(await h.drainOnce()).toBe(1); // dispatches the signal step
+    expect(await h.drainOnce()).toBe(1);
     const mid = await h.result(runId);
     expect(mid.stepStatus("wait")).toBe("running");
     expect(ran).toBe(false);
 
     await h.wf.signal(runId, "wait", { ok: true });
-    await h.drain(); // dispatches `after`
+    await h.drain();
 
     const final = await h.result(runId);
     expect(final.output("wait")).toEqual({ ok: true });
@@ -272,7 +272,6 @@ describe("dispatchMessage — driver", () => {
     expect(signalEvent?.kind).toBe("signal");
     expect(signalEvent?.input).toBeNull();
 
-    // sanity: signal completes after external payload arrives
     await h.wf.signal(runId, "wait", { ok: true });
     await h.drain();
   });
@@ -297,8 +296,6 @@ describe("dispatchMessage — driver", () => {
     await h.drain();
     expect(runs).toBe(1);
 
-    // Manually re-enqueue the same step. Dispatcher should detect the
-    // terminal state and ack without re-running.
     await h.queue.enqueue(runId, "only");
     await h.drain();
 

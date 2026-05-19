@@ -1,15 +1,5 @@
 import type { Json, RunId, StepId, Store } from "./types";
 
-/**
- * Stable key generator for external APIs (Stripe, Mux, etc.).
- *
- * Per the boundary contract: `hash(runId + stepId + scope)`. Identical across
- * retries of the same step, different across runs.
- *
- * v0 uses concat (`nagi:<runId>:<stepId>:<scope>`) — sync, debuggable,
- * Stripe-friendly (under the 255 char limit). Switch to `crypto.subtle`
- * SHA-256 if compactness ever matters.
- */
 export function makeIdempotencyKey(
   runId: RunId,
   stepId: StepId,
@@ -17,11 +7,6 @@ export function makeIdempotencyKey(
   return (scope) => `nagi:${runId}:${stepId}:${scope}`;
 }
 
-/**
- * Durable per-effect memoization. The first successful call for
- * `(runId, stepId, scope)` persists its return value; subsequent calls
- * (including post-crash retries) return the cached value without invoking `fn`.
- */
 export function makeOnce(args: {
   readonly runId: RunId;
   readonly stepId: StepId;

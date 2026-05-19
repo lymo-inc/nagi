@@ -1,10 +1,3 @@
-// Shared test fixtures + harnesses.
-//
-// Two modes:
-// - `runFlow(flow, input)` — fire-and-forget end-to-end with a worker.
-// - `makeHarness(flow)` — gives the test direct control of the dispatcher
-//   (no worker), the queue, the store, and a `Result` snapshot.
-
 import { type DispatchDeps, dispatchMessage } from "./dispatch";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
 import { type NagiConfig, nagi, type Wf } from "./runtime";
@@ -45,11 +38,8 @@ export interface Result {
   readonly status: RunStatus;
   readonly raw: RunState;
 
-  /** Asserts the step exists and is completed; returns its output. */
   output(stepName: string): Json;
-  /** Returns the step's status, or "pending" if not in run state. */
   stepStatus(stepName: string): StepStatus;
-  /** Asserts the step failed; returns its serialized error. */
   error(stepName: string): SerializedError;
 
   factCount(kind: Fact["kind"]): number;
@@ -106,20 +96,14 @@ export interface Harness {
   readonly queue: InMemoryQueue;
   readonly clock: InMemoryClock;
 
-  /** DispatchDeps for driver-style tests that call `dispatchMessage` directly. */
   readonly deps: DispatchDeps;
 
-  /** Start a worker; returns a `stop()` that aborts and waits for drain. */
   startWorker(config?: WorkerConfig): { stop: () => Promise<void> };
 
-  /** Dequeue at most `count` messages and dispatch each sequentially. */
   drainOnce(count?: number): Promise<number>;
-  /** Repeat `drainOnce` until the queue is empty. */
   drain(opts?: { maxIter?: number }): Promise<number>;
 
-  /** Block until `flow.completed` or `flow.failed` is the last fact. */
   waitForEnd(runId: RunId, timeoutMs?: number): Promise<Result>;
-  /** Block until a specific step reaches the target status. */
   waitForStep(
     runId: RunId,
     stepName: string,
@@ -127,7 +111,6 @@ export interface Harness {
     timeoutMs?: number,
   ): Promise<RunState>;
 
-  /** Snapshot the current run state into a `Result`. */
   result(runId: RunId): Promise<Result>;
 }
 
@@ -154,10 +137,6 @@ export async function makeHarness(
 
   if (flowList.length === 0) throw new Error("makeHarness: no flows provided");
 
-  // Reuse the runtime's dispatchDeps so that the harness's `drainOnce` path
-  // sees the same `lookupFlow` / `startChildRun` wiring as the worker. Tests
-  // that call `dispatchMessage(deps, msg)` directly are then equivalent to
-  // tests that run via `startWorker()`.
   const deps = (wf as unknown as { __dispatchDeps: DispatchDeps })
     .__dispatchDeps;
 

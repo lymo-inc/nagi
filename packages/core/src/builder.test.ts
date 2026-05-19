@@ -70,7 +70,6 @@ describe("flow()", () => {
             needs: { o: orphan },
             run: async () => null,
           });
-          // `orphan` is intentionally NOT returned
           return { downstream };
         },
       }),

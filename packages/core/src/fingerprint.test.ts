@@ -170,8 +170,6 @@ describe("nagi() — codeVersion auto-default integration", () => {
   });
 
   it("explicit codeVersion does not equal the auto-fingerprint", async () => {
-    // Sanity: the explicit override path is genuinely a different value, not
-    // a happy coincidence where the override happens to match the fingerprint.
     const f = single("override-vs-auto");
     const { store, queue, clock } = makeStores();
     const wf = await nagi({

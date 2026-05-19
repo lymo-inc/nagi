@@ -225,12 +225,10 @@ describe("b.signal — construction-time uniqueness", () => {
         id: "collide-alias-vs-step-id",
         input: passthroughSchema<Record<string, never>>(),
         build: (b) => ({
-          // Names "x" via alias.
           transcript: b.signal({
             names: ["x"],
             schema: passthroughSchema<{ v: number }>(),
           }),
-          // And "x" again as a step id.
           x: b.signal({
             schema: passthroughSchema<{ v: number }>(),
           }),
@@ -301,9 +299,6 @@ describe("b.signal — canonical hash invariants", () => {
   });
 
   it("default vs explicit names: [stepId] (same routing) → different hash", async () => {
-    // Explicitly listing the step id in `names` still moves the hash, because
-    // the declaration itself is structural: the caller has opted into named
-    // routing.
     const noNames = await sha256Canonical(await canonicalize(withSchema()));
     const explicit = await sha256Canonical(
       await canonicalize(withSchema(["only"])),
@@ -332,10 +327,6 @@ describe("b.signal — canonical hash invariants", () => {
   });
 
   it("different step id with same resolved single name → different hash", async () => {
-    // Step `x` with default vs step `y` with `names: ["x"]`. Both resolve
-    // the external name "x" but the step id differs (and so the canonical
-    // shape differs): the second declares routing explicitly while the
-    // first inherits it from the step id.
     const stepXDefault = flow({
       id: "hash-target",
       input: passthroughSchema<Record<string, never>>(),
@@ -361,15 +352,12 @@ describe("b.signal — canonical hash invariants", () => {
 
 describe("b.signal — type-level constraints", () => {
   it("rejects empty `names` tuple at compile time", () => {
-    // The non-empty tuple type `readonly [string, ...string[]]` should
-    // make `names: []` a type error. This test exists to fail the build
-    // if the constraint regresses to `readonly string[]`.
     flow({
       id: "type-check-empty-names",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         bad: b.signal({
-          // @ts-expect-error - empty tuple is rejected by the non-empty type
+          // @ts-expect-error
           names: [],
           schema: passthroughSchema<{ v: number }>(),
         }),

@@ -1,10 +1,3 @@
-/**
- * Conformance tests for `InMemoryStore.pruneFacts` and `wf.pruneFacts`.
- *
- * The Postgres adapter runs the same test table in
- * `packages/postgres/src/integration.test.ts` so both adapters return the
- * same result for the same opts — the cross-adapter contract for issue #9.
- */
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
@@ -66,7 +59,6 @@ async function seedRuns(
   return { store, runIds };
 }
 
-/** Default opts that `wf.pruneFacts` would apply. Use for direct store calls. */
 function defaults(overrides: {
   readonly olderThan: Date;
   readonly statuses?: ReadonlyArray<PrunableStatus>;
@@ -99,15 +91,14 @@ describe("InMemoryStore.pruneFacts — selection", () => {
         startedAtMs: 2000,
         terminal: { kind: "completed", atMs: 3000 },
       },
-      { flowId: "f", startedAtMs: 1100 }, // running
+      { flowId: "f", startedAtMs: 1100 },
     ]);
     const r = await store.pruneFacts(defaults({ olderThan: new Date(10_000) }));
     expect(r.runsPruned).toBe(3);
-    expect(r.factsPruned).toBe(6); // 2 facts per pruned run
-    // Running run survives.
+    expect(r.factsPruned).toBe(6);
     const remaining = await store.queryRuns({});
     expect(remaining.runs.map((s) => s.runId)).toContain(runIds[3]);
-    expect(remaining.runs).toHaveLength(4); // 1 live + 3 kept summaries
+    expect(remaining.runs).toHaveLength(4);
   });
 
   it("respects the olderThan cutoff", async () => {
@@ -279,7 +270,6 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
       at: new Date(1100),
       parentRunId: parentId,
     });
-    // Populate secondary state for the child.
     await store.completeStep(
       childId,
       "s1",
@@ -295,7 +285,6 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
     );
     await store.recordOnce(childId, "s1", "scope", { recorded: true });
     await store.claimStep(childId, "s2", 1);
-    // Terminate the child older than cutoff.
     await store.appendFact(childId, {
       kind: "flow.completed",
       runId: childId,
@@ -307,12 +296,9 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
       defaults({ olderThan: new Date(10_000), keepSummary: false }),
     );
 
-    // listChildren no longer sees the child.
     expect(await store.listChildren(parentId)).toEqual([]);
-    // getStepOutput / getOnce return null after cleanup.
     expect(await store.getStepOutput(childId, "s1")).toBeNull();
     expect(await store.getOnce(childId, "s1", "scope")).toBeNull();
-    // A fresh claim succeeds — leases dropped.
     expect(await store.claimStep(childId, "s2", 1)).toBeTruthy();
   });
 });

@@ -11,17 +11,7 @@ import type {
   StepStartEvent,
 } from "@nagi-js/core";
 
-/**
- * Fan out a single `FlowHooks` call site to multiple subscribers, awaiting each in
- * declaration order. A throw from one subscriber is logged via `console.error` and
- * does NOT prevent later subscribers (or the workflow runtime) from running.
- *
- * Nagi's runtime accepts a single `hooks` value — this is how users wire
- * `otelHooks()` alongside their own logger / metrics hooks.
- */
 export function composeHooks(...hooks: readonly FlowHooks[]): FlowHooks {
-  // Build a local FlowHooks-shaped object. Optional fields are only set when at
-  // least one subscriber provides them — required by `exactOptionalPropertyTypes`.
   const result: {
     onFlowStart?: (event: FlowStartEvent) => Promise<void>;
     onFlowComplete?: (event: FlowCompleteEvent) => Promise<void>;

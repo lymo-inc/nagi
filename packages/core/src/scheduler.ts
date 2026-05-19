@@ -24,10 +24,6 @@ export interface ScheduleArgs {
   readonly input: unknown;
 }
 
-/**
- * Compute the next set of runnable / skip decisions from current state.
- * Pure function; the caller persists the resulting facts and enqueues messages.
- */
 export function nextRunnable(args: ScheduleArgs): ScheduleDecision {
   const { flow, runState, input } = args;
   const runnable: string[] = [];
@@ -39,7 +35,6 @@ export function nextRunnable(args: ScheduleArgs): ScheduleDecision {
 
     const def = getDef(step);
 
-    // Gate nested arm steps on parent match arm selection.
     const parentGate = checkParentMatch(def, runState);
     if (parentGate === "blocked") continue;
     if (parentGate === "transitive-skip") {
@@ -88,10 +83,11 @@ function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
     const upstreamState = runState.steps[upstream.id];
     if (upstreamState === undefined) return "blocked";
     if (upstreamState.status === "completed") continue;
-    if (
-      upstreamState.status === "skipped" ||
-      upstreamState.status === "failed"
-    ) {
+    if (upstreamState.status === "skipped") {
+      if (manualSkipCascade(upstream.id, runState) === "continue") continue;
+      return "transitive-skip";
+    }
+    if (upstreamState.status === "failed") {
       return "transitive-skip";
     }
     return "blocked";
@@ -99,15 +95,21 @@ function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
   return "ready";
 }
 
-/**
- * Gate for nested arm steps. A step with `parentMatch` runs only after its
- * parent match has selected an arm AND that arm matches.
- *
- *   parent missing arm-selected fact   → blocked (parent hasn't routed yet)
- *   parent selected a different arm    → transitive-skip
- *   parent failed/skipped before selecting → transitive-skip
- *   parent selected this arm           → ready
- */
+function manualSkipCascade(
+  stepId: StepId,
+  runState: RunState,
+): "skip" | "continue" {
+  for (let i = runState.facts.length - 1; i >= 0; i--) {
+    const f = runState.facts[i];
+    if (f === undefined) continue;
+    if (f.kind !== "step.skipped") continue;
+    if (f.stepId !== stepId) continue;
+    if (f.reason !== "manual") return "skip";
+    return f.cascade ?? "skip";
+  }
+  return "skip";
+}
+
 function checkParentMatch(def: StepDef, runState: RunState): UpstreamStatus {
   if (!def.parentMatch) return "ready";
   const { matchId, armId } = def.parentMatch;
@@ -130,20 +132,6 @@ export type MatchAggregation =
     }
   | { readonly kind: "fail-fast"; readonly failedStepId: string };
 
-/**
- * Inspect the chosen arm of a `running` match and report whether it can be
- * promoted to a terminal state.
- *
- *   pending    — selected arm has steps still running/pending; do nothing
- *   fail-fast  — at least one chosen-arm step is `failed`; match should fail
- *   complete   — every chosen-arm step is terminal (completed/skipped) and
- *                none failed; match should be completed with assembled output
- *
- * Output is keyed by the *local* step key (the original key from the arm's
- * StepMap), not the namespaced runtime id — that's what the user sees in
- * `needs.matchStep.<key>`. Skipped steps land as `null`, consistent with the
- * "skip is transitive" lock.
- */
 export function aggregateMatch(
   matchId: string,
   flow: Flow,
@@ -196,11 +184,6 @@ export interface FlowTermination {
   readonly failed: boolean;
 }
 
-/**
- * `done` ⇔ every step is terminal (completed / failed / skipped).
- * `failed` ⇔ at least one step failed terminally.
- * The runtime appends `flow.completed` (or `flow.failed`) once `done`.
- */
 export function flowTermination(
   flow: Flow,
   runState: RunState,
@@ -222,30 +205,7 @@ export function flowTermination(
   return { done, failed };
 }
 
-/**
- * Compute the transitive closure of steps that should reset when `stepId` is
- * reset by `wf.replay({ from })`. The returned set INCLUDES `stepId` itself;
- * callers append one `step.reset` fact per returned id.
- *
- * Edges walked:
- *   - Forward `needs`: any step `Y` whose `def.needs` references `X` is a
- *     descendant of `X` (running `Y` without `X`'s output would be stale).
- *   - Match → arm: when `X` is a match step, every step inside its arms is a
- *     descendant — they only run after `X` selects an arm, so resetting `X`
- *     invalidates the selection (see `readSelectedArm` reset handling) and
- *     every arm step downstream.
- *
- * Edges NOT walked:
- *   - Sibling arm steps (no needs edge between siblings → no cascade).
- *   - The parent match when an arm step is reset (the arm step is downstream
- *     of the match, not the other way around).
- *
- * Returns ids in deterministic order (BFS from `stepId`) so the resulting
- * `step.reset` fact log is stable across runs.
- */
 export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {
-  // Forward-edge adjacency: parent → children (steps that should reset when
-  // parent resets). Built once per call; cheap relative to dispatch cost.
   const children = new Map<StepId, StepId[]>();
   const addEdge = (from: StepId, to: StepId) => {
     const bucket = children.get(from);
@@ -279,10 +239,6 @@ export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {
   return out;
 }
 
-/**
- * The flow input is persisted in the `flow.started` fact. Extracted on every
- * dispatch so handler `ctx.input` is consistent with what the run was started with.
- */
 export function extractInput(runState: RunState): Json {
   for (const fact of runState.facts) {
     if (fact.kind === "flow.started") return fact.input;

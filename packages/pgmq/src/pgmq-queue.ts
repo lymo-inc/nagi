@@ -15,40 +15,15 @@ const DEFAULT_QUEUE_NAME = "nagi";
 const DEFAULT_VISIBILITY_TIMEOUT_MS: Millis = 30_000;
 
 export interface PgmqQueueOpts {
-  /** Kysely instance. The adapter does NOT own the connection lifecycle. */
   readonly db: Kysely<unknown>;
-  /** PGMQ queue name. Default: "nagi". */
   readonly queueName?: string;
-  /** Visibility timeout applied on every dequeue, in ms. Default: 30_000. */
   readonly visibilityTimeoutMs?: Millis;
-  /**
-   * Use `pgmq.create_partitioned()` instead of `pgmq.create()` when
-   * `ensureSchema()` runs. Default: false.
-   */
   readonly partitioned?: boolean;
-  /**
-   * Use `pgmq.archive()` instead of `pgmq.delete()` on ack — retains messages
-   * in the archive table for audit. Default: false.
-   */
   readonly archiveOnAck?: boolean;
 }
 
 export interface PgmqQueue extends Queue {
-  /**
-   * Idempotent setup: installs the pgmq extension and creates the queue.
-   * Requires database privileges to `CREATE EXTENSION`. Suitable for dev/test;
-   * production should run these statements out-of-band.
-   */
   ensureSchema(): Promise<void>;
-  /**
-   * Returns a `Queue` whose operations execute on the supplied transaction.
-   * Pass `ctx.tx` to enqueue messages atomically with the handler's domain
-   * writes — the pgmq message commits with `step.completed` or rolls back
-   * with the handler. The user must have wired `@nagi-js/postgres` and
-   * augmented `Register.tx` so that `Tx` is a Kysely transaction at compile
-   * time; at runtime, `tx` must be the same Kysely handle the postgres store
-   * handed to `runStep`.
-   */
   withTx(tx: Tx): Queue;
 }
 
@@ -90,9 +65,6 @@ export function pgmqQueue(opts: PgmqQueueOpts): PgmqQueue {
     },
 
     withTx(tx: Tx): Queue {
-      // `Tx` is the user-augmented transaction type from `@nagi-js/core`.
-      // When `@nagi-js/postgres` is wired and `Register.tx` is augmented to
-      // a Kysely transaction, the cast is structurally sound at runtime.
       return buildQueue(tx as unknown as Kysely<unknown>, config);
     },
   };
@@ -151,8 +123,6 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
       options?: { readonly delayMs?: Millis },
     ): Promise<void> {
       const msgId = parseReceipt(receipt);
-      // set_vt expects seconds offset from now. 0 = immediately re-visible.
-      // Attempt counters live in the dispatcher — nack must not mutate them.
       const delaySeconds = Math.max(
         0,
         Math.ceil((options?.delayMs ?? 0) / 1000),

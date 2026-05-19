@@ -1,10 +1,3 @@
-/**
- * Conformance tests for `InMemoryStore.queryRuns` and `wf.queryRuns`.
- *
- * The Postgres adapter runs the same test table in
- * `packages/postgres/src/integration.test.ts` so both adapters return the
- * same rows for the same query — the cross-adapter contract for issue #5.
- */
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
@@ -21,11 +14,6 @@ function passthroughSchema<T>(): StandardSchemaV1<T, T> {
   };
 }
 
-/**
- * Seed a fresh InMemoryStore with N runs by calling `tryStartRun`. Returns
- * the store and the minted run ids in seed order (so callers can assert
- * "newest-first" by reversing).
- */
 async function seedRuns(
   cases: ReadonlyArray<{
     readonly flowId: string;
@@ -241,7 +229,6 @@ describe("InMemoryStore.queryRuns — ordering, latest, pagination", () => {
     expect(third.runs).toHaveLength(1);
     expect(third.cursor).toBeNull();
 
-    // No duplicates across pages.
     const ids = [...first.runs, ...second.runs, ...third.runs].map(
       (x) => x.runId,
     );
@@ -288,8 +275,6 @@ describe("wf.queryRuns — runtime layer", () => {
       queue: new InMemoryQueue(),
       clock: new InMemoryClock(),
     });
-    // Use `any` to defeat the discriminated-union compile check — the
-    // runtime guard is what matters for JS-only callers.
     await expect(
       // biome-ignore lint/suspicious/noExplicitAny: testing the runtime guard
       wf.queryRuns({ latest: true, limit: 5 } as any),

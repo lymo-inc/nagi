@@ -199,8 +199,6 @@ describe("start: caller-supplied runId", () => {
 
     const supplied = "run-idem-xyz" as RunId;
     const first = await h.wf.start(f, { x: 7 }, { runId: supplied });
-    // Second call BEFORE draining; runtime returns immediately with no new
-    // flow.started fact, no second dispatch.
     const second = await h.wf.start(f, { x: 999 }, { runId: supplied });
 
     expect(first).toBe(supplied);
@@ -210,15 +208,11 @@ describe("start: caller-supplied runId", () => {
     expect(state.facts.filter((f) => f.kind === "flow.started")).toHaveLength(
       1,
     );
-    // The single flow.started fact carries the FIRST input — second call
-    // didn't re-validate or overwrite.
     const started = state.facts.find((f) => f.kind === "flow.started");
     expect(
       started && started.kind === "flow.started" ? started.input : null,
     ).toEqual({ x: 7 });
 
-    // The queue should have exactly one enqueued message for `only` from the
-    // first dispatch — the second start() didn't re-dispatch.
     await h.drain();
     const final = await h.result(supplied);
     expect(final.output("only")).toEqual({ doubled: 14 });
@@ -236,7 +230,6 @@ describe("start: caller-supplied runId", () => {
     const f = trivialFlow();
     const h = await makeHarness(f);
     await expect(
-      // Force an invalid type past the compile-time check.
       h.wf.start(f, { x: 1 }, { runId: 123 as unknown as RunId }),
     ).rejects.toBeInstanceOf(NagiValidationError);
   });

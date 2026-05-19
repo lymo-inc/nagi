@@ -1,8 +1,3 @@
-/**
- * Drives `otelHooks()` through a real `nagi()` runtime end-to-end with in-memory
- * deps. Verifies that the flow + per-step span hierarchy and core attributes
- * land in an OTel exporter when the hooks are wired the way users will wire them.
- */
 import {
   flow,
   InMemoryClock,
@@ -106,7 +101,6 @@ describe("@nagi-js/otel — end-to-end against a real nagi runtime", () => {
     const stepSpans = spans.filter((s) => s.name.startsWith("step "));
     expect(stepSpans.length).toBe(2);
 
-    // Every step is a child of the flow span and shares the same trace id.
     for (const s of stepSpans) {
       expect(s.parentSpanId).toBe(flowSpan!.spanContext().spanId);
       expect(s.spanContext().traceId).toBe(flowSpan!.spanContext().traceId);
@@ -115,7 +109,6 @@ describe("@nagi-js/otel — end-to-end against a real nagi runtime", () => {
       expect(s.attributes["deployment.environment"]).toBe("test");
     }
 
-    // The two step span IDs are the local keys from `build`.
     const stepIds = stepSpans.map((s) => s.attributes["nagi.step.id"]).sort();
     expect(stepIds).toEqual(["a", "c"]);
   }, 10_000);

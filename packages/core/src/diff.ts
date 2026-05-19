@@ -1,7 +1,6 @@
 import type { CanonicalDag, CanonicalStep } from "./canonicalize";
 import type { StepId } from "./types";
 
-/** Fields on a step whose hash-relevant value can change between snapshots. */
 export type SnapshotChangedField =
   | "kind"
   | "when"
@@ -24,22 +23,6 @@ export interface SnapshotChangedField_ {
   readonly field: SnapshotChangedField;
 }
 
-/**
- * Structural delta between two snapshots — added/removed steps, added/removed
- * edges, per-field topology changes on shared steps.
- *
- * Pure function over canonical DAGs. The output mirrors the RFC 0001 shape:
- *
- *   {
- *     addedSteps,
- *     removedSteps,
- *     changedEdges,    // append-or-remove edges between shared steps
- *     changedPredicates // when / retry / timeoutMs / schema / match changes
- *   }
- *
- * "Changed" means the canonical hash-relevant value differs. For predicates
- * this is best-effort under the same source-hash limit as canonicalize.
- */
 export interface SnapshotDiff {
   readonly addedSteps: readonly StepId[];
   readonly removedSteps: readonly StepId[];
@@ -68,7 +51,6 @@ export function diffSnapshots(
   const changedEdges: SnapshotChangedEdge[] = [];
   const changedPredicates: SnapshotChangedField_[] = [];
 
-  // Edges and per-field changes only meaningful for steps present in both.
   for (const id of afterStepsById.keys()) {
     const beforeStep = beforeStepsById.get(id);
     const afterStep = afterStepsById.get(id);

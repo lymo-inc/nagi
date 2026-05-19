@@ -107,8 +107,6 @@ class WorkerImpl implements Worker {
       this.deps.logger?.error("worker.dispatch threw uncaught", {
         error: String(err),
       });
-      // Nack so the message becomes visible again after the lease expires.
-      // (dispatchMessage handles its own ack/nack on the happy path; this is the safety net.)
       try {
         await this.deps.queue.nack(msg.receipt);
       } catch {}
@@ -128,8 +126,6 @@ class WorkerImpl implements Worker {
   private async sleep(ms: Millis): Promise<void> {
     try {
       await this.deps.clock.sleep(ms, this.signal);
-    } catch {
-      // sleep rejects on abort; loop condition catches it next iteration.
-    }
+    } catch {}
   }
 }

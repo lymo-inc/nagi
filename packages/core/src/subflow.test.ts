@@ -26,7 +26,6 @@ describe("b.subflow — happy path", () => {
         const consume = b.task({
           needs: { sub },
           run: async ({ needs }) => ({
-            // The output is typed as { childRunId, output: { doubled: number } }
             tripled: needs.sub.output.doubled * 1.5,
             via: needs.sub.childRunId,
           }),
@@ -48,7 +47,6 @@ describe("b.subflow — happy path", () => {
     expect(consumeOutput.tripled).toBe(15);
     expect(consumeOutput.via).toMatch(/^run-/);
 
-    // The subflow step's persisted output is the SubflowStepOutput shape.
     const subOutput = result.output("sub") as {
       childRunId: string;
       output: { doubled: number };
@@ -56,7 +54,6 @@ describe("b.subflow — happy path", () => {
     expect(subOutput.childRunId).toBe(consumeOutput.via);
     expect(subOutput.output).toEqual({ doubled: 10 });
 
-    // The child run was independently recorded and reached terminal state.
     const childState = await h.store.loadRunState(
       subOutput.childRunId as ReturnType<
         typeof h.store.loadRunState
@@ -69,7 +66,6 @@ describe("b.subflow — happy path", () => {
     expect(childState.status).toBe("completed");
     expect(childState.flowId).toBe("child-double");
 
-    // Parent linkage is recorded on the child's flow.started fact.
     const startedFact = childState.facts.find(
       (f) => f.kind === "flow.started",
     ) as FlowStartedFact | undefined;
@@ -116,7 +112,7 @@ describe("b.subflow — happy path", () => {
       childRunId: string;
       output: { sum: number };
     };
-    expect(subOutput.output).toEqual({ sum: 77 }); // 7 + 70
+    expect(subOutput.output).toEqual({ sum: 77 });
   });
 });
 
@@ -207,9 +203,8 @@ describe("b.subflow — nesting", () => {
       childRunId: string;
       output: { result: number };
     };
-    expect(subOutput.output.result).toBe(17); // 4*4 + 1
+    expect(subOutput.output.result).toBe(17);
 
-    // Chain the parent linkages: child → parent, grandchild → child.
     const childState = await h.store.loadRunState(
       subOutput.childRunId as never,
     );
@@ -234,8 +229,6 @@ describe("b.subflow — nesting", () => {
 
 describe("b.subflow — cancel cascade", () => {
   it("wf.cancel(parent) transitively cancels children and grandchildren", async () => {
-    // Use a signal in the grandchild so the run parks; without that, the
-    // worker-less harness would race to drain everything before we cancel.
     const grandchild = flow({
       id: "gc-parked",
       input: passthroughSchema<Record<string, never>>(),
@@ -265,8 +258,6 @@ describe("b.subflow — cancel cascade", () => {
     const parentRunId = await h.wf.start(parent, {});
     await h.drain();
 
-    // At this point the grandchild's signal is parked. Find the child + gc
-    // run ids via listChildren.
     const childIds = await h.store.listChildren(parentRunId);
     expect(childIds.length).toBe(1);
     const childRunId = childIds[0] as never;
@@ -274,12 +265,10 @@ describe("b.subflow — cancel cascade", () => {
     expect(gcIds.length).toBe(1);
     const gcRunId = gcIds[0] as never;
 
-    // All three runs should currently be in `running` status.
     expect((await h.store.loadRunState(parentRunId)).status).toBe("running");
     expect((await h.store.loadRunState(childRunId)).status).toBe("running");
     expect((await h.store.loadRunState(gcRunId)).status).toBe("running");
 
-    // Cancel the parent. Both descendants should follow.
     await h.wf.cancel(parentRunId, { reason: "user pressed cancel" });
 
     expect((await h.store.loadRunState(parentRunId)).status).toBe("canceled");
@@ -336,7 +325,6 @@ describe("b.subflow — cancel cascade", () => {
     const runId = await h.wf.start(child, { x: 1 });
     await h.drain();
     expect((await h.store.loadRunState(runId)).status).toBe("completed");
-    // Cancel a completed run — should be a no-op (no throw, no fact change).
     await h.wf.cancel(runId);
     const state = await h.store.loadRunState(runId);
     expect(state.status).toBe("completed");
@@ -366,9 +354,6 @@ describe("b.subflow — registration", () => {
       }),
     });
 
-    // Register parent ONLY. Subflow dispatch should fail.
-    // Use a 1-attempt default retry so the failure surfaces immediately
-    // rather than waiting through the default 3-attempt exponential backoff.
     const h = await makeHarness([parent], {
       defaultRetry: {
         maxAttempts: 1,

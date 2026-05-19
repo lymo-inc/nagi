@@ -18,9 +18,7 @@ export interface CapturedQuery {
 export interface CapturingDb {
   readonly db: Kysely<unknown>;
   readonly queries: readonly CapturedQuery[];
-  /** Set the rows the next executeQuery call returns. FIFO. */
   enqueueRows(rows: readonly unknown[]): void;
-  /** Drop all captured queries and pre-loaded responses. */
   reset(): void;
 }
 
@@ -58,11 +56,6 @@ class CapturingDriver implements Driver {
   async destroy(): Promise<void> {}
 }
 
-/**
- * A Kysely instance whose driver captures every executed query and replays
- * pre-loaded rows. Used by adapter unit tests to verify SQL shape and result
- * projection without a real Postgres.
- */
 export function createCapturingDb(): CapturingDb {
   const captured: CapturedQuery[] = [];
   const responses: unknown[][] = [];

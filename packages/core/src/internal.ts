@@ -14,13 +14,6 @@ import type {
   StepStartEvent,
 } from "./types";
 
-/**
- * A nested step's annotation — set on any step that lives inside a match arm.
- * The scheduler uses this to gate the step:
- *   - blocked     until the parent match selects an arm
- *   - skipped     when the parent's selected arm differs from this step's arm
- *   - eligible    when the parent's selected arm matches
- */
 export interface ParentMatchRef {
   readonly matchId: string;
   readonly armId: string;
@@ -42,12 +35,6 @@ export interface TaskDef {
   }) => Promise<Json>;
   readonly parentMatch?: ParentMatchRef;
 
-  /**
-   * Step-local lifecycle hooks, forwarded from `TaskConfig` / `StepEntryConfig`.
-   * Stored at runtime-wide signatures (Json output) because the dispatcher
-   * deals in Json — the typed `Output` narrowing happens at the public config
-   * layer, not here.
-   */
   readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
   readonly onComplete?: (event: StepCompleteEvent) => void | Promise<void>;
   readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
@@ -58,12 +45,6 @@ export interface SignalDef {
   readonly kind: "signal";
   readonly needs: NeedsMap;
   readonly schema: StandardSchemaV1;
-  /**
-   * Resolved external signal names this step accepts. ONLY populated when
-   * the caller supplied `name` or `names` explicitly — the back-compat
-   * "default to step id" path leaves this undefined so older flows hash
-   * byte-identically.
-   */
   readonly names?: readonly [string, ...string[]];
   readonly timeoutMs?: Millis;
   readonly when?: (args: {
@@ -73,15 +54,6 @@ export interface SignalDef {
   readonly parentMatch?: ParentMatchRef;
 }
 
-/**
- * One arm of a match. For discriminator matches `id` is the case key
- * (e.g. "hot"); for guard matches it's `arm0` / `arm1` / ... / `otherwise`.
- *
- * `stepIds` is populated by `flow()` once nested steps have been assigned
- * namespaced IDs (`<matchKey>.<armId>.<stepKey>`). During builder execution
- * `stepIds` is empty and the unflattened map lives on `_nested`, which
- * `flow()` consumes and discards.
- */
 export interface MatchArmDef {
   readonly id: string;
   readonly when?: (args: {
@@ -90,7 +62,6 @@ export interface MatchArmDef {
   }) => boolean;
   readonly otherwise?: true;
   readonly stepIds: readonly string[];
-  /** @internal Transient. Populated by builder, consumed by flow(). */
   readonly _nested?: StepMap;
 }
 
@@ -116,15 +87,6 @@ export interface GuardMatchDef extends MatchDefBase {
 
 export type MatchDef = DiscriminatorMatchDef | GuardMatchDef;
 
-/**
- * A subflow step. Holds the child flow's id (lookup at dispatch time via
- * the runtime's `flowsById` registry) and the user's `buildInput` callback
- * that derives the child's input from `(parentInput, needs)`.
- *
- * `kind: "subflow"` parks the step in `running` after the child run is
- * spawned; completion arrives via the child's `finalizeFlowCompletion`
- * hook, not via a queue message redelivery.
- */
 export interface SubflowDef {
   readonly kind: "subflow";
   readonly needs: NeedsMap;
@@ -156,12 +118,6 @@ export function attachDef<Output>(
   return { kind: meta.kind, id: meta.id, [DEF]: def };
 }
 
-/**
- * In-place def attachment for the `b.steps()` two-phase build. Phase 1
- * allocates a placeholder `Step` so sibling `needs` can hold a stable object
- * reference; phase 2 builds the def (whose `needs` map points to those same
- * shells) and stamps it onto the shell here.
- */
 export function attachDefMut(step: Step<unknown>, def: StepDef): void {
   (step as unknown as { [DEF]: StepDef })[DEF] = def;
 }
@@ -176,17 +132,14 @@ export function getDef(step: Step<unknown>): StepDef {
   return def;
 }
 
-/** A step is "complete-blocking" if downstream can't run until it finishes. */
 export function isStepKind(def: StepDef, kind: StepDef["kind"]): boolean {
   return def.kind === kind;
 }
 
-/** Names of the upstream steps this step depends on. */
 export function needsKeys(def: StepDef): readonly string[] {
   return Object.keys(def.needs);
 }
 
-/** Extract the upstream step IDs (after `flow()` has assigned ids from keys). */
 export function needsStepIds(def: StepDef): readonly string[] {
   const out: string[] = [];
   for (const upstream of Object.values(def.needs)) {
@@ -202,7 +155,6 @@ export function needsStepIds(def: StepDef): readonly string[] {
   return out;
 }
 
-/** Build the `needs` record passed to a handler — `{ localKey: upstreamOutput }`. */
 export function resolveNeeds(
   def: StepDef,
   loadOutput: (stepId: string) => Json | null,
@@ -223,35 +175,19 @@ export function resolveNeeds(
 
 export type StepMapWithDefs = Readonly<Record<string, StepWithDef<unknown>>>;
 
-/** Cast a public StepMap to the internal one. Builder produces StepWithDef instances. */
 export function asStepMapWithDefs(steps: StepMap): StepMapWithDefs {
   return steps as StepMapWithDefs;
 }
 
-/** All arms of a match, regardless of mode, as an ordered list. */
 export function matchArms(def: MatchDef): readonly MatchArmDef[] {
   return def.mode === "discriminator" ? Object.values(def.arms) : def.arms;
 }
 
-/** Look up an arm by id. Returns undefined if no arm has that id. */
 export function findArm(def: MatchDef, armId: string): MatchArmDef | undefined {
   if (def.mode === "discriminator") return def.arms[armId];
   return def.arms.find((a) => a.id === armId);
 }
 
-/**
- * Read the chosen arm of a match from the fact log. Returns `null` if the
- * match has not yet selected an arm in this run (i.e. no `match.arm-selected`
- * fact for `matchId`), OR if the latest fact for `matchId` is a `step.reset`
- * that invalidated a prior selection.
- *
- * The fact log is the source of truth for the selection — it survives crash
- * and replay, and the match's own `running` state in the steps projection
- * doesn't carry the chosen-arm bit. We walk forward and track the current
- * selection so a `step.reset` (emitted by `wf.replay({ from: matchId })`)
- * correctly clears it; otherwise re-running a match step would inherit the
- * stale arm and skip re-selection.
- */
 export function readSelectedArm(
   matchId: string,
   runState: RunState,
@@ -267,23 +203,6 @@ export function readSelectedArm(
   return selected;
 }
 
-/**
- * Pick the arm to run for a given match invocation.
- *
- * Discriminator: invoke `on(args)`, look up the case key in `def.arms`. Throw
- *   if the returned key has no arm — the type system guards exhaustiveness,
- *   but the discriminant might be a runtime-narrowed string that escapes the
- *   declared union.
- *
- * Guard: walk `def.arms` top-to-bottom. The first arm whose `when()` returns
- *   true wins; an arm with `otherwise: true` matches unconditionally. Throw
- *   if no arm matches and no `otherwise` is present (per the v0 fallthrough
- *   policy: unreachable fallthrough is a programmer error → match fails
- *   terminally).
- *
- * The thrown Error's message becomes the `step.failed.error.message` for the
- * match, so phrase it for an operator reading a fact log.
- */
 export function selectArm(
   def: MatchDef,
   args: { readonly input: unknown; readonly needs: Record<string, unknown> },

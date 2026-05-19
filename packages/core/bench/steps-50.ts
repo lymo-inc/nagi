@@ -1,5 +1,3 @@
-// Benchmark fixture: 50-step `b.step()` chain. Used to measure tsc compile
-// time for RFC 0002. Not exported and not part of any test run.
 import { flow } from "../src/builder";
 
 const _f = flow({

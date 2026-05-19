@@ -165,9 +165,7 @@ describe("otelHooks — happy path", () => {
     expect(stepSpan).toBeDefined();
     expect(flowSpan).toBeDefined();
 
-    // Step is a child of flow (parent-span-id matches flow's span id).
     expect(stepSpan!.parentSpanId).toBe(flowSpan!.spanContext().spanId);
-    // Both share a trace id.
     expect(stepSpan!.spanContext().traceId).toBe(
       flowSpan!.spanContext().traceId,
     );
@@ -266,7 +264,6 @@ describe("otelHooks — retry", () => {
     expect(a1.status.code).toBe(SpanStatusCode.ERROR);
     expect(a2.status.code).toBe(SpanStatusCode.UNSET);
 
-    // Both siblings have the same flow-span parent.
     expect(a1.parentSpanId).toBe(a2.parentSpanId);
 
     const flowSpan = bySpanName(exporter.getFinishedSpans(), "flow flow-test")!;
@@ -297,8 +294,6 @@ describe("otelHooks — signal received", () => {
 
 describe("otelHooks — resilience", () => {
   it("does not throw when onFlowComplete fires without a preceding onFlowStart", () => {
-    // Out-of-order events can happen if a hook subscription is added mid-run.
-    // The adapter must absorb this rather than crash the workflow.
     const hooks = makeHooks();
     expect(() => hooks.onFlowComplete!(flowComplete())).not.toThrow();
     expect(() => hooks.onFlowError!(flowError())).not.toThrow();

@@ -51,7 +51,6 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
       (f): f is StepResetFact => f.kind === "step.reset",
     );
     expect(resets.map((r) => r.stepId).sort()).toEqual(["b", "c"]);
-    // The user-named step has no cascadedFrom; the cascaded one points back to it.
     const named = resets.find((r) => r.stepId === "b");
     const cascaded = resets.find((r) => r.stepId === "c");
     expect(named?.cascadedFrom).toBeUndefined();
@@ -74,7 +73,6 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
   });
 
   it("throws NagiRuntimeError when the run is still running", async () => {
-    // A signal step parks the run in `running` indefinitely.
     const f = flow({
       id: "from-running",
       input: passthroughSchema<Record<string, never>>(),
@@ -127,7 +125,6 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     const failed = await h.store.loadRunState(runId);
     expect(failed.status).toBe("failed");
 
-    // `from: "a"` instead of default-from-b: both should re-run.
     bShouldFail = false;
     await h.wf.replay(runId, { mode: "continue", from: "a" });
     await h.drain();

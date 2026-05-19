@@ -36,10 +36,6 @@ import type {
   TaskConfig,
 } from "./types";
 
-/**
- * Marker stamped on every Builder instance so `flow()` (and match-case
- * extraction) can distinguish a chain return from a plain `StepMap`.
- */
 const BUILDER_BRAND = Symbol.for("nagi.builder");
 
 interface BuilderInternal {
@@ -55,7 +51,6 @@ function isBuilder(value: unknown): value is BuilderInternal {
   );
 }
 
-/** Resolve a build-callback result (Builder | StepMap) to a plain StepMap. */
 function resolveBuildResult(value: unknown): StepMap {
   if (isBuilder(value)) {
     return Object.fromEntries(value.__steps) as StepMap;
@@ -75,9 +70,6 @@ function isDiscriminator(
 }
 
 function makeBuilder<Input>(): Builder<Input> {
-  // Chain accumulator. Each `.step()` / `.include()` call writes here so the
-  // build callback can return the builder directly and `flow()` can read the
-  // assembled StepMap.
   const chainSteps = new Map<string, Step<unknown>>();
 
   function task<N extends NeedsMap, O>(
@@ -116,9 +108,6 @@ function makeBuilder<Input>(): Builder<Input> {
   function signal<N extends NeedsMap, S extends StandardSchemaV1>(
     config: SignalConfig<Input, N, S>,
   ): Step<InferSchemaOutput<S>> {
-    // `names` is only stored when the caller passed it explicitly. Leaving
-    // it undefined for the default case keeps pre-RFC-0004 flows byte-stable
-    // in the canonical hash.
     const def: SignalDef = {
       kind: "signal",
       needs: (config.needs ?? {}) as NeedsMap,
@@ -220,12 +209,6 @@ function makeBuilder<Input>(): Builder<Input> {
     return attachDef<unknown>({ kind: "match", id: "" }, def);
   }
 
-  /**
-   * Chainable task entry. Pre-allocates a `Step` shell so sibling `needs`
-   * keys can hold a stable object reference, then immediately stamps the
-   * built `TaskDef` onto the shell. The shell is registered in the chain
-   * accumulator so subsequent `.step()` calls can resolve sibling refs.
-   */
   function step(
     key: string,
     config: StepEntryConfig<
@@ -286,11 +269,6 @@ function makeBuilder<Input>(): Builder<Input> {
     return builder as Builder<Input, Record<string, unknown>>;
   }
 
-  /**
-   * Bring a pre-built `Step` (from `b.task` / `b.signal` / `b.match`) into
-   * the chain under a key. The step's def is already attached; we only
-   * register the identity in the accumulator.
-   */
   function include(
     key: string,
     s: Step<unknown>,
@@ -318,22 +296,6 @@ function makeBuilder<Input>(): Builder<Input> {
   return builder;
 }
 
-/**
- * Construct a flow.
- *
- * 1. Run `build(b)` to collect the user's StepMap. Each call to `b.task` /
- *    `b.signal` / `b.match` produced a Step with `id: ""` and a captured def
- *    (which may reference upstream Step values from earlier in the closure).
- *    Match defs additionally hold their arms' nested StepMaps on `_nested`.
- * 2. Walk the returned map *recursively*, descending into match arms. Each
- *    step gets an id derived from its position: top-level keys verbatim,
- *    nested arm steps namespaced as `<matchKey>.<armId>.<stepKey>`.
- * 3. Rewrite every def's `needs` so each upstream Step value carries its
- *    assigned id. Nested-arm step defs additionally get a `parentMatch`
- *    annotation so the scheduler can gate them on arm selection.
- * 4. Promote `MatchArmDef._nested` → `MatchArmDef.stepIds` (the namespaced
- *    IDs of the arm's nested steps), then drop `_nested`.
- */
 export function flow<
   const Id extends string,
   InputSchema extends StandardSchemaV1,
@@ -380,7 +342,6 @@ export function flow<
   };
 }
 
-/** Recursively assign namespaced IDs and record them by Step identity. */
 function collectIds(
   map: StepMap,
   prefix: string,
@@ -410,12 +371,6 @@ interface WalkArgs {
   readonly out: Record<string, Step<unknown>>;
 }
 
-/**
- * Recursively rewrite defs and emit them into `out` under their assigned
- * namespaced IDs. For matches, each arm's nested steps are emitted into the
- * same flat `out` map (so the scheduler sees the full graph), then the arm
- * is finalized with the namespaced ID list.
- */
 function walkAndRewrite(args: WalkArgs): void {
   const { flowId, map, prefix, parentMatch, idByIdentity, out } = args;
 
@@ -428,9 +383,6 @@ function walkAndRewrite(args: WalkArgs): void {
           `Did you return a value not produced by the builder?`,
       );
     }
-    // Steps fresh from `b.task` / `b.signal` / `b.match` carry id "". A
-    // non-empty id means this step was already processed by a different
-    // `flow()` call — sharing a step across flows is unsupported.
     if (step.id !== "") {
       throw new Error(
         `Flow "${flowId}": step "${id}" was produced by a different flow() ` +
@@ -515,18 +467,10 @@ function walkAndRewrite(args: WalkArgs): void {
   }
 }
 
-/**
- * Signal names share a namespace with step ids: every step's id is implicitly
- * an accepted signal name, and explicit `names` on a signal step adds aliases
- * to that same namespace. Two declarations of the same name —
- * step-id-vs-alias OR alias-vs-alias — make `wf.signal(runId, name, ...)`
- * ambiguous. We catch that at construction so a bad flow can't boot.
- */
 function assertSignalNameUniqueness(
   flowId: string,
   finalSteps: Record<string, Step<unknown>>,
 ): void {
-  // Map<name, "<sourceKind>:<sourceStepId>"> — first writer wins, second hit throws.
   const owners = new Map<string, string>();
 
   for (const stepId of Object.keys(finalSteps)) {
@@ -539,7 +483,6 @@ function assertSignalNameUniqueness(
     if (def.names === undefined) continue;
 
     for (const alias of def.names) {
-      // An alias listing the step's own id is a no-op (deduped), not a clash.
       if (alias === stepId) continue;
 
       const prior = owners.get(alias);

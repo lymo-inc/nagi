@@ -34,17 +34,9 @@ const DEFAULT_LEASE_MS: Millis = 60_000;
 const SCHEMA_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface PostgresStoreOpts<DB = unknown> {
-  /** User-supplied Kysely instance. Driver (`pg`, `postgres.js`, Neon) is the user's choice. */
   readonly db: Kysely<DB>;
-  /** Schema name; default `nagi`. Must match `/^[A-Za-z_][A-Za-z0-9_]*$/`. */
   readonly schema?: string;
-  /** Lease duration in milliseconds; default 60_000. */
   readonly leaseMs?: Millis;
-  /**
-   * If provided, the store emits `pg_notify(<channel>, runId)` after writing
-   * each fact. Pair with `postgresTrigger({ listen, channel })` to wake
-   * schedulers without polling.
-   */
   readonly notifyChannel?: string;
 }
 
@@ -72,7 +64,6 @@ class PostgresStore<DB = unknown> implements Store {
     this.notifyChannel = opts.notifyChannel;
   }
 
-  /** Schema-qualified table name for raw SQL interpolation. */
   private t(table: string): string {
     return `${this.schema}.${table}`;
   }
@@ -100,9 +91,6 @@ class PostgresStore<DB = unknown> implements Store {
     }>;
   }> {
     if (concurrency === undefined) {
-      // Fast path with no concurrency: race-safe atomic insert via the
-      // run_id PRIMARY KEY. Losers of a runId-collision race get the
-      // clean idempotent no-op.
       const started = await this.db.transaction().execute(async (trx) => {
         const insert = await sql<{ run_id: string }>`
           INSERT INTO ${sql.raw(this.t("workflow_run"))}
@@ -126,19 +114,12 @@ class PostgresStore<DB = unknown> implements Store {
       return { started, canceled: [] };
     }
 
-    // Concurrency path: serialize starts for the same `(flowId, key)` via an
-    // advisory lock so the partial unique index on active runs is never
-    // violated. We cancel prior actives BEFORE inserting the new row, so the
-    // index slot is free at INSERT time.
     const result = await this.db.transaction().execute(async (trx) => {
       const lockText = `nagi:concurrency:${fact.flowId}:${concurrency.key}`;
       await sql`SELECT pg_advisory_xact_lock(hashtext(${lockText}))`.execute(
         trx,
       );
 
-      // runId-idempotency wins: if a run with this id already exists, do
-      // nothing — no cancellation, no double-emit, same contract as the
-      // non-concurrency path.
       const existing = await sql<{ run_id: string }>`
         SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
          WHERE run_id = ${runId}
@@ -154,10 +135,6 @@ class PostgresStore<DB = unknown> implements Store {
         };
       }
 
-      // Cancel any other active runs sharing this key. FOR UPDATE inside the
-      // advisory lock is belt-and-suspenders — the lock already serializes;
-      // the row lock just makes the cancel safe even if some other path
-      // (e.g. an admin SQL update) is mid-flight.
       const others = await sql<{ run_id: string }>`
         SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
          WHERE flow_id = ${fact.flowId}
@@ -187,8 +164,6 @@ class PostgresStore<DB = unknown> implements Store {
         canceled.push({ runId: priorRunId, fact: cancelFact });
       }
 
-      // Now insert the new run. With prior actives moved to `canceled`,
-      // the partial unique index slot is free.
       await sql`
         INSERT INTO ${sql.raw(this.t("workflow_run"))}
           (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key, parent_run_id, parent_step_id)
@@ -336,10 +311,6 @@ class PostgresStore<DB = unknown> implements Store {
       readonly fact: StepCompletedFact | StepFailedFact | StepCanceledFact;
     }>,
   ): Promise<T> {
-    // The handler runs inside this Kysely tx; its ctx.tx points to the same
-    // tx, so user-written domain rows commit atomically with the fact write
-    // and step_run upsert below. If body() throws, the tx is rolled back —
-    // dispatcher's outer handleStepError will record `step.failed` separately.
     const output = await this.db.transaction().execute(async (trx) => {
       const result = await body(trx as unknown as Tx);
       if (result.fact.kind === "step.completed") {
@@ -359,9 +330,6 @@ class PostgresStore<DB = unknown> implements Store {
           result.fact.error,
         );
       } else {
-        // step.canceled: handler returned normally but the run was canceled
-        // mid-flight (boundary check in dispatcher). Domain writes still
-        // commit; the materialized row records the canceled classification.
         await this.upsertStepCanceled(
           trx,
           runId,
@@ -397,10 +365,6 @@ class PostgresStore<DB = unknown> implements Store {
   ): Promise<void> {
     switch (fact.kind) {
       case "flow.started":
-        // `tryStartRun` is the canonical entry point for `flow.started`. This
-        // branch only fires if a caller threads the fact through `appendFact`
-        // directly (e.g. tests). Use DO NOTHING to preserve idempotent
-        // semantics — never clobber an existing run row.
         await sql`
           INSERT INTO ${sql.raw(this.t("workflow_run"))}
             (run_id, flow_id, status, input, started_at, flow_hash, code_version)
@@ -424,11 +388,6 @@ class PostgresStore<DB = unknown> implements Store {
         `.execute(trx);
         return;
       case "flow.canceled":
-        // `tryStartRun` is the canonical writer of `flow.canceled` and does
-        // its own UPDATE there. This branch is the safety net for callers
-        // that append the fact directly via `appendFact` (tests, custom
-        // tooling). DO NOTHING on race would leave status stale; instead
-        // do the UPDATE again — idempotent since canceled is terminal.
         await sql`
           UPDATE ${sql.raw(this.t("workflow_run"))}
              SET status = 'canceled',
@@ -453,9 +412,6 @@ class PostgresStore<DB = unknown> implements Store {
         `.execute(trx);
         return;
       case "step.reset":
-        // Clear materialized step_run rows so read-side queries reflect the
-        // forgotten state, and free the lease (any attempt) so the next
-        // dispatch can re-claim and re-execute.
         await sql`
           DELETE FROM ${sql.raw(this.t("step_run"))}
            WHERE run_id = ${runId} AND step_id = ${fact.stepId}
@@ -470,10 +426,6 @@ class PostgresStore<DB = unknown> implements Store {
         `.execute(trx);
         return;
       case "step.canceled":
-        // Materialize when handleStepError records via appendFact (handler
-        // threw mid-flight on a canceled run). The runStep body path
-        // materializes via `upsertStepCanceled` directly, in which case this
-        // branch is the no-op idempotent fallback.
         await this.upsertStepCanceled(
           trx,
           runId,
@@ -483,11 +435,10 @@ class PostgresStore<DB = unknown> implements Store {
         );
         await this.deleteLease(trx, runId, fact.stepId);
         return;
-      // step.completed / step.failed are materialized by runStep / completeStep / failStep
-      // before insertFact, so applyFactToMaterialized is a no-op for them.
       case "step.completed":
       case "step.failed":
       case "step.retried":
+      case "step.abort-requested":
       case "signal.sent":
       case "signal.received":
       case "match.arm-selected":
@@ -561,7 +512,6 @@ class PostgresStore<DB = unknown> implements Store {
 
   private async maybeNotify(runId: RunId): Promise<void> {
     if (!this.notifyChannel) return;
-    // pg_notify takes (channel text, payload text). Bind both as parameters.
     await sql`SELECT pg_notify(${this.notifyChannel}, ${runId})`.execute(
       this.db,
     );
@@ -627,15 +577,11 @@ class PostgresStore<DB = unknown> implements Store {
           : [where.status as RunStatus];
     const inputFilter = where.input;
 
-    // `latest: true` short-circuits limit/cursor (validated upstream in
-    // `wf.queryRuns`). Still safe at the SQL layer — `latest` collapses to
-    // a 1-row fetch with no cursor returned.
     const isLatest = opts.latest === true;
     const limit = isLatest ? 1 : clampLimit(opts.limit);
     const cursor =
       !isLatest && opts.cursor !== undefined ? decodeCursor(opts.cursor) : null;
 
-    // Fetch limit+1 to detect whether a next page exists without a COUNT(*).
     const fetchLimit = isLatest ? 1 : limit + 1;
 
     const rows = await sql<{
@@ -700,26 +646,12 @@ class PostgresStore<DB = unknown> implements Store {
   }
 
   async pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult> {
-    // Statuses are validated as `PrunableStatus` at the runtime boundary;
-    // copy into a mutable array so kysely's parameter binder accepts it as a
-    // text[] (it rejects `readonly` array types).
     const statuses: PrunableStatus[] = Array.from(opts.statuses);
     let runsPruned = 0;
     let factsPruned = 0;
 
-    // Batch loop: each iteration runs one transaction that locks-and-deletes
-    // up to `batchSize` victims. `FOR UPDATE SKIP LOCKED` makes concurrent
-    // pruners share work without contention; partially-completed prunes
-    // simply leave the rest for the next call.
     for (;;) {
       const batch = await this.db.transaction().execute(async (trx) => {
-        // The EXISTS check is what terminates the loop when `keepSummary` is
-        // true: a previously-pruned run still matches the status / date
-        // predicates because we keep the `workflow_run` row, so without
-        // requiring "at least one fact still present" the SELECT would
-        // re-return the same rows forever and `runsPruned` would inflate
-        // without bound. When `keepSummary` is false the EXISTS is harmless
-        // (the row is gone after the first pass and the predicate is moot).
         const victimRows = await sql<{ run_id: string }>`
           SELECT w.run_id
             FROM ${sql.raw(this.t("workflow_run"))} w
@@ -740,9 +672,6 @@ class PostgresStore<DB = unknown> implements Store {
           return { runs: 0, facts: 0 };
         }
 
-        // Delete order is bottom-up so an interrupted prune leaves no
-        // orphaned references in higher tables. None of these are FK-linked
-        // (the schema has no CASCADE), so app-level ordering is required.
         const factDel = await sql<{ run_id: string }>`
           DELETE FROM ${sql.raw(this.t("fact"))}
            WHERE run_id = ANY(${victims}::text[])
@@ -799,8 +728,6 @@ interface DecodedCursor {
 }
 
 function encodeCursor(c: DecodedCursor): string {
-  // Isomorphic base64url — same as @nagi-js/core, so cursors round-trip
-  // between the two adapters byte-for-byte.
   const bytes = new TextEncoder().encode(JSON.stringify(c));
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {
@@ -835,12 +762,7 @@ function decodeCursor(s: string): DecodedCursor {
   }
 }
 
-/**
- * Build the JSON payload column for a fact. Stores the full discriminated
- * union body (minus `kind`/`at` which are already separate columns).
- */
 function serializeFactPayload(fact: Fact): Json {
-  // Strip the redundantly-stored top-level fields. `runId` is the row key.
   const { kind: _kind, at: _at, runId: _runId, ...rest } = fact;
   return rest as unknown as Json;
 }
@@ -850,10 +772,6 @@ function serializeGlobalFactPayload(fact: GlobalFact): Json {
   return rest as unknown as Json;
 }
 
-/**
- * Re-hydrate a Fact from a fact-table row. The DB carries `kind` + `at` in
- * their own columns, and the rest of the discriminated-union body in `payload`.
- */
 function reviveFact(kind: string, at: Date, payload: unknown): Fact {
   const body = (payload ?? {}) as Record<string, unknown>;
   return {
@@ -863,12 +781,6 @@ function reviveFact(kind: string, at: Date, payload: unknown): Fact {
   } as Fact;
 }
 
-/**
- * Bind a `Json` value as a jsonb-typed parameter. `pg` will send strings as
- * TEXT and objects as JSON, but jsonb columns require an explicit cast for
- * the parameter to be typed correctly across all primitive cases. The
- * returned Kysely `sql` fragment expands to `$N::jsonb` when interpolated.
- */
 function jsonb(value: Json) {
   return sql`${JSON.stringify(value)}::jsonb`;
 }

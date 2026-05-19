@@ -19,11 +19,6 @@ import type {
   StepKind,
 } from "./types";
 
-/**
- * Canonical retry shape. Defaults are materialized explicitly so equivalent
- * retry configs hash identically regardless of source-side omission style.
- * `retryOn` is dropped — it's a function, not serializable.
- */
 export interface CanonicalRetryPolicy {
   readonly maxAttempts: number;
   readonly backoff: BackoffStrategy;
@@ -31,11 +26,6 @@ export interface CanonicalRetryPolicy {
   readonly maxDelayMs: Millis;
 }
 
-/**
- * Canonical schema fingerprint. v0 hashes `validate.toString()` alongside
- * runtime-stable `vendor` + `version` — best-effort, breaks under minification.
- * Documented as a known limit in RFC 0001.
- */
 export interface CanonicalSchema {
   readonly vendor: string;
   readonly version: number;
@@ -46,55 +36,31 @@ export interface CanonicalMatchArm {
   readonly id: string;
   readonly otherwise?: true;
   readonly whenHash?: string;
-  /** Namespaced IDs of nested steps for this arm, sorted lexicographically. */
   readonly stepIds: readonly StepId[];
 }
 
 export interface CanonicalStep {
   readonly id: StepId;
   readonly kind: StepKind;
-  /** Upstream step ids the step depends on, sorted lexicographically. */
   readonly needs: readonly StepId[];
   readonly whenHash?: string;
   readonly retry?: CanonicalRetryPolicy;
   readonly timeoutMs?: Millis;
-  // signal-only
   readonly signalSchema?: CanonicalSchema;
-  /**
-   * External signal names this step accepts, sorted lexicographically. Only
-   * present when the caller supplied `name` / `names` on `b.signal`; absent
-   * for the default "name == step id" case so pre-RFC-0004 flows hash
-   * byte-identically.
-   */
   readonly signalNames?: readonly string[];
-  // match-only
   readonly matchMode?: "discriminator" | "guard";
   readonly matchOnHash?: string;
   readonly matchArms?: readonly CanonicalMatchArm[];
-  // subflow-only
-  /**
-   * The referenced child flow's id. Topology changes in the child do NOT
-   * propagate into the parent's hash — child carries its own `flowHash` on
-   * its own `flow.started` fact. The parent's hash captures only the
-   * structural fact "this step starts a child of this flow id with this
-   * input mapping."
-   */
   readonly childFlowId?: string;
-  /** Hash of the `input: ({ input, needs }) => ChildInput` callback source. */
   readonly subflowInputHash?: string;
 }
 
 export interface CanonicalDag {
   readonly flowId: string;
   readonly inputSchema: CanonicalSchema;
-  /** Steps sorted by `id` lexicographically — insertion order is ignored. */
   readonly steps: readonly CanonicalStep[];
 }
 
-/**
- * Default retry policy. Mirrors `DEFAULT_RETRY` in `dispatch.ts` — kept in
- * sync manually; both must drift together if either changes.
- */
 const DEFAULT_RETRY: CanonicalRetryPolicy = {
   maxAttempts: 3,
   backoff: "exponential",
@@ -110,24 +76,10 @@ function warnSourceHashOnce(): void {
   console.warn(
     "[nagi] canonicalize: hashing `when`/schema source via Function.prototype.toString(). " +
       "Cosmetic source changes (minification, whitespace, identifier renames) will flip " +
-      "the flow hash even when behavior is unchanged. See RFC 0001.",
+      "the flow hash even when behavior is unchanged.",
   );
 }
 
-/**
- * Build the canonical DAG for a flow.
- *
- * Stable across cosmetic source changes (step-key reorder, needs-key reorder)
- * and different across topology changes (added/removed steps, edge changes,
- * `when` flips, retry edits, timeout edits).
- *
- * Handler `run` bodies are intentionally NOT part of the hash — see RFC 0001
- * "Topology vs handler code." Use `nagi({ codeVersion })` (typically a git
- * SHA) to capture handler-code drift orthogonally.
- *
- * Async because predicate/schema source bodies are sha256'd via
- * `crypto.subtle` so the stored `dag` JSON stays compact.
- */
 export async function canonicalize(flow: Flow): Promise<CanonicalDag> {
   const ids = Object.keys(flow.steps).sort();
   const steps: CanonicalStep[] = [];
@@ -246,28 +198,10 @@ async function hashFnSource(
   return sha256Hex(fn.toString());
 }
 
-/**
- * Compute the sha256 hex digest of a canonical DAG. Uses Web Crypto
- * (`crypto.subtle.digest`) which is available in Node ≥ 19, modern browsers,
- * Cloudflare Workers, Deno, and Bun.
- *
- * The DAG is serialized via {@link stableStringify} so object-key order is
- * deterministic. Two equivalent DAGs produce byte-identical input bytes.
- */
 export async function sha256Canonical(dag: CanonicalDag): Promise<string> {
   return sha256Hex(stableStringify(dag));
 }
 
-/**
- * Compute a structural fingerprint over a set of registered flows. Used as
- * the default value of `nagi({ codeVersion })` when the caller omits it.
- *
- * Per-flow projection reuses {@link canonicalize} unchanged — so this hash
- * and each flow's snapshot `flowHash` share one canonical definition and
- * cannot drift apart. Equivalent flow sets produce byte-identical hashes;
- * adding/removing a flow, renaming a flow id, or any structural step change
- * moves the result. `run`-body edits do not.
- */
 export async function fingerprintFlows(
   flows: ReadonlyArray<Flow>,
 ): Promise<string> {
@@ -280,15 +214,6 @@ export async function fingerprintFlows(
   return sha256Hex(stableStringify(entries));
 }
 
-/**
- * Deterministic JSON serializer. Object keys are emitted in ascending
- * lexicographic order; `undefined` entries are skipped (matching `JSON.stringify`).
- *
- * Arrays preserve order — canonicalize.ts is responsible for sorting any
- * array whose hash-relevant ordering is otherwise unstable (steps, needs,
- * arm step ids). Match arms preserve declaration order because top-to-bottom
- * evaluation is semantically meaningful for guard mode.
- */
 export function stableStringify(value: unknown): string {
   if (value === undefined) return "null";
   if (value === null || typeof value !== "object") return JSON.stringify(value);

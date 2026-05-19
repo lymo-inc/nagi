@@ -1,14 +1,3 @@
-/**
- * End-to-end conformance against a real Postgres.
- *
- * Skipped unless `NAGI_POSTGRES_TEST_URL` is set, e.g.:
- *
- *   NAGI_POSTGRES_TEST_URL=postgres://postgres:postgres@localhost:5432/nagi_test \
- *     pnpm --filter @nagi-js/postgres test
- *
- * Each test uses a unique schema (`nagi_test_<uuid7>`) so concurrent runs and
- * stale data never interfere. Schema is dropped at the end.
- */
 import {
   flow,
   InMemoryClock,
@@ -43,7 +32,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
   afterAll(async () => {
     if (!db) return;
     await sql.raw(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).execute(db);
-    // db.destroy() ends the underlying pg.Pool — do not call pool.end() again.
     await db.destroy();
   }, 30_000);
 
@@ -117,7 +105,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const runId = await wf.start(f, {});
     await runToEnd(wf, runId);
 
-    // replay() on a completed run is a no-op; should NOT re-invoke the handler.
     await wf.replay(runId, { mode: "continue" });
     expect(invocations).toBe(1);
   }, 15_000);
@@ -129,7 +116,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(await store.getOnce(runId, "step", "scope")).toBeNull();
     await store.recordOnce(runId, "step", "scope", { value: 1 });
     expect(await store.getOnce(runId, "step", "scope")).toEqual({ value: 1 });
-    // Second write must not overwrite — Option A locked: first writer wins.
     await store.recordOnce(runId, "step", "scope", { value: 2 });
     expect(await store.getOnce(runId, "step", "scope")).toEqual({ value: 1 });
   });
@@ -172,9 +158,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const wf = await makeNagi(f);
     const supplied = `run-${uuidv7()}` as RunId;
 
-    // Fire two concurrent start() calls. The Postgres ON CONFLICT DO NOTHING
-    // on workflow_run.run_id must serialize them so exactly one writes the
-    // flow.started fact and dispatches the work.
     const [a, b] = await Promise.all([
       wf.start(f, { x: 5 }, { runId: supplied }),
       wf.start(f, { x: 5 }, { runId: supplied }),
@@ -184,7 +167,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
 
     await runToEnd(wf, supplied);
 
-    // Workflow row exists exactly once.
     const rows = await sql<{
       count: string;
     }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${supplied}`.execute(
@@ -192,7 +174,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     );
     expect(rows.rows[0]?.count).toBe("1");
 
-    // Exactly one flow.started fact.
     const facts = await sql<{
       count: string;
     }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.fact`)} WHERE run_id = ${supplied} AND kind = 'flow.started'`.execute(
@@ -200,7 +181,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     );
     expect(facts.rows[0]?.count).toBe("1");
 
-    // The task ran exactly once (no double-dispatch).
     expect(invocations).toBe(1);
 
     const output = await loadOutput(db, schema, supplied);
@@ -218,7 +198,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       build: (b) => ({
         analyze: b.task({
           run: async ({ input }) => {
-            // Hold the step briefly so the second start can land first.
             await new Promise((r) => setTimeout(r, 50));
             return { v: input.videoId };
           },
@@ -231,8 +210,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const second = await wf.start(f, { videoId: "v1" });
     expect(first).not.toBe(second);
 
-    // First run is canceled (in workflow_run.status), and the fact log has
-    // a flow.canceled entry pointing at the second run.
     await runToEnd(wf, first);
     const firstStatus = await loadStatus(db, schema, first);
     expect(firstStatus).toBe("canceled");
@@ -252,7 +229,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(cancelFact.rows[0]?.payload.canceledByRunId).toBe(second);
     expect(cancelFact.rows[0]?.payload.concurrencyKey).toBe("v1");
 
-    // Second run completes successfully.
     await runToEnd(wf, second);
     const secondStatus = await loadStatus(db, schema, second);
     expect(secondStatus).toBe("completed");
@@ -264,15 +240,12 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const flowId = "pg-conc-uidx";
     const key = "k1";
 
-    // Insert run A as 'running' with concurrency_key = 'k1'. OK.
     await sql`
       INSERT INTO ${sql.raw(`${schema}.workflow_run`)}
         (run_id, flow_id, status, input, started_at, concurrency_key)
       VALUES (${runIdA}, ${flowId}, 'running', '{}'::jsonb, now(), ${key})
     `.execute(db);
 
-    // Try to insert run B as 'running' with same flow_id + key → should fail
-    // due to partial unique index.
     await expect(
       sql`
         INSERT INTO ${sql.raw(`${schema}.workflow_run`)}
@@ -281,7 +254,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       `.execute(db),
     ).rejects.toThrow(/workflow_run_concurrency_active_uidx/);
 
-    // After A transitions to canceled, the index slot is free.
     await sql`
       UPDATE ${sql.raw(`${schema}.workflow_run`)} SET status = 'canceled' WHERE run_id = ${runIdA}
     `.execute(db);
@@ -291,7 +263,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       VALUES (${runIdB}, ${flowId}, 'running', '{}'::jsonb, now(), ${key})
     `.execute(db);
 
-    // Cleanup so subsequent tests aren't affected.
     await sql`DELETE FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id IN (${runIdA}, ${runIdB})`.execute(
       db,
     );
@@ -313,16 +284,11 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const wf = await makeNagi(f);
     const key = "race-key";
 
-    // Fire 8 concurrent start() calls. The advisory lock + cancel-then-insert
-    // path must serialize them so exactly one ends up running and no two
-    // active rows for the same key coexist (which would violate the partial
-    // unique index).
     const runIds = await Promise.all(
       Array.from({ length: 8 }, () => wf.start(f, { key })),
     );
     expect(new Set(runIds).size).toBe(8);
 
-    // Exactly one row should be in an active status.
     const activeCount = await sql<{
       count: string;
     }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.workflow_run`)}
@@ -330,7 +296,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     `.execute(db);
     expect(activeCount.rows[0]?.count).toBe("1");
 
-    // All other runs should be in 'canceled' status.
     const canceledCount = await sql<{
       count: string;
     }>`SELECT COUNT(*)::text AS count FROM ${sql.raw(`${schema}.workflow_run`)}
@@ -354,8 +319,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const first = await wf.start(f, { x: 1 }, { runId: supplied });
     await runToEnd(wf, supplied);
 
-    // Second start with same runId after completion: must return same id
-    // without re-appending or clobbering the original input.
     const second = await wf.start(f, { x: 999 }, { runId: supplied });
     expect(second).toBe(first);
 
@@ -366,7 +329,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     );
     expect(facts.rows[0]?.count).toBe("1");
 
-    // Original input preserved.
     const row = await sql<{
       input: { x: number };
     }>`SELECT input FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${supplied}`.execute(
@@ -406,9 +368,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
           error: { name: "E", message: "x" },
         });
       }
-      // Note: "canceled" goes through tryStartRun's concurrency path. Tested
-      // separately via the concurrency suite; this seed helper covers the
-      // common cases.
       return runId;
     }
 
@@ -489,7 +448,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       const wf = await makeNagi();
       const seeded: RunId[] = [];
       for (let i = 0; i < 5; i++) {
-        // Each seed bumps started_at by Postgres-clock; sleep keeps ordering deterministic.
         seeded.push(await seed("f-page", { i }));
         await new Promise((r) => setTimeout(r, 2));
       }
@@ -517,10 +475,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       for (let i = 0; i < 20; i++) await seed("f-idx", { i, tag: "x" });
       await wf.queryRuns({ where: { input: { tag: "x" } } });
 
-      // EXPLAIN the same query and assert the index is selected (or a
-      // sequential scan, which would only happen on tiny tables where PG
-      // chooses a seq scan over the index). Accept either, but at least
-      // verify the plan mentions our index name OR is a small-table seq scan.
       const plan = await sql<{ "QUERY PLAN": string }>`
         EXPLAIN SELECT run_id FROM ${sql.raw(`${schema}.workflow_run`)}
          WHERE input @> '{"tag":"x"}'::jsonb
@@ -560,7 +514,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
 
       expect(await loadStatus(db, schema, parentRunId)).toBe("completed");
 
-      // Child run is persisted with parent_run_id = parentRunId.
       const row = await sql<{
         run_id: string;
         parent_run_id: string | null;
@@ -578,8 +531,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(childRow.parent_step_id).toBe("sub");
       expect(childRow.status).toBe("completed");
 
-      // Parent's output (computed by flow.output reducer) — none declared,
-      // so the workflow_run.output column is null. Verify via fact log.
       const factRows = await sql<{ payload: { output: unknown } }>`
         SELECT payload FROM ${sql.raw(`${schema}.fact`)}
          WHERE run_id = ${parentRunId} AND kind = 'step.completed'
@@ -648,7 +599,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       const wf = await makeNagi(parent, childF, grandchild);
       const parentRunId = await wf.start(parent, {});
 
-      // Pump until all three runs exist + grandchild signal is parked.
       const ac = new AbortController();
       const worker = wf.worker({ pollIntervalMs: 5, signal: ac.signal });
       const done = worker.run();
@@ -682,10 +632,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
   });
 
   describe("pruneFacts — retention", () => {
-    // Prune has no flowId filter — it operates globally over the schema.
-    // Each test asserts on `runsPruned` and on the survival or removal of
-    // specific run rows. Wipe every table the prune touches between tests
-    // so prior tests' (kept) summary rows don't inflate global counts.
     beforeEach(async () => {
       await sql
         .raw(
@@ -764,7 +710,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         startedAtMs: Date.now() - 1000,
         completedAtMs: Date.now(),
       });
-      // A running row (no completed_at) — must survive any prune.
       const runningRun = `run-${uuidv7()}` as RunId;
       await postgresStore({ db, schema }).tryStartRun(runningRun, {
         kind: "flow.started",
@@ -780,12 +725,9 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(result.runsPruned).toBe(1);
       expect(result.factsPruned).toBeGreaterThanOrEqual(2);
 
-      // Old run: facts gone, workflow_run kept (keepSummary defaults true).
       expect(await countRows("fact", oldRun)).toBe(0);
       expect(await countRows("workflow_run", oldRun)).toBe(1);
-      // Recent run untouched.
       expect(await countRows("fact", recentRun)).toBeGreaterThan(0);
-      // Running run untouched.
       expect(await countRows("fact", runningRun)).toBeGreaterThan(0);
     });
 
@@ -856,8 +798,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         startedAtMs: 1000,
         completedAtMs: 2000,
       });
-      // Insert per-run rows in the secondary tables directly. These have no
-      // FK to workflow_run, so the prune must clean them up by app code.
       await sql`
         INSERT INTO ${sql.raw(`${schema}.step_run`)}
           (run_id, step_id, attempt, status, started_at, completed_at)
@@ -885,7 +825,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(await countRows("lease", runId)).toBe(0);
       expect(await countRows("timer", runId)).toBe(0);
       expect(await countRows("dedupe", runId)).toBe(0);
-      // workflow_run kept by default (keepSummary: true).
       expect(await countRows("workflow_run", runId)).toBe(1);
     });
 
@@ -899,9 +838,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       });
       await wf.pruneFacts({ olderThan: new Date(), keepSummary: false });
       expect(await countRows("workflow_run", runId)).toBe(0);
-      // The cross-adapter `queryRuns` semantic — pruned run not surfaced —
-      // is covered by the InMemoryStore conformance tests; here we assert
-      // the postgres row-level effect directly.
     });
 
     it("batchSize < total drains everything via the internal loop", async () => {
@@ -922,9 +858,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     });
 
     it("uses the workflow_run_completed_at_idx for the victim selection", async () => {
-      // Seed enough rows that PG should prefer the partial index over a seq
-      // scan. As with the queryRuns GIN test, this is a smoke check that the
-      // index is *eligible*, not a hard assertion.
       for (let i = 0; i < 50; i++) {
         await seedTerminal({
           flowId: "pf-explain",
@@ -961,7 +894,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         wf.pruneFacts({ olderThan: new Date(), batchSize: 3 }),
         wf.pruneFacts({ olderThan: new Date(), batchSize: 3 }),
       ]);
-      // Together they prune everything matching, with no double-counting.
       expect(a.runsPruned + b.runsPruned).toBe(12);
     });
   });

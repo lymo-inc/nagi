@@ -33,28 +33,11 @@ const DEFAULT_FLOW_PREFIX = "flow";
 const DEFAULT_STEP_PREFIX = "step";
 
 export interface OtelHooksOpts {
-  /**
-   * Custom `Tracer`. Defaults to `trace.getTracer("@nagi-js/otel", "0.0.0")` —
-   * a no-op when no SDK is registered (per the OTel API contract).
-   */
   readonly tracer?: Tracer;
-  /** Override `"flow"`/`"step"` span-name prefixes (low cardinality; do NOT use IDs). */
   readonly spanNamePrefix?: { readonly flow?: string; readonly step?: string };
-  /** Extra attributes stamped on every span (e.g. `deployment.environment`). */
   readonly defaultAttributes?: Attributes;
 }
 
-/**
- * `FlowHooks` adapter that maps Nagi lifecycle events to OpenTelemetry spans.
- *
- * Hierarchy: one `flow {flowId}` span per run; per-step-attempt sibling `step
- * {stepId}` spans underneath. All spans are `INTERNAL` kind. Errors call
- * `span.recordException` + `setStatus(ERROR)`; success leaves status `UNSET`
- * per the Tracing API spec recommendation for instrumentation libraries.
- *
- * Adapter errors are swallowed: a misconfigured tracer must never crash a
- * workflow. Throws are logged via `console.error`.
- */
 export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
   const tracer: Tracer =
     opts.tracer ?? trace.getTracer(TRACER_NAME, TRACER_VERSION);
@@ -62,10 +45,7 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
   const stepPrefix = opts.spanNamePrefix?.step ?? DEFAULT_STEP_PREFIX;
   const baseAttrs: Attributes = opts.defaultAttributes ?? {};
 
-  // Per-run flow-span context. Used as the parent for step spans.
   const flowCtxs = new Map<RunId, Context>();
-  // Per-step match-duration tracking: dispatch.ts hard-codes durationMs=0 on
-  // match completion, so we compute it ourselves from the stashed start time.
   const stepStartTimes = new Map<string, Date>();
 
   function withGuard<E>(
@@ -117,8 +97,6 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
   function endStepSpanOk(event: StepCompleteEvent, span: Span): void {
     const k = stepKey(event.runId, event.stepId, event.attempt);
     const startedAt = stepStartTimes.get(k);
-    // Match steps get a hard-coded durationMs=0 from the runtime; recover the
-    // real value from the stashed start time when available.
     const durationMs =
       event.kind === "match" && startedAt
         ? event.at.getTime() - startedAt.getTime()
@@ -192,13 +170,9 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
     }),
 
     onStepRetry: withGuard<StepRetryEvent>("onStepRetry", (event) => {
-      // End the failed attempt's span with ERROR status. The next onStepStart
-      // for attempt+1 opens a fresh sibling span under the same flow span.
       const span = consumeStepSpan(event.runId, event.stepId, event.attempt);
       if (span) endStepSpanErr(span, event.error, event.at);
 
-      // Surface the retry on the flow span so users can see retry latency in
-      // the run-level trace without inspecting individual step attempts.
       const flowCtx = flowCtxs.get(event.runId);
       const flowSpan = flowCtx ? trace.getSpan(flowCtx) : undefined;
       flowSpan?.addEvent(
@@ -212,8 +186,6 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
       );
     }),
 
-    // onSignalSent is declared in core/types.ts but never fired by the runtime;
-    // intentionally omitted until core wires a sender path.
     onSignalReceived: withGuard<SignalReceivedEvent>(
       "onSignalReceived",
       (event) => {
@@ -232,9 +204,6 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
 }
 
 function toError(err: SerializedError): Error {
-  // `recordException` accepts `{ name, message, stack }`. We rebuild a
-  // shape-compatible object rather than a real Error to preserve the original
-  // name/stack exactly.
   const e = new Error(err.message);
   e.name = err.name;
   if (err.stack !== undefined) e.stack = err.stack;

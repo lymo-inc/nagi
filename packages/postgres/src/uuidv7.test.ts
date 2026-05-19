@@ -11,7 +11,6 @@ describe("uuidv7", () => {
 
   it("encodes the version 7 nibble", () => {
     const id = uuidv7();
-    // 15th hex char (0-indexed) is the version nibble.
     expect(id.charAt(14)).toBe("7");
   });
 
@@ -21,10 +20,8 @@ describe("uuidv7", () => {
   });
 
   it("encodes the supplied timestamp in the high 48 bits", () => {
-    // 2026-05-12 00:00:00 UTC.
     const ts = Date.UTC(2026, 4, 12);
     const id = uuidv7(ts);
-    // First 12 hex chars = 48-bit ms timestamp.
     const hexTs = id.replace(/-/g, "").slice(0, 12);
     expect(parseInt(hexTs, 16)).toBe(ts);
   });
@@ -38,8 +35,6 @@ describe("uuidv7", () => {
   });
 
   it("survives a million-call uniqueness smoke without obvious collisions", () => {
-    // Not a guarantee — the random bits give ~2^74 entropy per ms — but a
-    // smoke test that catches gross bugs (e.g. forgetting to randomise).
     const seen = new Set<string>();
     for (let i = 0; i < 10_000; i++) {
       const id = uuidv7();

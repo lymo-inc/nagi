@@ -29,7 +29,6 @@ describe("InMemoryClock — wake-up via Trigger", () => {
     const runId = "run-wake-2" as RunId;
     const stepId = "step1" as StepId;
 
-    // First schedule far in the future; replaced by a near-future one.
     await clock.schedule(new Date(Date.now() + 1_000), runId, stepId);
     await clock.schedule(new Date(Date.now() + 5), runId, stepId);
 

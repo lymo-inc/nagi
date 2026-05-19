@@ -78,7 +78,7 @@ describe("StepCtx shape", () => {
   });
 
   it("runId is branded — a raw string is not assignable", () => {
-    // @ts-expect-error — RunId is `string & { __brand: "RunId" }`.
+    // @ts-expect-error
     const x: typeof ctxCall.runId = "raw-string";
     void x;
   });
@@ -145,7 +145,7 @@ describe("Builder.match — discriminator mode", () => {
   });
 
   it("missing a case is a compile error (exhaustiveness)", () => {
-    // @ts-expect-error — `cold` case is missing from `cases`.
+    // @ts-expect-error
     builderU.match({
       needs: { c: classifyStep },
       on: ({ needs }) => needs.c.category,
@@ -182,11 +182,8 @@ describe("Builder.match — guard mode", () => {
   });
 
   it("an arm cannot have both `when` and `otherwise`", () => {
-    // The MatchArm union rejects an object that sets both `when` and `otherwise`.
-    // Asserting against the union directly so `@ts-expect-error` lands on the
-    // offending property rather than getting swallowed by an outer overload failure.
     type ScoreNeeds = { s: typeof scoreStep };
-    // @ts-expect-error — `when` and `otherwise` are mutually exclusive on one arm.
+    // @ts-expect-error
     const _badArm: MatchArm<unknown, ScoreNeeds, StepMap> = {
       when: (args: { input: unknown; needs: NeedsOutputs<ScoreNeeds> }) =>
         args.needs.s.intent,
@@ -359,7 +356,7 @@ describe("Builder.step chain (RFC 0002)", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) =>
         b.step("a", { run: async () => ({ y: 1 }) }).step("b", {
-          // @ts-expect-error - "wrong" is not in the accumulator
+          // @ts-expect-error
           needs: ["wrong"],
           run: async () => null,
         }),
@@ -372,7 +369,7 @@ describe("Builder.step chain (RFC 0002)", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) =>
         b.step("a", { run: async () => ({ y: 1 }) }).step(
-          // @ts-expect-error - "a" is already in the accumulator
+          // @ts-expect-error
           "a",
           { run: async () => null },
         ),
@@ -429,7 +426,7 @@ describe("Wf.start signature", () => {
       input: passthroughSchema<{ x: number }>(),
       build: (b) => ({ a: b.task({ run: async () => null }) }),
     });
-    // @ts-expect-error — RunId is branded; a raw string literal isn't assignable.
+    // @ts-expect-error
     void wfEx.start(f, { x: 1 }, { runId: "raw-string" });
   });
 });

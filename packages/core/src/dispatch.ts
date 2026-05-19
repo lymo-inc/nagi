@@ -35,30 +35,8 @@ import type {
 } from "./types";
 
 export interface DispatchDeps {
-  /**
-   * Resolves the flow for a given run. The runtime supplies a closure over its
-   * flow registry; adapters may override to load flows lazily. Called once at
-   * the top of `dispatchMessage` and `advance` — per-step lookups reuse the
-   * resolved value.
-   */
   readonly flowFor: (runId: RunId) => Promise<Flow>;
-  /**
-   * Synchronous flow lookup by flow id. Used by the subflow dispatch path to
-   * resolve a referenced child flow without round-tripping through the store.
-   * Returns `undefined` for unregistered flows; the caller throws an
-   * actionable error. Optional only to keep adapters that don't supply it
-   * compilable — calling a subflow step without it is a runtime error.
-   */
   readonly lookupFlow?: (flowId: string) => Flow | undefined;
-  /**
-   * Start a child run linked to a parent. Honors the child flow's
-   * `concurrency` config (cancel-in-progress, etc.) via the same atomic
-   * `tryStartRun` path used by `wf.start()`. Writes a `flow.started` fact
-   * with `parentRunId`/`parentStepId` so the runtime can wake the parent's
-   * subflow step on terminal completion.
-   *
-   * Returns the minted child runId.
-   */
   readonly startChildRun?: (args: {
     readonly child: Flow;
     readonly childInput: unknown;
@@ -71,21 +49,10 @@ export interface DispatchDeps {
   readonly hooks?: FlowHooks;
   readonly logger?: Logger;
   readonly defaultRetry?: RetryPolicy;
-  /**
-   * When `false`, neither step-local nor flow-local hooks fire, and the
-   * cross-cutting `hooks` (FlowHooks) are also suppressed. Set by
-   * `wf.replay({ fireHooks: false })` for backfills where webhooks
-   * must not re-publish. Default behavior (undefined / `true`): hooks fire.
-   */
   readonly fireHooks?: boolean;
+  readonly cancelPollIntervalMs?: Millis;
 }
 
-/**
- * Invoke a lifecycle hook, swallowing thrown errors so a hook bug cannot fail
- * the run. Errors are logged via `deps.logger` — operators see the failure
- * without the workflow caring. When `deps.fireHooks === false`, the call is a
- * no-op (used by replay to suppress re-emission).
- */
 export async function fireHook<E>(
   hook: ((event: E) => void | Promise<void>) | undefined,
   event: E,
@@ -131,10 +98,6 @@ export async function dispatchMessage(
   const def = getDef(step);
 
   const preState = await store.loadRunState(runId);
-  // Run was canceled by a concurrency-group supersede before this message
-  // was claimed. Ack and skip — the dispatcher stops scheduling new work
-  // for canceled runs; in-flight steps already executing run to completion
-  // (their facts persist), but anything that hadn't started yet is dropped.
   if (preState.status === "canceled") {
     await queue.ack(message.receipt);
     return;
@@ -163,13 +126,6 @@ export async function dispatchMessage(
     attempt,
     at: clock.now(),
   });
-  // Resolve the hook's `input` field by step kind:
-  //  - task:    the same value passed to `run({ input, ... })` (flow input).
-  //  - subflow: the parent's flow input (the resolved child input is
-  //             derived inside the dispatch branch, not visible to hooks).
-  //  - signal:  `null` — no pre-execution input.
-  //  - match:   `null` — the discriminator value is computed inside the
-  //             match handler; the start event fires before that resolves.
   const startEventInput: Json =
     def.kind === "task" || def.kind === "subflow"
       ? extractInput(await store.loadRunState(runId))
@@ -191,7 +147,7 @@ export async function dispatchMessage(
 
   try {
     if (def.kind === "task") {
-      const output = await executeTask({
+      const { output, skipAdvance } = await executeTask({
         deps,
         message,
         def,
@@ -199,6 +155,7 @@ export async function dispatchMessage(
         stepId,
         attempt,
       });
+      if (skipAdvance) return;
       const completeEvent = {
         runId,
         flowId: flow.id,
@@ -218,20 +175,12 @@ export async function dispatchMessage(
       );
       await advance(deps, runId);
     } else if (def.kind === "signal") {
-      // Signals don't run; they wait. Mark `started` (already done above) and ack.
-      // Completion arrives via `wf.signal()`.
       await queue.ack(message.receipt);
       return;
     } else if (def.kind === "match") {
       await executeMatch({ deps, message, def, runId, stepId, attempt });
       await advance(deps, runId);
     } else if (def.kind === "subflow") {
-      // Subflows don't run inline; they spawn a child run on the same
-      // store/queue and wait. `step.started` is already written above; the
-      // parent step stays in `running` until the child reaches a terminal
-      // state — at which point `finalizeFlowCompletion` /
-      // `finalizeFlowFailure` writes the parent's `step.completed` /
-      // `step.failed` directly (mirrors how `wf.signal` resolves a signal).
       await executeSubflow({ deps, message, def, runId, stepId });
       await queue.ack(message.receipt);
       return;
@@ -250,6 +199,11 @@ export async function dispatchMessage(
   }
 }
 
+interface ExecuteTaskResult {
+  readonly output: Json;
+  readonly skipAdvance: boolean;
+}
+
 async function executeTask(args: {
   deps: DispatchDeps;
   message: QueueMessage;
@@ -257,7 +211,7 @@ async function executeTask(args: {
   runId: RunId;
   stepId: string;
   attempt: number;
-}): Promise<Json> {
+}): Promise<ExecuteTaskResult> {
   const { deps, message, def, runId, stepId, attempt } = args;
   if (def.kind !== "task") {
     throw new Error(`executeTask called with non-task def (kind: ${def.kind})`);
@@ -268,78 +222,154 @@ async function executeTask(args: {
   const input = extractInput(runState);
   const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
 
-  // `ctx.signal` aborts when the run reaches a terminal canceled status. The
-  // wakeup that fires the abort is a follow-up feature (see issue tracker);
-  // for now the signal is wired structurally and observable to handlers that
-  // compose it with their own AbortSignals (e.g. `AbortSignal.any([ctx.signal,
-  // AbortSignal.timeout(60_000)])`). The boundary check after the handler
-  // returns is what reclassifies cancellation today.
   const ac = new AbortController();
-
-  // `runStep` owns the atomic scope: adapter-managed tx, then atomic write of
-  // step output + `step.completed` fact + lease release. The handler's
-  // `ctx.tx` is the same tx so domain writes commit together with the step.
-  const output = await store.runStep<Json>(
+  const watcher = startCancelWatcher({
+    store,
     runId,
     stepId,
     attempt,
-    async (tx) => {
-      const ctx = makeStepCtx({
-        runId,
-        stepId,
-        attempt,
-        input,
-        store,
-        clock,
-        tx,
-        signal: ac.signal,
-        ...(deps.logger !== undefined ? { logger: deps.logger } : {}),
-      });
-      const out = (await def.run({ input, needs, ctx })) as Json;
-      // Boundary check: if the run reached canceled status while the handler
-      // was in flight (e.g. a newer `wf.start()` superseded), record
-      // `step.canceled` instead of `step.completed`. The handler's domain
-      // writes still commit atomically with this fact — the read-side just
-      // sees the truthful classification rather than a stale "completed"
-      // output on a canceled run.
-      const postState = await store.loadRunState(runId);
-      if (postState.status === "canceled") {
-        const canceledFact: Fact = {
-          kind: "step.canceled",
+    ac,
+    intervalMs: deps.cancelPollIntervalMs ?? CANCEL_POLL_INTERVAL_MS,
+  });
+
+  try {
+    let stepAbortedHere = false;
+    const output = await store.runStep<Json>(
+      runId,
+      stepId,
+      attempt,
+      async (tx) => {
+        const ctx = makeStepCtx({
           runId,
           stepId,
           attempt,
+          input,
+          store,
+          clock,
+          tx,
+          signal: ac.signal,
+          ...(deps.logger !== undefined ? { logger: deps.logger } : {}),
+        });
+        const out = (await def.run({ input, needs, ctx })) as Json;
+        const postState = await store.loadRunState(runId);
+        if (postState.status === "canceled") {
+          const canceledFact: Fact = {
+            kind: "step.canceled",
+            runId,
+            stepId,
+            attempt,
+            at: clock.now(),
+          };
+          return { output: out, fact: canceledFact };
+        }
+        if (hasAbortRequest(postState.facts, stepId, attempt)) {
+          stepAbortedHere = true;
+          const canceledFact: Fact = {
+            kind: "step.canceled",
+            runId,
+            stepId,
+            attempt,
+            at: clock.now(),
+          };
+          return { output: out, fact: canceledFact };
+        }
+        const fact: Fact = {
+          kind: "step.completed",
+          runId,
+          stepId,
+          attempt,
+          output: out,
           at: clock.now(),
         };
-        return { output: out, fact: canceledFact };
-      }
-      const fact: Fact = {
-        kind: "step.completed",
-        runId,
-        stepId,
-        attempt,
-        output: out,
-        at: clock.now(),
-      };
-      return { output: out, fact };
-    },
-  );
-  await queue.ack(message.receipt);
-  return output;
+        return { output: out, fact };
+      },
+    );
+    await queue.ack(message.receipt);
+    return { output, skipAdvance: stepAbortedHere };
+  } finally {
+    watcher.stop();
+  }
 }
 
-/**
- * Subflow dispatch: derive the child input from `(parentInput, needs)`, start
- * a child run on the same store/queue, and park the parent step in `running`.
- * The parent step's `step.completed` is written by `finalizeFlowCompletion`
- * on the child run's terminal transition — not via a queue re-dispatch.
- *
- * Throws if the child flow is unregistered or its input fails schema
- * validation. `handleStepError` then applies the parent step's retry policy
- * (or surfaces the failure). Sibling cancellation triggered by the child's
- * own `concurrency` config is propagated to those siblings' parents inside
- * `startChildRun` itself.
- */
+const CANCEL_POLL_INTERVAL_MS = 250;
+
+interface CancelWatcher {
+  stop(): void;
+}
+
+function startCancelWatcher(args: {
+  readonly store: Store;
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly attempt: number;
+  readonly ac: AbortController;
+  readonly intervalMs: Millis;
+}): CancelWatcher {
+  const { store, runId, stepId, attempt, ac, intervalMs } = args;
+  let stopped = false;
+  void (async () => {
+    while (!stopped) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      if (stopped) return;
+      try {
+        const s = await store.loadRunState(runId);
+        if (
+          s.status === "canceled" ||
+          s.status === "failed" ||
+          s.status === "completed"
+        ) {
+          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
+          return;
+        }
+        if (hasAbortRequest(s.facts, stepId, attempt)) {
+          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "step"));
+          return;
+        }
+      } catch {}
+    }
+  })();
+  return {
+    stop: () => {
+      stopped = true;
+    },
+  };
+}
+
+function hasAbortRequest(
+  facts: ReadonlyArray<Fact>,
+  stepId: string,
+  attempt: number,
+): boolean {
+  for (let i = facts.length - 1; i >= 0; i--) {
+    const f = facts[i];
+    if (f === undefined) continue;
+    if (f.kind === "step.reset" && f.stepId === stepId) return false;
+    if (
+      f.kind === "step.abort-requested" &&
+      f.stepId === stepId &&
+      f.attempt === attempt
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export class NagiAbortError extends Error {
+  readonly runId: RunId;
+  readonly scope: "run" | "step";
+  constructor(runId: RunId, scope: "run" | "step") {
+    super(
+      scope === "run"
+        ? `Run ${runId} was canceled — ctx.signal aborted.`
+        : `Step in run ${runId} was aborted by operator.retry() — ctx.signal aborted.`,
+    );
+    this.name = "NagiAbortError";
+    this.runId = runId;
+    this.scope = scope;
+  }
+}
+
 async function executeSubflow(args: {
   deps: DispatchDeps;
   message: QueueMessage;
@@ -372,13 +402,6 @@ async function executeSubflow(args: {
   });
 }
 
-/**
- * Match dispatch: select an arm, persist the `match.arm-selected` fact, ack
- * the message. The match step stays in `running` status — it transitions to
- * `completed` (or `failed`) inside `advance()` once the chosen arm's nested
- * steps are terminal. Throws if `selectArm` throws so `handleStepError`
- * applies the match's retry policy / surfaces the failure.
- */
 async function executeMatch(args: {
   deps: DispatchDeps;
   message: QueueMessage;
@@ -420,14 +443,13 @@ async function handleStepError(args: {
   const { store, queue, clock } = deps;
   const error = serializeError(err);
 
-  // If the run reached canceled status mid-handler (e.g. a newer wf.start()
-  // superseded via cancel-in-progress), record `step.canceled` instead of
-  // `step.failed`. The handler's transaction already rolled back via
-  // `runStep`; the canceled fact lands on its own and onStepError stays
-  // silent — `flow.onError` already fired against the canceling run.
   const postState = await store.loadRunState(runId);
-  if (postState.status === "canceled") {
-    const isAbort = err instanceof Error && err.name === "AbortError";
+  const runIsCanceled = postState.status === "canceled";
+  const stepAborted = hasAbortRequest(postState.facts, stepId, attempt);
+  if (runIsCanceled || stepAborted) {
+    const isAbort =
+      err instanceof Error &&
+      (err.name === "AbortError" || err.name === "NagiAbortError");
     const canceledFact: Fact = {
       kind: "step.canceled",
       runId,
@@ -438,7 +460,7 @@ async function handleStepError(args: {
     };
     await store.appendFact(runId, canceledFact);
     await queue.ack(message.receipt);
-    await advance(deps, runId);
+    if (!stepAborted) await advance(deps, runId);
     return;
   }
 
@@ -510,9 +532,6 @@ export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
   for (let iter = 0; iter < MAX_ADVANCE_ITERS; iter++) {
     const runState = await store.loadRunState(runId);
 
-    // Promote any `running` match whose chosen arm has reached a terminal
-    // state. This must precede termination + scheduling: a match that just
-    // completed releases its downstream needs in the same iteration.
     const promoted = await promoteMatches({ deps, flow, runState });
     if (promoted) continue;
 
@@ -554,16 +573,9 @@ export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
       await queue.enqueue(runId, stepId);
     }
 
-    if (decision.runnable.length > 0) {
-      // Workers will pick up these messages; advance loop exits and resumes
-      // when those steps complete.
-      return;
-    }
-    // Only skips happened; loop to recompute.
+    if (decision.runnable.length > 0) return;
   }
 
-  // Cycle guard: rather than crash the worker, mark the flow as failed with a
-  // structured error so callers can query the terminal state.
   const cycleError: SerializedError = {
     name: "NagiCycleError",
     message: `advance exceeded ${MAX_ADVANCE_ITERS} iterations — likely a cycle or infinite skip loop in flow "${flow.id}"`,
@@ -574,19 +586,6 @@ export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
   }
 }
 
-/**
- * Walk every match step in `running` status and promote any whose chosen arm
- * has reached a terminal state.
- *
- *   fail-fast — a chosen-arm step terminally failed. Mark the match `failed`
- *               with an error that points back to the failing nested step.
- *               Sibling running arm steps will still complete on their workers,
- *               but the match is already terminal — downstream cascades skip.
- *   complete  — every chosen-arm step terminated cleanly. Mark the match
- *               `completed` with the assembled `{ stepKey: stepOutput }` map.
- *
- * Returns true if any match was promoted (caller should reload + re-loop).
- */
 async function promoteMatches(args: {
   deps: DispatchDeps;
   flow: Flow;
@@ -690,11 +689,6 @@ function makeStepCtx(args: {
     attempt,
     signal,
     now: () => clock.now(),
-    // `tx` is supplied by `Store.runStep` — for adapters with no real
-    // transaction (in-memory) it is `undefined as Tx`, and handlers that
-    // touch `ctx.tx` will throw on the first call. Adapters that need
-    // typed transactional clients (e.g. `@nagi-js/postgres`) augment
-    // `Register.tx` and pass a real Kysely transaction here.
     tx,
     logger: args.logger ?? consoleLogger(),
     once: makeOnce({ runId, stepId, store }),
@@ -730,9 +724,6 @@ function retryAllows(policy: RetryPolicy, err: unknown): boolean {
 }
 
 function isFlowTerminal(facts: readonly Fact[]): boolean {
-  // Walk back from the tail. `flow.canceled` is appended to a prior run by a
-  // concurrent `wf.start()`, which may interleave with the prior run's own
-  // step facts — so the canceled fact is not always the literal last entry.
   for (let i = facts.length - 1; i >= 0; i--) {
     const f = facts[i];
     if (
@@ -788,23 +779,6 @@ async function finalizeFlowCompletion(args: {
   await propagateToParent(deps, runId, { kind: "completed", output });
 }
 
-/**
- * Read the parent linkage from the just-finalized child run's `flow.started`
- * fact. If linked, resolve the parent's subflow step:
- *
- * - child completed → write parent step.completed with `{ childRunId, output }`,
- *   matching `SubflowStepOutput`.
- * - child failed     → write parent step.failed with the child's error.
- * - child canceled   → write parent step.failed with a structured cancel error.
- *
- * Then call `advance(parent)` so downstream parent steps unblock. The
- * mechanism mirrors `wf.signal()`: the dispatcher does NOT re-enqueue the
- * parent step; completion is written directly.
- *
- * Idempotent: if the parent's subflow step is already terminal (or the
- * parent itself is canceled / completed), this is a logged no-op rather than
- * a throw. Race-safe because the child only transitions to terminal once.
- */
 export type SubflowChildOutcome =
   | { readonly kind: "completed"; readonly output: Json }
   | { readonly kind: "failed"; readonly error: SerializedError }

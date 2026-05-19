@@ -55,27 +55,9 @@ export class InMemoryStore implements Store {
   >();
   private readonly refs = new Map<string, string>();
   private readonly globalFacts: GlobalFact[] = [];
-  /**
-   * The runId currently holding the active slot for `flowId::concurrencyKey`.
-   * Updated on `tryStartRun` (set when concurrency is supplied) and on
-   * terminal facts (cleared via {@link keyByActiveRun}).
-   */
   private readonly activeByKey = new Map<string, RunId>();
-  /** Reverse lookup so terminal facts can free the slot in O(1). */
   private readonly keyByActiveRun = new Map<RunId, string>();
-  /**
-   * Index: parentRunId → set of child run ids spawned by `b.subflow()`.
-   * Populated in `tryStartRun` when `fact.parentRunId` is set. Used by
-   * `listChildren()` to power transitive cancel cascade in O(children).
-   */
   private readonly childrenByParent = new Map<RunId, Set<RunId>>();
-  /**
-   * Pruned-but-kept summaries. Populated by `pruneFacts` when `keepSummary`
-   * is true so that `queryRuns` still surfaces runs whose facts were dropped.
-   * Mirrors the postgres adapter's retained `workflow_run` row after a prune.
-   * Also blocks `tryStartRun` from reusing a pruned runId — matching the
-   * postgres `INSERT ... ON CONFLICT DO NOTHING` semantic on `run_id`.
-   */
   private readonly summaries = new Map<RunId, RunSummary>();
   private readonly leaseMs: Millis;
 
@@ -101,9 +83,6 @@ export class InMemoryStore implements Store {
       }
     }
     if (fact.kind === "step.reset") {
-      // The projector forgets the step's status, but per-attempt leases and
-      // the cached output are stored outside the fact log. Release them so
-      // the next dispatch can re-claim and re-execute at the same attempt.
       const leasePrefix = `${runId}::${fact.stepId}::`;
       for (const key of this.leases.keys()) {
         if (key.startsWith(leasePrefix)) this.leases.delete(key);
@@ -126,14 +105,6 @@ export class InMemoryStore implements Store {
       readonly fact: FlowCanceledFact;
     }>;
   }> {
-    // Single-process JS is cooperatively single-threaded between awaits, so
-    // these reads/writes are atomic with respect to any other call into
-    // this Store. No locking primitive needed; the Postgres adapter is where
-    // real cross-process race safety lives.
-    //
-    // `summaries` covers the post-prune case: the run's facts are gone but
-    // we retained its summary row (matching postgres `workflow_run` PK
-    // conflict semantics).
     if (this.facts.has(runId) || this.summaries.has(runId)) {
       return { started: false, canceled: [] };
     }
@@ -150,7 +121,6 @@ export class InMemoryStore implements Store {
           canceledByRunId: runId,
           concurrencyKey: concurrency.key,
         };
-        // `appendFact` clears the activeByKey slot for terminal facts.
         await this.appendFact(priorRunId, cancelFact);
         canceled.push({ runId: priorRunId, fact: cancelFact });
       }
@@ -281,7 +251,6 @@ export class InMemoryStore implements Store {
     this.globalFacts.push(fact);
   }
 
-  /** Test-only: peek at the in-memory global fact log. */
   readGlobalFacts(): ReadonlyArray<GlobalFact> {
     return this.globalFacts;
   }
@@ -314,13 +283,10 @@ export class InMemoryStore implements Store {
       if (summary === null) continue;
       if (matches(summary)) summaries.push(summary);
     }
-    // Pruned-but-kept runs (no facts; summary retained on prune).
     for (const summary of this.summaries.values()) {
       if (matches(summary)) summaries.push(summary);
     }
 
-    // Stable order: (startedAt DESC, runId DESC). Matches the Postgres
-    // adapter so cursors interoperate semantically.
     summaries.sort((a, b) => {
       const t = b.startedAt.getTime() - a.startedAt.getTime();
       if (t !== 0) return t;
@@ -357,7 +323,6 @@ export class InMemoryStore implements Store {
     const olderThanMs = opts.olderThan.getTime();
     const statusSet = new Set<PrunableStatus>(opts.statuses);
 
-    // Pass 1: collect victims without mutating `facts` mid-iteration.
     interface Victim {
       readonly runId: RunId;
       readonly summary: RunSummary;
@@ -384,9 +349,6 @@ export class InMemoryStore implements Store {
       });
     }
 
-    // Pass 2: delete per-run state. `batchSize` exists in the cross-adapter
-    // contract to bound transaction scope in postgres; in-memory has no
-    // transactions so a single call drains all matching victims.
     let runsPruned = 0;
     let factsPruned = 0;
     for (const v of victims) {
@@ -423,8 +385,6 @@ function deleteByRunPrefix<V>(map: Map<string, V>, runId: RunId): void {
 }
 
 function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
-  // `tryStartRun` guarantees the first fact is `flow.started`. Defensive
-  // null when the invariant is violated (tests poking facts directly).
   const first = facts[0];
   if (first === undefined || first.kind !== "flow.started") return null;
   const projected = projectRunState(runId, facts);
@@ -466,8 +426,6 @@ interface DecodedCursor {
 }
 
 function encodeCursor(c: DecodedCursor): string {
-  // base64url of JSON. Opaque to callers but human-readable in logs.
-  // Isomorphic: TextEncoder + btoa work on Node, Bun, Deno, Workers, browsers.
   const bytes = new TextEncoder().encode(JSON.stringify(c));
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {
@@ -502,18 +460,6 @@ function decodeCursor(s: string): DecodedCursor {
   }
 }
 
-/**
- * Recursive JSONB containment — `haystack` is a superset of `needle`.
- *
- * Mirrors Postgres `jsonb @> jsonb` semantics (§9.16.3):
- *   - Objects: every key in `needle` exists in `haystack` AND each value
- *     matches recursively. Extra keys in `haystack` are allowed.
- *   - Arrays: every element in `needle` is contained in some element of
- *     `haystack` (set-like; duplicates in `needle` don't require
- *     duplicates in `haystack`).
- *   - Scalars / null: strict equality.
- *   - Type mismatch (object vs array, string vs number, …): false.
- */
 function containsJson(haystack: Json, needle: Json): boolean {
   if (Array.isArray(needle)) {
     if (!Array.isArray(haystack)) return false;
@@ -533,11 +479,6 @@ function containsJson(haystack: Json, needle: Json): boolean {
   return haystack === needle;
 }
 
-/**
- * Project an append-only fact stream into a `RunState`. Public so adapters
- * (e.g. `@nagi-js/postgres`) can re-use the same projection rules — keeping
- * one canonical definition of "what does the fact log mean".
- */
 export function projectRunState(
   runId: RunId,
   facts: readonly Fact[],
@@ -607,11 +548,11 @@ export function projectRunState(
         delete steps[fact.stepId];
         break;
       case "step.retried":
+      case "step.abort-requested":
       case "signal.sent":
       case "signal.received":
       case "once.recorded":
       case "match.arm-selected":
-        // Don't affect the step-state projection directly; live in the fact log only.
         break;
     }
   }
@@ -693,8 +634,6 @@ export class InMemoryQueue implements Queue {
     const item = this.leased.get(receipt);
     if (!item) return;
     this.leased.delete(receipt);
-    // attempt is owned by the dispatcher (store-side tracking) — nack does not
-    // increment. The same message returns to the queue on lease expiry / nack.
     const requeued: QueuedItem = {
       ...item,
       visibleAt: Date.now() + (opts?.delayMs ?? 0),
@@ -710,13 +649,6 @@ export class InMemoryQueue implements Queue {
 }
 
 export interface InMemoryClockOpts {
-  /**
-   * Wires `schedule()` wake-ups to a trigger. When the persistent timer fires,
-   * the clock calls `trigger.fire(runId)` so scheduler subscribers can resume
-   * the run. Without this, `schedule()` is a no-op on the worker loop and any
-   * step that depends on it (time-based gates, long-delayed retries) will
-   * stall in tests.
-   */
   readonly trigger?: InMemoryTrigger;
 }
 
@@ -762,7 +694,6 @@ export class InMemoryClock implements Clock {
     this.timers.set(key, handle);
   }
 
-  /** Clear any pending scheduled timers. Call from test teardown. */
   dispose(): void {
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
@@ -779,10 +710,6 @@ export class InMemoryTrigger implements Trigger {
     };
   }
 
-  /**
-   * Test-only: synchronously dispatch a wake-up to all subscribers.
-   * Real triggers fire from a Store change (NOTIFY/LISTEN, polling, etc.).
-   */
   fire(runId: RunId): void {
     for (const h of this.handlers) h(runId);
   }

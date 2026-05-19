@@ -1,7 +1,3 @@
-// Pure unit tests for the scheduler.
-// Build a Flow + a synthetic RunState (via InMemoryStore) and assert the
-// decision the scheduler returns. No worker, no dispatch.
-
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
 import { InMemoryStore } from "./memory";

@@ -45,7 +45,6 @@ describe("migrations", () => {
       (n, m) => n + (m.sql("nagi").match(/PRIMARY KEY/g) ?? []).length,
       0,
     );
-    // Original 6 tables + flow_snapshot + flow_ref + global_fact.
     expect(totalPks).toBeGreaterThanOrEqual(6);
   });
 

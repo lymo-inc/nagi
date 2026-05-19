@@ -6,13 +6,6 @@ export interface Migration {
   readonly sql: (schema: string) => string;
 }
 
-/**
- * v0 schema for `@nagi-js/postgres`. Each migration's `sql` builds a script
- * for a configurable schema name — the default in `migrate()` is `nagi`.
- *
- * Inline strings, never `fs.readFileSync` — preserves edge-runtime safety
- * (the adapter must be importable on Cloudflare Workers / Deno Deploy).
- */
 export const migrations: readonly Migration[] = [
   {
     id: "0001_init",
@@ -136,11 +129,6 @@ export const migrations: readonly Migration[] = [
         ADD CONSTRAINT workflow_run_status_check
         CHECK (status IN ('pending','running','completed','failed','canceled'));
 
-      -- Defense-in-depth: even if application code skips the advisory lock,
-      -- this index makes "two active runs sharing a concurrency key" a
-      -- unique-violation at insert time. Excludes terminal rows and rows
-      -- without a key (the common case for flows that don't declare
-      -- concurrency).
       CREATE UNIQUE INDEX IF NOT EXISTS workflow_run_concurrency_active_uidx
         ON ${schema}.workflow_run (flow_id, concurrency_key)
         WHERE concurrency_key IS NOT NULL
@@ -150,10 +138,6 @@ export const migrations: readonly Migration[] = [
   {
     id: "0004_query_runs_input_idx",
     sql: (schema) => `
-      -- Backs \`wf.queryRuns({ where: { input } })\`. \`jsonb_path_ops\` is the
-      -- smaller, faster GIN opclass for containment-only queries — we never
-      -- expose ?/?&/?| existence operators, so dropping support for them is
-      -- the right trade.
       CREATE INDEX IF NOT EXISTS workflow_run_input_gin_idx
         ON ${schema}.workflow_run USING gin (input jsonb_path_ops);
     `,
@@ -161,10 +145,6 @@ export const migrations: readonly Migration[] = [
   {
     id: "0005_subflow_parent_link",
     sql: (schema) => `
-      -- Subflow back-pointer for b.subflow() child runs. Populated by
-      -- tryStartRun when flow.started.parentRunId is set. NULL for runs
-      -- started directly via wf.start(). The btree index backs
-      -- Store.listChildren(parentRunId) used by wf.cancel cascade.
       ALTER TABLE ${schema}.workflow_run
         ADD COLUMN IF NOT EXISTS parent_run_id  text;
       ALTER TABLE ${schema}.workflow_run
@@ -177,10 +157,6 @@ export const migrations: readonly Migration[] = [
   {
     id: "0006_step_canceled_status",
     sql: (schema) => `
-      -- Widen step_run.status to accept 'canceled'. Recorded when a run
-      -- transitions to canceled status (cancel-in-progress supersede)
-      -- while a step is mid-flight: the boundary check in the dispatcher
-      -- reclassifies the in-flight step from completed/failed to canceled.
       ALTER TABLE ${schema}.step_run
         DROP CONSTRAINT IF EXISTS step_run_status_check;
       ALTER TABLE ${schema}.step_run
@@ -191,11 +167,6 @@ export const migrations: readonly Migration[] = [
   {
     id: "0007_prune_completed_at_idx",
     sql: (schema) => `
-      -- Backs \`wf.pruneFacts({ olderThan })\` scanning terminal runs by
-      -- completion time. Partial index: pending/running rows have
-      -- completed_at IS NULL and are never prune candidates. Rows
-      -- transition to terminal exactly once, so write amplification is
-      -- minimal.
       CREATE INDEX IF NOT EXISTS workflow_run_completed_at_idx
         ON ${schema}.workflow_run (completed_at)
         WHERE completed_at IS NOT NULL
@@ -205,17 +176,9 @@ export const migrations: readonly Migration[] = [
 ];
 
 export interface MigrateOpts {
-  /** Schema name; default `nagi`. */
   readonly schema?: string;
 }
 
-/**
- * Apply pending migrations idempotently. Maintains a `<schema>.schema_migrations`
- * table; migrations whose ids are already recorded there are skipped.
- *
- * Each migration runs inside its own transaction, so a partial failure leaves
- * the bookkeeping table consistent.
- */
 export async function migrate<DB>(
   db: Kysely<DB>,
   opts: MigrateOpts = {},
@@ -226,7 +189,6 @@ export async function migrate<DB>(
   const applied: string[] = [];
   const skipped: string[] = [];
 
-  // Bootstrap the bookkeeping table outside any user migration. Idempotent.
   await sql
     .raw(
       `CREATE SCHEMA IF NOT EXISTS ${schema};
@@ -258,11 +220,6 @@ export async function migrate<DB>(
   return { applied, skipped };
 }
 
-/**
- * Reject schema names with anything other than `[A-Za-z_][A-Za-z0-9_]*` to
- * guard against SQL injection — the schema name is interpolated raw into
- * every DDL string. Kysely's `sql` tag cannot bind identifiers, only values.
- */
 function assertValidSchema(schema: string): void {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema)) {
     throw new Error(

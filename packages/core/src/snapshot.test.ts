@@ -126,7 +126,6 @@ describe("wf.replay() — drift detection", () => {
     const wf1 = await nagi({ flows: [original], store, queue, clock });
     const runId = await wf1.start(original, {});
 
-    // Boot a second nagi() with the drifted flow shape but the same store.
     const wf2 = await nagi({ flows: [drifted], store, queue, clock });
 
     await expect(wf2.replay(runId, { mode: "continue" })).rejects.toThrow(
@@ -144,7 +143,6 @@ describe("wf.replay() — drift detection", () => {
     const wf = await nagi({ flows: [f], store, queue, clock });
     const runId = await wf.start(f, {});
 
-    // Same flow, same nagi instance — no drift expected.
     await expect(
       wf.replay(runId, { mode: "continue" }),
     ).resolves.toBeUndefined();
@@ -169,7 +167,6 @@ describe("wf.replay() — drift detection", () => {
     const runId = await wf1.start(original, {});
     const wf2 = await nagi({ flows: [drifted], store, queue, clock });
 
-    // inspect mode is a probe — no execution, no drift check.
     await expect(
       wf2.replay(runId, { mode: "inspect" }),
     ).resolves.toBeUndefined();
@@ -200,9 +197,6 @@ describe("wf.replay() — drift detection", () => {
   });
 
   it("legacy runs (no pinned flowHash) skip the drift check", async () => {
-    // Simulate a pre-snapshot-store run by appending a flow.started fact
-    // without flowHash. (Real legacy runs migrated from a prior version of
-    // the schema would land here.)
     const f = flow({
       id: "legacy",
       input: passthroughSchema<Record<string, never>>(),
@@ -218,7 +212,6 @@ describe("wf.replay() — drift detection", () => {
       flowId: "legacy",
       input: {},
       at: clock.now(),
-      // no flowHash — simulating legacy
     });
 
     await expect(
