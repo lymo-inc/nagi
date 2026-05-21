@@ -1,5 +1,13 @@
 # @nagi-js/otel
 
+## 0.1.1-rc.9
+
+### Patch Changes
+
+- RFCs #10, #11 implemented!
+- Updated dependencies
+  - @nagi-js/core@0.1.1-rc.9
+
 ## 0.1.1-rc.8
 
 ### Patch Changes
