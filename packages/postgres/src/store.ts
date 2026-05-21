@@ -576,12 +576,7 @@ class PostgresStore<DB = unknown> implements Store {
   async queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult> {
     const where = opts.where ?? {};
     const flowId = where.flowId;
-    const statuses =
-      where.status === undefined
-        ? undefined
-        : Array.isArray(where.status)
-          ? Array.from(where.status)
-          : [where.status as RunStatus];
+    const statuses = where.status ? Array.from(where.status) : undefined;
     const inputFilter = where.input;
 
     const isLatest = opts.latest === true;

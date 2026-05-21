@@ -1,9 +1,14 @@
 import { describe, expectTypeOf, it } from "vitest";
+import type { Wf } from "../runtime";
+import type { Resolved } from "../state";
 import type {
   AttemptNumber,
   Builder,
+  Json,
+  RunId,
   SerializedError,
   Step,
+  StepId,
   StepKind,
   StreamEvent,
   StreamingStepCtx,
@@ -12,6 +17,9 @@ import type {
 
 declare const builderX: Builder<{ x: number }>;
 declare const streamEvent: StreamEvent<{ token: string }>;
+declare const wf: Wf;
+declare const runId: RunId;
+declare const stepId: StepId;
 
 describe("Builder.streamingTask — output inference", () => {
   it("infers Output from the run handler's return type (not the chunk type)", () => {
@@ -43,7 +51,7 @@ describe("Builder.streamingTask — output inference", () => {
     builderX.task({
       needs: { gen: upstream },
       run: async ({ needs }) => {
-        expectTypeOf(needs.gen).toEqualTypeOf<{ final: string }>();
+        expectTypeOf(needs.gen).toEqualTypeOf<Resolved<{ final: string }>>();
         return null;
       },
     });
@@ -148,5 +156,53 @@ describe("StreamEvent<C> discriminated union", () => {
     if (ev.kind === "chunk") {
       expectTypeOf(ev.chunk).toEqualTypeOf<import("../types").Json>();
     }
+  });
+});
+
+describe("Wf.subscribe — typing (O6)", () => {
+  it("subscribe(runId, stepId) defaults the element to StreamEvent<Json>", () => {
+    expectTypeOf(wf.subscribe(runId, stepId)).toEqualTypeOf<
+      AsyncIterable<StreamEvent<Json>>
+    >();
+  });
+
+  it("subscribe<C>(...) yields AsyncIterable<StreamEvent<C>> with the asserted C", () => {
+    expectTypeOf(wf.subscribe<{ token: string }>(runId, stepId)).toEqualTypeOf<
+      AsyncIterable<StreamEvent<{ token: string }>>
+    >();
+  });
+
+  it("narrowing the yielded envelope by `kind` exposes the asserted chunk type", () => {
+    async function consume(): Promise<void> {
+      for await (const ev of wf.subscribe<{ token: string }>(runId, stepId)) {
+        if (ev.kind === "chunk") {
+          expectTypeOf(ev.chunk).toEqualTypeOf<{ token: string }>();
+        }
+      }
+    }
+    void consume;
+  });
+
+  it("accepts the optional 3rd arg { replayBuffered?: boolean }", () => {
+    expectTypeOf(
+      wf.subscribe(runId, stepId, { replayBuffered: true }),
+    ).toEqualTypeOf<AsyncIterable<StreamEvent<Json>>>();
+    // Omitting replayBuffered within the opts object is allowed (it is optional).
+    void wf.subscribe(runId, stepId, {});
+  });
+
+  it("rejects a wrong-typed opts object", () => {
+    // @ts-expect-error replayBuffered must be a boolean, not a string
+    void wf.subscribe(runId, stepId, { replayBuffered: "yes" });
+  });
+
+  it("rejects an unknown opts key", () => {
+    // @ts-expect-error `replay` is not a known option (only replayBuffered)
+    void wf.subscribe(runId, stepId, { replay: true });
+  });
+
+  it("requires the branded RunId — a raw string is rejected", () => {
+    // @ts-expect-error a plain string is not assignable to the branded RunId
+    void wf.subscribe("run-1", stepId);
   });
 });

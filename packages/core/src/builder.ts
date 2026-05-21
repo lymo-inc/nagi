@@ -85,8 +85,7 @@ function makeBuilder<Input>(): Builder<Input> {
       needs: (config.needs ?? {}) as NeedsMap,
       schema: config.schema,
       ...compact({
-        names: config.names,
-        timeoutMs: config.timeoutMs,
+        ...config,
         when: config.when as SignalDef["when"],
       }),
     };

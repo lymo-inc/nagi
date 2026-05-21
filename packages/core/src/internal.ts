@@ -1,3 +1,4 @@
+import type { Resolved } from "./state";
 import type {
   Json,
   LogEntry,
@@ -234,11 +235,11 @@ export function needsStepIds(def: StepDef): readonly string[] {
 
 export function resolveNeeds(
   def: StepDef,
-  loadOutput: (stepId: string) => Json | null,
+  loadResolved: (stepId: string) => Resolved,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [localKey, upstream] of Object.entries(def.needs)) {
-    result[localKey] = loadOutput(upstream.id);
+    result[localKey] = loadResolved(upstream.id);
   }
   return result;
 }

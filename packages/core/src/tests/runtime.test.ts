@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { NagiRuntimeError, NagiValidationError } from "../runtime";
+import { unwrap } from "../state";
 import type { RunId, StandardSchemaV1 } from "../types";
 import {
   emptySchema,
@@ -20,7 +21,7 @@ describe("e2e: linear task chain", () => {
         });
         const c = b.task({
           needs: { a },
-          run: async ({ needs }) => ({ plusTen: needs.a.doubled + 10 }),
+          run: async ({ needs }) => ({ plusTen: unwrap(needs.a).doubled + 10 }),
         });
         return { a, c };
       },
@@ -44,7 +45,7 @@ describe("e2e: when:false skip cascade", () => {
         });
         const branch = b.task({
           needs: { gate },
-          when: ({ needs }) => needs.gate.enabled,
+          when: ({ needs }) => unwrap(needs.gate).enabled,
           run: async () => ({ ran: true }),
         });
         const after = b.task({
@@ -131,8 +132,8 @@ describe("e2e: signal full loop", () => {
         const send = b.task({
           needs: { review, prep },
           run: async ({ needs }) => ({
-            sent: needs.review.approved,
-            subject: needs.prep.subject,
+            sent: unwrap(needs.review).approved,
+            subject: unwrap(needs.prep).subject,
           }),
         });
         return { prep, review, send };

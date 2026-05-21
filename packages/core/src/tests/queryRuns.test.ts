@@ -141,12 +141,12 @@ describe("InMemoryStore.queryRuns — filters", () => {
     expect(r.runs).toEqual([]);
   });
 
-  it("status: single value", async () => {
+  it("status: single-element array", async () => {
     const { store } = await seedRuns([
       { flowId: "f", input: {}, startedAtMs: 1000 },
       { flowId: "f", input: {}, startedAtMs: 2000, terminal: "completed" },
     ]);
-    const r = await store.queryRuns({ where: { status: "completed" } });
+    const r = await store.queryRuns({ where: { status: ["completed"] } });
     expect(r.runs).toHaveLength(1);
     expect(r.runs[0]?.status).toBe("completed");
   });

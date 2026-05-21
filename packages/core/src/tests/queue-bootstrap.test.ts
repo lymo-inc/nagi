@@ -46,7 +46,7 @@ describe("nagi() — auto queue-schema bootstrap", () => {
     for (const msg of await queue.dequeue({ count: 32 })) {
       await dispatchMessage(deps, msg);
     }
-    expect((await store.loadRunState(runId)).status).toBe("completed");
+    expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
     expect(queue.ensureSchemaCalls).toBe(1);
   });
 

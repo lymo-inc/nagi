@@ -7,6 +7,7 @@ import {
   type MatchDef,
   resolveNeeds,
   type StepDef,
+  type StreamingTaskDef,
   type SubflowDef,
   selectArm,
   type TaskDef,
@@ -19,6 +20,7 @@ import {
   type SkipDecision,
   stepStateOf,
 } from "./scheduler";
+import { isTerminalRun, resolvedOf, runStatusOf, stepStatusOf } from "./state";
 import type {
   AttemptNumber,
   Clock,
@@ -39,6 +41,7 @@ import type {
   StepCtx,
   StepId,
   Store,
+  StreamingStepCtx,
   Tx,
 } from "./types";
 
@@ -109,15 +112,15 @@ export async function dispatchMessage(
   const def = getDef(step);
 
   const preState = await store.loadRunState(runId);
-  if (preState.status === "canceled") {
+  if (preState.phase.tag === "canceled") {
     await queue.ack(message.receipt);
     return;
   }
   const preStep = stepStateOf(preState, stepId);
   if (
-    preStep.status === "completed" ||
-    preStep.status === "failed" ||
-    preStep.status === "skipped"
+    preStep.tag === "completed" ||
+    preStep.tag === "failed" ||
+    preStep.tag === "skipped"
   ) {
     await queue.ack(message.receipt);
     return;
@@ -134,6 +137,7 @@ export async function dispatchMessage(
     runId,
     stepId,
     attempt,
+    stepKind: def.kind,
     at: clock.now(),
   });
   const startEventInput: Json =
@@ -149,8 +153,9 @@ export async function dispatchMessage(
     input: startEventInput,
     at: clock.now(),
   };
-  // TODO(RFC 0019 Phase C): streaming routes through the task path here; Phase C
-  // adds the StreamingStepCtx + emit wiring and a `retry` event on re-attempt.
+  // RFC 0019: streaming shares the task dispatch path; executeTask builds the
+  // StreamingStepCtx + emit, and the `retry` event is fact-driven (the
+  // step.retried fact fires the hub's signalRetry inside InMemoryStore).
   const stepOnStart =
     def.kind === "task" || def.kind === "streaming" ? def.onStart : undefined;
   await fireHook(stepOnStart, startEvent, "step.onStart", deps);
@@ -233,7 +238,9 @@ async function executeTask(args: {
   const { store, queue, clock } = deps;
   const runState = await store.loadRunState(runId);
   const input = extractInput(runState);
-  const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
+  const needs = resolveNeeds(def, (id) =>
+    resolvedOf(stepStateOf(runState, id)),
+  );
 
   const ac = new AbortController();
   const watcher = startCancelWatcher({
@@ -263,14 +270,32 @@ async function executeTask(args: {
           signal: ac.signal,
           emitLog: deps.emitLog,
         });
-        // TODO(RFC 0019 Phase C): a streaming step's `run` expects a
-        // StreamingStepCtx with `emit`; Phase A invokes it through the plain
-        // task ctx (no emit wiring yet). Phase C builds the StreamingStepCtx and
-        // routes `emit` to the out-of-band transport (D3).
-        const run = def.run as TaskDef["run"];
-        const out = (await run({ input, needs, ctx })) as Json;
+        let out: Json;
+        if (def.kind === "streaming") {
+          // RFC 0019 D3: emit publishes OUT-OF-BAND via the store's write-side,
+          // never through `tx` (chunks must be visible before commit, and never
+          // enter the durable fact log). `emitActive` makes any emit after the
+          // handler returns a silent no-op (a dangling setTimeout etc.), the
+          // documented invariant from the RFC.
+          let emitActive = true;
+          const streamingCtx: StreamingStepCtx<unknown> = {
+            ...ctx,
+            emit: async (chunk: Json) => {
+              if (emitActive) store.publishChunk?.(runId, stepId, chunk);
+            },
+          };
+          const run = def.run as StreamingTaskDef["run"];
+          try {
+            out = (await run({ input, needs, ctx: streamingCtx })) as Json;
+          } finally {
+            emitActive = false;
+          }
+        } else {
+          const run = def.run as TaskDef["run"];
+          out = (await run({ input, needs, ctx })) as Json;
+        }
         const postState = await store.loadRunState(runId);
-        if (postState.status === "canceled") {
+        if (postState.phase.tag === "canceled") {
           const canceledFact: Fact = {
             kind: "step.canceled",
             runId,
@@ -331,11 +356,7 @@ function startCancelWatcher(args: {
       if (stopped) return;
       try {
         const s = await store.loadRunState(runId);
-        if (
-          s.status === "canceled" ||
-          s.status === "failed" ||
-          s.status === "completed"
-        ) {
+        if (isTerminalRun(s)) {
           if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
           return;
         }
@@ -405,7 +426,9 @@ async function executeSubflow(args: {
   }
   const runState = await store.loadRunState(runId);
   const parentInput = extractInput(runState);
-  const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
+  const needs = resolveNeeds(def, (id) =>
+    resolvedOf(stepStateOf(runState, id)),
+  );
   const childInput = def.buildInput({ input: parentInput, needs });
   await deps.startChildRun({
     child,
@@ -427,7 +450,9 @@ async function executeMatch(args: {
 
   const runState = await store.loadRunState(runId);
   const input = extractInput(runState);
-  const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
+  const needs = resolveNeeds(def, (id) =>
+    resolvedOf(stepStateOf(runState, id)),
+  );
 
   const armId = selectArm(def, { input, needs });
 
@@ -456,7 +481,7 @@ async function handleStepError(args: {
   const error = serializeError(err);
 
   const postState = await store.loadRunState(runId);
-  const runIsCanceled = postState.status === "canceled";
+  const runIsCanceled = postState.phase.tag === "canceled";
   const stepAborted = hasAbortRequest(postState.facts, stepId, attempt);
   if (runIsCanceled || stepAborted) {
     const isAbort =
@@ -490,6 +515,7 @@ async function handleStepError(args: {
       stepId,
       attempt,
       nextAttemptAt: new Date(Date.now() + delayMs),
+      error,
       at: clock.now(),
     });
     const retryEvent = {
@@ -828,11 +854,7 @@ export async function propagateToParent(
   const { runId: parentRunId, stepId: parentStepId } = startedFact.parent;
 
   const parentState = await store.loadRunState(parentRunId);
-  if (
-    parentState.status === "completed" ||
-    parentState.status === "failed" ||
-    parentState.status === "canceled"
-  ) {
+  if (isTerminalRun(parentState)) {
     deps.emitLog({
       level: "info",
       msg: "nagi: subflow wake skipped — parent run already terminal",
@@ -840,26 +862,26 @@ export async function propagateToParent(
         parentRunId,
         parentStepId,
         childRunId,
-        parentStatus: parentState.status,
+        parentStatus: runStatusOf(parentState),
       },
     });
     return;
   }
   const parentStep = stepStateOf(parentState, parentStepId);
-  if (parentStep.status !== "running") {
+  if (parentStep.tag !== "awaitingChild") {
     deps.emitLog({
       level: "info",
-      msg: "nagi: subflow wake skipped — parent step not running",
+      msg: "nagi: subflow wake skipped — parent step not awaiting child",
       attrs: {
         parentRunId,
         parentStepId,
         childRunId,
-        parentStepStatus: parentStep.status,
+        parentStepStatus: stepStatusOf(parentStep),
       },
     });
     return;
   }
-  const attempt = parentStep.attempts > 0 ? parentStep.attempts : 1;
+  const attempt = parentStep.attempt;
 
   const parentFlow = await deps.flowFor(parentRunId);
 

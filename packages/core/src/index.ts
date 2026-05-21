@@ -34,4 +34,25 @@ export {
   type StartOpts,
   type Wf,
 } from "./runtime";
+export type {
+  Anomaly,
+  Cascade,
+  Resolved,
+  RunCancelCause,
+  RunPhase,
+  SkipReason,
+  StepCancelCause,
+} from "./state";
+export {
+  attemptOf,
+  errorOf,
+  isStepTerminal,
+  isTerminalRun,
+  outputOf,
+  resolvedOf,
+  runStatusOf,
+  stepStateOf,
+  stepStatusOf,
+  unwrap,
+} from "./state";
 export type * from "./types";

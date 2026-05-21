@@ -52,7 +52,7 @@ describe("wf.operator().skip()", () => {
     expect(manual?.cascade).toBe("skip");
   });
 
-  it("manual skip with cascade=continue lets downstream run with needs.x === null", async () => {
+  it("manual skip with cascade=continue lets downstream run with needs.x resolved as skipped", async () => {
     let observed: unknown = "untouched";
     const f = flow({
       id: "skip-cascade-continue",
@@ -84,7 +84,7 @@ describe("wf.operator().skip()", () => {
     const result = await h.result(runId);
     expect(result.stepStatus("a")).toBe("skipped");
     expect(result.stepStatus("b")).toBe("completed");
-    expect(observed).toBeNull();
+    expect(observed).toEqual({ tag: "skipped" });
   });
 
   it("rejects skip with empty actor", async () => {
@@ -266,7 +266,7 @@ describe("wf.operator().abort()", () => {
     await h.wf.operator().abort(runId, { actor: "ops@nagi", note: "stuck" });
 
     const state = await h.store.loadRunState(runId);
-    expect(state.status).toBe("canceled");
+    expect(state.phase.tag).toBe("canceled");
     const canceled = state.facts.find(
       (f): f is FlowCanceledFact => f.kind === "flow.canceled",
     );

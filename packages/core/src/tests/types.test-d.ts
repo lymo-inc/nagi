@@ -1,6 +1,7 @@
 import { describe, expectTypeOf, it } from "vitest";
 import { flow } from "../builder";
 import { nagi, type Wf } from "../runtime";
+import { type Resolved, unwrap } from "../state";
 import type {
   Builder,
   Fact,
@@ -10,6 +11,7 @@ import type {
   MatchArm,
   NeedsOutputs,
   Queue,
+  ResolvedNeeds,
   RunId,
   RunSummary,
   Step,
@@ -107,7 +109,9 @@ describe("Builder.task", () => {
     const downstream = builderX.task({
       needs: { rec: upstream },
       run: async ({ needs }) => {
-        expectTypeOf(needs.rec).toEqualTypeOf<{ recordingUrl: string }>();
+        expectTypeOf(needs.rec).toEqualTypeOf<
+          Resolved<{ recordingUrl: string }>
+        >();
         return { ok: true };
       },
     });
@@ -120,8 +124,10 @@ describe("Builder.task", () => {
       needs: { review: upstream },
       when: ({ input, needs }) => {
         expectTypeOf(input).toEqualTypeOf<{ x: number }>();
-        expectTypeOf(needs.review).toEqualTypeOf<{ approved: boolean }>();
-        return needs.review.approved;
+        expectTypeOf(needs.review).toEqualTypeOf<
+          Resolved<{ approved: boolean }>
+        >();
+        return unwrap(needs.review).approved;
       },
       run: async () => null,
     });
@@ -134,7 +140,7 @@ describe("Builder.match — guard mode", () => {
       needs: { s: scoreStep },
       arms: [
         {
-          when: ({ needs }) => needs.s.value >= 90,
+          when: ({ needs }) => unwrap(needs.s).value >= 90,
           build: (b) => ({
             f: b.task({ run: async () => ({ tier: "premium" as const }) }),
           }),
@@ -156,8 +162,8 @@ describe("Builder.match — guard mode", () => {
     type ScoreNeeds = { s: typeof scoreStep };
     // @ts-expect-error
     const _badArm: MatchArm<unknown, ScoreNeeds, StepMap> = {
-      when: (args: { input: unknown; needs: NeedsOutputs<ScoreNeeds> }) =>
-        args.needs.s.intent,
+      when: (args: { input: unknown; needs: ResolvedNeeds<ScoreNeeds> }) =>
+        unwrap(args.needs.s).intent,
       otherwise: true,
       build: (b) => ({ f: b.task({ run: async () => null }) }),
     };

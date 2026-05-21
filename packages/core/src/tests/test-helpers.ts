@@ -1,6 +1,7 @@
 import { type DispatchDeps, dispatchMessage } from "../dispatch";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { type NagiConfig, nagi, type Wf } from "../runtime";
+import { errorOf, isTerminalRun, runStatusOf, stepStatusOf } from "../state";
 import type {
   Fact,
   Flow,
@@ -51,27 +52,29 @@ export interface Result {
 
 function makeResult(state: RunState): Result {
   return {
-    status: state.status,
+    status: runStatusOf(state),
     raw: state,
     output(stepName) {
       const step = state.steps[stepName];
       if (!step) throw new Error(`Result.output: no step "${stepName}" in run`);
-      if (step.status !== "completed") {
+      if (step.tag !== "completed") {
         throw new Error(
-          `Result.output: step "${stepName}" status is "${step.status}", not "completed"`,
+          `Result.output: step "${stepName}" status is "${stepStatusOf(step)}", not "completed"`,
         );
       }
-      return step.output ?? null;
+      return step.output;
     },
     stepStatus(stepName) {
-      return state.steps[stepName]?.status ?? "pending";
+      const step = state.steps[stepName];
+      return step ? stepStatusOf(step) : "pending";
     },
     error(stepName) {
       const step = state.steps[stepName];
-      if (!step?.error) {
+      const err = step ? errorOf(step) : undefined;
+      if (!err) {
         throw new Error(`Result.error: step "${stepName}" did not fail`);
       }
-      return step.error;
+      return err;
     },
     factCount(kind) {
       return state.facts.filter((f) => f.kind === kind).length;
@@ -210,11 +213,7 @@ export async function makeHarness(
         const state = await store.loadRunState(runId);
         // Check via projected status so post-cancellation step facts (which
         // may interleave after `flow.canceled`) don't trip the check.
-        if (
-          state.status === "completed" ||
-          state.status === "failed" ||
-          state.status === "canceled"
-        ) {
+        if (isTerminalRun(state)) {
           return makeResult(state);
         }
         await new Promise((r) => setTimeout(r, 5));
@@ -226,7 +225,8 @@ export async function makeHarness(
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
         const state = await store.loadRunState(runId);
-        if (state.steps[stepName]?.status === status) return state;
+        const step = state.steps[stepName];
+        if (step !== undefined && stepStatusOf(step) === status) return state;
         await new Promise((r) => setTimeout(r, 5));
       }
       throw new Error(

@@ -1,4 +1,10 @@
-import { compact } from "./internal";
+import {
+  foldRun,
+  isTerminalRun,
+  runStatusOf,
+  stepStateOf,
+  stepStatusOf,
+} from "./state";
 import { InMemoryStreamHub } from "./stream-hub";
 import type {
   AttemptNumber,
@@ -22,14 +28,12 @@ import type {
   QueueMessage,
   RunId,
   RunState,
-  RunStatus,
   RunSummary,
   SerializedError,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
   StepId,
-  StepState,
   Store,
   StreamEvent,
   Trigger,
@@ -76,6 +80,35 @@ export class InMemoryStore implements Store {
     const list = this.facts.get(runId) ?? [];
     list.push(fact);
     this.facts.set(runId, list);
+    // RFC 0019 D3: drive the ephemeral stream hub off the durable fact log, so
+    // termination is derived from committed state — never an in-band end-marker.
+    // These fire for ALL steps; the hub's close*/closeRun are safe no-ops for
+    // non-streaming steps (no channel exists → nothing created, nothing leaks).
+    switch (fact.kind) {
+      case "step.completed":
+        this.streamHub.closeOk(runId, fact.stepId);
+        break;
+      case "step.failed":
+        // failStep (hence this fact) is only written on terminal failure; the
+        // retry path uses step.retried. So this is always retries-exhausted.
+        this.streamHub.closeError(runId, fact.stepId, fact.error);
+        break;
+      case "step.retried":
+        // O5: the retry event carries the NEXT attempt number.
+        this.streamHub.signalRetry(
+          runId,
+          fact.stepId,
+          (fact.attempt + 1) as AttemptNumber,
+        );
+        break;
+      case "flow.completed":
+      case "flow.failed":
+      case "flow.canceled":
+        // Run-terminal: close every still-open channel for this run so a
+        // subscriber to a skipped/typo'd/never-emitting step never hangs.
+        this.streamHub.closeRun(runId);
+        break;
+    }
     if (
       fact.kind === "flow.completed" ||
       fact.kind === "flow.failed" ||
@@ -156,7 +189,7 @@ export class InMemoryStore implements Store {
   }
 
   async loadRunState(runId: RunId): Promise<RunState> {
-    return projectRunState(runId, this.facts.get(runId) ?? []);
+    return foldRun(runId, this.facts.get(runId) ?? []);
   }
 
   async claimStep(
@@ -268,25 +301,12 @@ export class InMemoryStore implements Store {
 
   async queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult> {
     const where = opts.where ?? {};
-    const statuses =
-      where.status === undefined
-        ? undefined
-        : Array.isArray(where.status)
-          ? where.status
-          : [where.status as RunStatus];
+    const wanted = where.status && new Set(where.status);
 
-    const matches = (summary: RunSummary): boolean => {
-      if (where.flowId !== undefined && summary.flowId !== where.flowId)
-        return false;
-      if (statuses !== undefined && !statuses.includes(summary.status))
-        return false;
-      if (
-        where.input !== undefined &&
-        !containsJson(summary.input, where.input)
-      )
-        return false;
-      return true;
-    };
+    const matches = (summary: RunSummary): boolean =>
+      (where.flowId === undefined || summary.flowId === where.flowId) &&
+      (!wanted || wanted.has(summary.status)) &&
+      (where.input === undefined || containsJson(summary.input, where.input));
 
     const summaries: RunSummary[] = [];
     for (const [runId, factList] of this.facts) {
@@ -392,6 +412,23 @@ export class InMemoryStore implements Store {
     stepId: StepId,
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<Json>> {
+    // D3 authoritative guard: durable facts decide whether the stream is over,
+    // not the ephemeral hub (the hub may never have held a channel for this
+    // step). If the step already reached a terminal fact, or the run is already
+    // terminal, the stream is over → hand back an immediately-closed, empty
+    // iterable rather than delegating (which would open a channel that hangs).
+    const state = foldRun(runId, this.facts.get(runId) ?? []);
+    const stepStatus = stepStatusOf(stepStateOf(state, stepId));
+    const runIsTerminal = isTerminalRun(state);
+    if (
+      runIsTerminal ||
+      stepStatus === "completed" ||
+      stepStatus === "failed" ||
+      stepStatus === "canceled" ||
+      stepStatus === "skipped"
+    ) {
+      return EMPTY_CLOSED_STREAM;
+    }
     return this.streamHub.subscribeStream(runId, stepId, opts);
   }
 
@@ -399,6 +436,18 @@ export class InMemoryStore implements Store {
     this.streamHub.publishChunk(runId, stepId, chunk);
   }
 }
+
+/**
+ * A shared, immediately-ended async iterable for "the stream is already over"
+ * (D3): subscribing to a step that has already reached a terminal fact, or whose
+ * run is terminal. Yields nothing and ends on first `next()` — so a `for await`
+ * loop completes at once and never hangs.
+ */
+const EMPTY_CLOSED_STREAM: AsyncIterable<StreamEvent<Json>> = {
+  [Symbol.asyncIterator](): AsyncIterator<StreamEvent<Json>> {
+    return { next: async () => ({ value: undefined, done: true }) };
+  },
+};
 
 function deleteByRunPrefix<V>(map: Map<string, V>, runId: RunId): void {
   const prefix = `${runId}::`;
@@ -410,7 +459,7 @@ function deleteByRunPrefix<V>(map: Map<string, V>, runId: RunId): void {
 function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
   const first = facts[0];
   if (first === undefined || first.kind !== "flow.started") return null;
-  const projected = projectRunState(runId, facts);
+  const projected = foldRun(runId, facts);
   let completedAt: Date | null = null;
   for (let i = facts.length - 1; i >= 0; i--) {
     const f = facts[i];
@@ -427,7 +476,7 @@ function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
   return {
     runId,
     flowId: first.flowId,
-    status: projected.status,
+    status: runStatusOf(projected),
     startedAt: first.at,
     completedAt,
     input: first.input,
@@ -502,97 +551,7 @@ function containsJson(haystack: Json, needle: Json): boolean {
   return haystack === needle;
 }
 
-export function projectRunState(
-  runId: RunId,
-  facts: readonly Fact[],
-): RunState {
-  let flowId = "";
-  let status: RunStatus = "pending";
-  let flowHash: string | undefined;
-  let codeVersion: string | undefined;
-  const steps: Record<string, StepState> = {};
-
-  for (const fact of facts) {
-    switch (fact.kind) {
-      case "flow.started":
-        flowId = fact.flowId;
-        status = "running";
-        flowHash = fact.flowHash;
-        codeVersion = fact.codeVersion;
-        break;
-      case "flow.completed":
-        status = "completed";
-        break;
-      case "flow.failed":
-        status = "failed";
-        break;
-      case "flow.canceled":
-        status = "canceled";
-        break;
-      case "step.started":
-        steps[fact.stepId] = {
-          stepId: fact.stepId,
-          status: "running",
-          attempts: fact.attempt,
-          output: null,
-        };
-        break;
-      case "step.completed":
-        steps[fact.stepId] = {
-          stepId: fact.stepId,
-          status: "completed",
-          attempts: fact.attempt,
-          output: fact.output,
-        };
-        break;
-      case "step.failed":
-        steps[fact.stepId] = {
-          stepId: fact.stepId,
-          status: "failed",
-          attempts: fact.attempt,
-          output: null,
-          error: fact.error,
-        };
-        break;
-      case "step.canceled":
-        steps[fact.stepId] = {
-          stepId: fact.stepId,
-          status: "canceled",
-          attempts: fact.attempt,
-          output: null,
-          ...compact({ error: fact.error }),
-        };
-        break;
-      case "step.skipped":
-        steps[fact.stepId] = {
-          stepId: fact.stepId,
-          status: "skipped",
-          attempts: 0,
-          output: null,
-        };
-        break;
-      case "step.reset":
-        delete steps[fact.stepId];
-        break;
-      case "step.retried":
-      case "step.abort-requested":
-      case "signal.sent":
-      case "signal.received":
-      case "once.recorded":
-      case "match.arm-selected":
-        break;
-    }
-  }
-
-  return {
-    runId,
-    flowId,
-    status,
-    steps,
-    facts,
-    ...compact({ flowHash, codeVersion }),
-  };
-}
+export { foldRun as projectRunState } from "./state";
 
 interface QueuedItem extends QueueMessage {
   readonly enqueuedAt: number;

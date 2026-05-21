@@ -8,6 +8,7 @@ import {
   nextRunnable,
   nextTransition,
 } from "../scheduler";
+import { unwrap } from "../state";
 import type { Fact, Flow, RunId, RunState } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
@@ -68,7 +69,7 @@ function linearFlow(): Flow {
       });
       const c = b.task({
         needs: { a },
-        run: async ({ needs }) => ({ tripled: needs.a.doubled * 3 }),
+        run: async ({ needs }) => ({ tripled: unwrap(needs.a).doubled * 3 }),
       });
       return { a, c };
     },
@@ -85,7 +86,7 @@ function gatedFlow(): Flow {
       });
       const branch = b.task({
         needs: { gate },
-        when: ({ needs }) => needs.gate.enabled,
+        when: ({ needs }) => unwrap(needs.gate).enabled,
         run: async () => ({ ran: true }),
       });
       return { gate, branch };
@@ -181,6 +182,7 @@ describe("nextRunnable", () => {
         runId: RUN,
         stepId: "a",
         attempt: 1,
+        stepKind: "task",
         at: new Date(),
       },
     ]);
@@ -335,6 +337,7 @@ function startedStepFact(stepId: string): Fact {
     runId: RUN,
     stepId,
     attempt: 1,
+    stepKind: "task",
     at: new Date(),
   };
 }

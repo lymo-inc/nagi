@@ -1,3 +1,5 @@
+import type { Resolved, RunState, StepState } from "./state";
+
 export type Json =
   | string
   | number
@@ -78,6 +80,15 @@ export type NeedsOutputs<N extends NeedsMap> = {
   readonly [K in keyof N]: StepOutput<N[K]>;
 };
 
+/**
+ * Handler-facing view of `needs`: each upstream is a {@link Resolved} value, so
+ * a `cascade: "continue"` skip (`{ tag: "skipped" }`) is distinct from an
+ * upstream that genuinely produced `null` (`{ tag: "value", value: null }`).
+ */
+export type ResolvedNeeds<N extends NeedsMap> = {
+  readonly [K in keyof N]: Resolved<StepOutput<N[K]>>;
+};
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface LogEntry {
@@ -142,7 +153,7 @@ interface StepConfigBase<Input, N extends NeedsMap> {
   readonly needs?: N;
   readonly when?: (args: {
     readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<NeedsOutputs<N>>;
+    readonly needs: NoInfer<ResolvedNeeds<N>>;
   }) => boolean;
   readonly timeoutMs?: Millis;
 }
@@ -152,7 +163,7 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
   readonly retry?: RetryPolicy;
   readonly run: (args: {
     readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<NeedsOutputs<N>>;
+    readonly needs: NoInfer<ResolvedNeeds<N>>;
     readonly ctx: StepCtx<NoInfer<Input>>;
   }) => Promise<Output>;
 
@@ -169,7 +180,7 @@ export interface StreamingTaskConfig<Input, N extends NeedsMap, Output, Chunk>
   readonly retry?: RetryPolicy;
   readonly run: (args: {
     readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<NeedsOutputs<N>>;
+    readonly needs: NoInfer<ResolvedNeeds<N>>;
     readonly ctx: StreamingStepCtx<NoInfer<Input>, Chunk>;
   }) => Promise<Output>;
 
@@ -193,7 +204,7 @@ export interface SignalConfig<
 export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {
   readonly when: (args: {
     readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<NeedsOutputs<N>>;
+    readonly needs: NoInfer<ResolvedNeeds<N>>;
   }) => boolean;
   readonly otherwise?: never;
   readonly build: (b: Builder<Input>) => M;
@@ -213,7 +224,7 @@ export type MatchArmShape<Input, N extends NeedsMap> =
   | {
       readonly when: (args: {
         readonly input: NoInfer<Input>;
-        readonly needs: NoInfer<NeedsOutputs<N>>;
+        readonly needs: NoInfer<ResolvedNeeds<N>>;
       }) => boolean;
       readonly otherwise?: never;
       readonly build: (b: Builder<Input>) => StepMap;
@@ -241,7 +252,7 @@ export interface SubflowConfig<Input, N extends NeedsMap, Child extends Flow>
   extends StepConfigBase<Input, N> {
   readonly input: (args: {
     readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<NeedsOutputs<N>>;
+    readonly needs: NoInfer<ResolvedNeeds<N>>;
   }) => FlowInput<Child>;
 }
 
@@ -580,7 +591,7 @@ export interface Store {
 
 export interface QueryRunsWhere<FlowId extends string = string> {
   readonly flowId?: FlowId;
-  readonly status?: RunStatus | ReadonlyArray<RunStatus>;
+  readonly status?: ReadonlyArray<RunStatus>;
   readonly input?: Record<string, Json>;
 }
 
@@ -756,6 +767,9 @@ export interface StepStartedFact extends FactBase {
   readonly kind: "step.started";
   readonly stepId: StepId;
   readonly attempt: AttemptNumber;
+  /** The step's kind, so the projection can fold a started step into the right
+   * state (running vs awaitingSignal vs awaitingChild) without the flow def. */
+  readonly stepKind: StepKind;
 }
 
 export interface StepCompletedFact extends FactBase {
@@ -784,6 +798,8 @@ export interface StepRetriedFact extends FactBase {
   readonly stepId: StepId;
   readonly attempt: AttemptNumber;
   readonly nextAttemptAt: Date;
+  /** The failure that triggered this retry; surfaces on the `backoff` state. */
+  readonly error: SerializedError;
 }
 
 export interface StepSkippedFact extends FactBase {
@@ -870,23 +886,12 @@ export type StepStatus =
   | "canceled"
   | "skipped";
 
-export interface StepState {
-  readonly stepId: StepId;
-  readonly status: StepStatus;
-  readonly attempts: AttemptNumber;
-  readonly output: Json;
-  readonly error?: SerializedError;
-}
-
-export interface RunState {
-  readonly runId: RunId;
-  readonly flowId: string;
-  readonly status: RunStatus;
-  readonly steps: Readonly<Record<StepId, StepState>>;
-  readonly facts: ReadonlyArray<Fact>;
-  readonly flowHash?: string;
-  readonly codeVersion?: string;
-}
+/**
+ * The projected run/step state machines are tagged unions defined in `state.ts`
+ * ({@link RunState} carries a `phase`; {@link StepState} a `tag`). Re-exported
+ * here so existing `from "./types"` imports keep resolving.
+ */
+export type { RunState, StepState };
 
 export type ReplayMode = "inspect" | "continue";
 

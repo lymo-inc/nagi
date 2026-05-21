@@ -178,7 +178,7 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     await h.wf.start(f, { videoId: "v1" });
 
     const firstStateBefore = await h.store.loadRunState(firstRunId);
-    expect(firstStateBefore.status).toBe("canceled");
+    expect(firstStateBefore.phase.tag).toBe("canceled");
 
     const drained = await h.drainOnce(8);
     expect(drained).toBeGreaterThan(0);
@@ -259,12 +259,12 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     });
 
     const before = await h.store.loadRunState(runId);
-    expect(before.status).toBe("canceled");
+    expect(before.phase.tag).toBe("canceled");
 
     await h.drain();
 
     const after = await h.store.loadRunState(runId);
-    expect(after.status).toBe("canceled");
+    expect(after.phase.tag).toBe("canceled");
     expect(
       after.facts.find((fact) => fact.kind === "step.started"),
     ).toBeUndefined();
@@ -303,12 +303,12 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
 
     await waitFor(async () => {
       const s = await h.store.loadRunState(firstRunId);
-      return s.steps["analyze"]?.status === "running";
+      return s.steps["analyze"]?.tag === "running";
     });
 
     await h.wf.start(f, { videoId: "v1" });
     const midState = await h.store.loadRunState(firstRunId);
-    expect(midState.status).toBe("canceled");
+    expect(midState.phase.tag).toBe("canceled");
 
     barrier.release();
     await dispatching;
@@ -355,7 +355,7 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
 
     await waitFor(async () => {
       const s = await h.store.loadRunState(firstRunId);
-      return s.steps["analyze"]?.status === "running";
+      return s.steps["analyze"]?.tag === "running";
     });
 
     await h.wf.start(f, { videoId: "v1" });
@@ -400,7 +400,7 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     const dispatching = h.drainOnce(1);
     await waitFor(async () => {
       const s = await h.store.loadRunState(firstRunId);
-      return s.steps["analyze"]?.status === "running";
+      return s.steps["analyze"]?.tag === "running";
     });
     await h.wf.start(f, { videoId: "v1" });
     barrier.release();

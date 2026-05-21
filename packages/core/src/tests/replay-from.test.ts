@@ -84,7 +84,7 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     const runId = await h.wf.start(f, {});
     await h.drain();
     const state = await h.store.loadRunState(runId);
-    expect(state.status).toBe("running");
+    expect(state.phase.tag).toBe("running");
 
     await expect(
       h.wf.replay(runId, { mode: "continue", from: "wait" }),
@@ -123,7 +123,7 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     expect(aRuns).toBe(1);
     expect(bRuns).toBe(1);
     const failed = await h.store.loadRunState(runId);
-    expect(failed.status).toBe("failed");
+    expect(failed.phase.tag).toBe("failed");
 
     bShouldFail = false;
     await h.wf.replay(runId, { mode: "continue", from: "a" });

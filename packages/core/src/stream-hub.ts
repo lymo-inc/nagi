@@ -186,14 +186,17 @@ export class InMemoryStreamHub {
    * Close the channel on `step.completed`: drain buffered events to each
    * subscriber, then end their iterators. No event emitted. Drops the replay
    * buffer and marks the channel closed so later subscribes yield nothing (D3).
+   *
+   * NB: this is a no-op when no channel exists. `InMemoryStore.appendFact` fires
+   * it for *every* `step.completed` fact — including non-streaming steps that
+   * never published — so creating a channel here would leak one per such step.
+   * Closed-ness is authoritative in the durable facts, not the hub, so a
+   * never-created channel is correct: `InMemoryStore.subscribeStream` consults
+   * the terminal fact before delegating here.
    */
   closeOk(runId: RunId, stepId: StepId): void {
     const channel = this.channels.get(InMemoryStreamHub.key(runId, stepId));
-    if (channel === undefined || channel.closed) {
-      // Ensure a channel that never saw a publish is still marked terminal.
-      this.getOrCreate(runId, stepId).closed = true;
-      return;
-    }
+    if (channel === undefined || channel.closed) return;
     channel.closed = true;
     channel.replay.length = 0;
     for (const sub of channel.subscribers) sub.close();
@@ -204,13 +207,13 @@ export class InMemoryStreamHub {
    * Close the channel on terminal `step.failed` (retries exhausted): fan out a
    * final `{ kind: "error", error }`, then end every iterator. Drops the replay
    * buffer and marks the channel closed (D3/O4).
+   *
+   * Like {@link closeOk}, a no-op when no channel exists (fired for every
+   * terminal `step.failed`, streaming or not — see that method's note).
    */
   closeError(runId: RunId, stepId: StepId, error: SerializedError): void {
     const channel = this.channels.get(InMemoryStreamHub.key(runId, stepId));
-    if (channel === undefined || channel.closed) {
-      this.getOrCreate(runId, stepId).closed = true;
-      return;
-    }
+    if (channel === undefined || channel.closed) return;
     channel.closed = true;
     channel.replay.length = 0;
     const event: StreamEvent<Json> = { kind: "error", error };
@@ -219,6 +222,25 @@ export class InMemoryStreamHub {
       sub.close();
     }
     channel.subscribers.clear();
+  }
+
+  /**
+   * Close *every* channel belonging to a run on a run-terminal fact
+   * (`flow.completed`/`flow.failed`/`flow.canceled`). Guarantees a subscriber to
+   * a skipped, typo'd, or never-emitting step never hangs past run end: any
+   * still-open channel for the run is drained and ended (clean close, no `error`
+   * event — per-step failures already surfaced their own `error` via
+   * {@link closeError}). A no-op for runs with no live channels.
+   */
+  closeRun(runId: RunId): void {
+    const prefix = `${runId}::`;
+    for (const [key, channel] of this.channels) {
+      if (!key.startsWith(prefix) || channel.closed) continue;
+      channel.closed = true;
+      channel.replay.length = 0;
+      for (const sub of channel.subscribers) sub.close();
+      channel.subscribers.clear();
+    }
   }
 
   /**

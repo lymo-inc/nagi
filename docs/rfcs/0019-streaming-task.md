@@ -1,6 +1,6 @@
 # RFC 0019 — `b.streamingTask`: streaming step outputs for LLM token streaming
 
-- **Status:** Draft — grilling complete (2026-05-21); decisions log AWAITING Jay's approval before implementation
+- **Status:** Accepted (2026-05-21, Jay — decisions resolved via grill). **Implemented: Phases A–D** (types/builder; in-memory broadcast hub; dispatch `emit` + lifecycle + `wf.subscribe` + capability gate; replay/retry/edge + type-d tests). Whole `@nagi-js/core` suite green (50 files · 743 tests · typecheck clean, 2026-05-22), composing with the committed core refactor + uncommitted RFC 0020. **Not committed / no PR** — held for your sequencing (intermixed with RFC 0020 in shared files). See `0019-streaming-task.handoff.md`.
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking:** GitHub issue #12 (note: RFC number ≠ issue number; RFC 0012 is `shorthand-concurrency-config`)
@@ -322,6 +322,35 @@ Chunk**, `StepKind` includes `"streaming"`. Files:
 `packages/core/src/tests/streaming-task.test.ts` and `.test-d.ts`. The in-memory
 harness (`test-helpers.ts: makeHarness`) is the vehicle; a `collect(iter)`
 helper drains a subscription.
+
+## Implementation notes (Phases A–C, 2026-05-21)
+
+Refinements made while implementing — all consistent with the decisions above;
+recorded so the log stays authoritative:
+
+- **Lifecycle is fact-driven inside `InMemoryStore`, zero new `Store` methods.**
+  `appendFact` (the single chokepoint) drives the hub: `step.completed`→`closeOk`,
+  `step.failed`→`closeError`, `step.retried`→`signalRetry(attempt+1)`, and the
+  run-terminal facts (`flow.completed`/`flow.failed`/`flow.canceled`)→`closeRun`.
+  This realizes D3 ("termination derived from durable facts") with no Store-port
+  bloat (only the Phase-A `subscribeStream?`/`publishChunk?` capability methods).
+- **Closed-ness is authoritative in the fact log, not the hub.** `closeOk`/
+  `closeError` no longer create channels (so non-streaming steps leak nothing);
+  `subscribeStream` returns an immediately-closed empty stream when the step or
+  the run is already terminal. This kills the "subscribe to a typo'd / silent /
+  skipped step hangs forever" failure mode.
+- **`emit` no-op after return** is enforced at the ctx boundary via an
+  `emitActive` flag flipped in a `finally` (not relying on the hub).
+- **`signalRetry` also clears the channel's replay buffer** so a `replayBuffered`
+  late subscriber can't replay a superseded attempt's chunks (extends D7's
+  ephemeral intent).
+- **`wf.subscribe` fail-loud (revised minor call):** instead of "throw on unknown
+  stepId" via run→flow resolution, it statically validates `stepId` against the
+  set of `kind:"streaming"` step ids across registered flows and throws
+  `NagiRuntimeError` on a typo / non-streaming id. Hangs from a run/flow mismatch
+  are still prevented by the run-terminal `closeRun` guard.
+- **Buffer caps:** `STREAM_SUBSCRIBER_BUFFER_CAP = STREAM_REPLAY_BUFFER_CAP =
+  256` (item-count bounds for v1; documented, tunable later).
 
 ## Alternatives considered
 

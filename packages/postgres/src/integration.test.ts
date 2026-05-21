@@ -410,7 +410,9 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       await seed("f", {}, "completed");
       await seed("f", {}, "failed");
 
-      const completed = await wf.queryRuns({ where: { status: "completed" } });
+      const completed = await wf.queryRuns({
+        where: { status: ["completed"] },
+      });
       expect(completed.runs).toHaveLength(1);
 
       const both = await wf.queryRuns({

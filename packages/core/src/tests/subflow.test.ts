@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
+import { outputOf, stepStateOf, unwrap } from "../state";
 import type { FlowStartedFact } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
@@ -26,8 +27,8 @@ describe("b.subflow — happy path", () => {
         const consume = b.task({
           needs: { sub },
           run: async ({ needs }) => ({
-            tripled: needs.sub.output.doubled * 1.5,
-            via: needs.sub.childRunId,
+            tripled: unwrap(needs.sub).output.doubled * 1.5,
+            via: unwrap(needs.sub).childRunId,
           }),
         });
         return { sub, consume };
@@ -63,7 +64,7 @@ describe("b.subflow — happy path", () => {
           : never
         : never,
     );
-    expect(childState.status).toBe("completed");
+    expect(childState.phase.tag).toBe("completed");
     expect(childState.flowId).toBe("child-double");
 
     const startedFact = childState.facts.find(
@@ -96,7 +97,7 @@ describe("b.subflow — happy path", () => {
           needs: { upstream },
           input: ({ input, needs }) => ({
             a: input.base,
-            b: needs.upstream.multiplier,
+            b: unwrap(needs.upstream).multiplier,
           }),
         });
         return { upstream, sub };
@@ -177,7 +178,7 @@ describe("b.subflow — nesting", () => {
         const inc = b.task({
           needs: { gc },
           run: async ({ needs }) => ({
-            result: needs.gc.output.squared + 1,
+            result: unwrap(needs.gc).output.squared + 1,
           }),
         });
         return { gc, inc };
@@ -213,7 +214,7 @@ describe("b.subflow — nesting", () => {
     ) as FlowStartedFact;
     expect(childStarted.parent?.runId).toBe(parentRunId);
 
-    const gcStepOutput = childState.steps["gc"]?.output as {
+    const gcStepOutput = outputOf(stepStateOf(childState, "gc")) as {
       childRunId: string;
     };
     const gcState = await h.store.loadRunState(
@@ -265,15 +266,17 @@ describe("b.subflow — cancel cascade", () => {
     expect(gcIds.length).toBe(1);
     const gcRunId = gcIds[0] as never;
 
-    expect((await h.store.loadRunState(parentRunId)).status).toBe("running");
-    expect((await h.store.loadRunState(childRunId)).status).toBe("running");
-    expect((await h.store.loadRunState(gcRunId)).status).toBe("running");
+    expect((await h.store.loadRunState(parentRunId)).phase.tag).toBe("running");
+    expect((await h.store.loadRunState(childRunId)).phase.tag).toBe("running");
+    expect((await h.store.loadRunState(gcRunId)).phase.tag).toBe("running");
 
     await h.wf.cancel(parentRunId, { reason: "user pressed cancel" });
 
-    expect((await h.store.loadRunState(parentRunId)).status).toBe("canceled");
-    expect((await h.store.loadRunState(childRunId)).status).toBe("canceled");
-    expect((await h.store.loadRunState(gcRunId)).status).toBe("canceled");
+    expect((await h.store.loadRunState(parentRunId)).phase.tag).toBe(
+      "canceled",
+    );
+    expect((await h.store.loadRunState(childRunId)).phase.tag).toBe("canceled");
+    expect((await h.store.loadRunState(gcRunId)).phase.tag).toBe("canceled");
   });
 
   it("wf.cancel(child) propagates upward — parent's subflow step fails", async () => {
@@ -303,7 +306,7 @@ describe("b.subflow — cancel cascade", () => {
     await h.wf.cancel(childRunId as never, { reason: "operator cancel" });
     await h.drain();
 
-    expect((await h.store.loadRunState(childRunId as never)).status).toBe(
+    expect((await h.store.loadRunState(childRunId as never)).phase.tag).toBe(
       "canceled",
     );
     const parentResult = await h.result(parentRunId);
@@ -324,10 +327,10 @@ describe("b.subflow — cancel cascade", () => {
     const h = await makeHarness([child]);
     const runId = await h.wf.start(child, { x: 1 });
     await h.drain();
-    expect((await h.store.loadRunState(runId)).status).toBe("completed");
+    expect((await h.store.loadRunState(runId)).phase.tag).toBe("completed");
     await h.wf.cancel(runId);
     const state = await h.store.loadRunState(runId);
-    expect(state.status).toBe("completed");
+    expect(state.phase.tag).toBe("completed");
     expect(state.facts.filter((f) => f.kind === "flow.canceled").length).toBe(
       0,
     );

@@ -209,6 +209,68 @@ describe("InMemoryStreamHub — early break cleanup", () => {
   });
 });
 
+describe("InMemoryStreamHub — close*/closeRun never create a channel (leak-free)", () => {
+  // RFC 0019 Phase C: appendFact fires closeOk/closeError/closeRun for EVERY
+  // step/run, streaming or not. If those created a channel per non-streaming
+  // step, the hub would leak one channel per step in the system. They must be
+  // pure no-ops when no channel exists; closed-ness is authoritative in the
+  // durable facts (asserted at the store level), not the hub.
+  it("closeOk on a never-published channel does not create one (subscribe stays live)", async () => {
+    const hub = new InMemoryStreamHub();
+    hub.closeOk(RUN, STEP); // no channel exists → no-op, nothing created
+
+    // Because no channel was created+closed, a subsequent subscribe is a fresh,
+    // OPEN channel that delivers live chunks (the store's fact guard, not the
+    // hub, is what makes subscribe-after-terminal empty).
+    const got = collect(hub.subscribeStream(RUN, STEP));
+    await tick();
+    hub.publishChunk(RUN, STEP, "live");
+    hub.closeOk(RUN, STEP);
+    expect(await got).toEqual([{ kind: "chunk", chunk: "live" }]);
+  });
+
+  it("closeError / closeRun on a never-published channel are safe no-ops", () => {
+    const hub = new InMemoryStreamHub();
+    expect(() =>
+      hub.closeError(RUN, STEP, { name: "E", message: "m" }),
+    ).not.toThrow();
+    expect(() => hub.closeRun(RUN)).not.toThrow();
+  });
+
+  it("closeRun closes every open channel of a run (clean close, no error event)", async () => {
+    const hub = new InMemoryStreamHub();
+    const stepA = "a" as StepId;
+    const stepB = "b" as StepId;
+    const onA = collect(hub.subscribeStream(RUN, stepA));
+    const onB = collect(hub.subscribeStream(RUN, stepB));
+    hub.publishChunk(RUN, stepA, "a1");
+    hub.publishChunk(RUN, stepB, "b1");
+
+    hub.closeRun(RUN);
+
+    // Both channels drained and ended; no error event injected by closeRun.
+    expect(await onA).toEqual([{ kind: "chunk", chunk: "a1" }]);
+    expect(await onB).toEqual([{ kind: "chunk", chunk: "b1" }]);
+  });
+
+  it("closeRun does not touch another run's channel", async () => {
+    const hub = new InMemoryStreamHub();
+    const runX = "run-x" as RunId;
+    const runY = "run-y" as RunId;
+    const onY = collect(hub.subscribeStream(runY, STEP));
+
+    hub.publishChunk(runY, STEP, "y1");
+    hub.closeRun(runX); // unrelated run — must not close runY's channel
+    hub.publishChunk(runY, STEP, "y2");
+    hub.closeOk(runY, STEP);
+
+    expect(await onY).toEqual([
+      { kind: "chunk", chunk: "y1" },
+      { kind: "chunk", chunk: "y2" },
+    ]);
+  });
+});
+
 describe("InMemoryStreamHub — scoping by (runId, stepId)", () => {
   it("a publish to (run, stepA) is not seen by a subscriber of (run, stepB)", async () => {
     const hub = new InMemoryStreamHub();

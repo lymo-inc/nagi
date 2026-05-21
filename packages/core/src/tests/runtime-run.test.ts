@@ -58,7 +58,7 @@ describe("nagi.run — shape & worker", () => {
     });
     const runId = await handle.wf.start(echo, { x: 7 });
     await vi.waitFor(async () => {
-      expect((await store.loadRunState(runId)).status).toBe("completed");
+      expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
     });
     await handle.stop();
   });
@@ -137,7 +137,7 @@ describe("nagi.run — graceful vs crash", () => {
     });
     const runId = await handle.wf.start(echo, { x: 5 });
     await vi.waitFor(async () => {
-      expect((await store.loadRunState(runId)).status).toBe("completed");
+      expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
     });
     await handle.stop();
     expect(errors()).toHaveLength(0);
@@ -208,7 +208,7 @@ describe("nagi.run — back-compat", () => {
     const loop = worker.run();
     const runId = await wf.start(echo, { x: 9 });
     await vi.waitFor(async () => {
-      expect((await store.loadRunState(runId)).status).toBe("completed");
+      expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
     });
     ac.abort();
     await loop;

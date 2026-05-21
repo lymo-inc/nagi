@@ -5,6 +5,7 @@ import {
   InMemoryStore,
   nagi,
   type RunId,
+  unwrap,
 } from "@nagi-js/core";
 import {
   BasicTracerProvider,
@@ -50,7 +51,7 @@ async function runToEnd(
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const state = await store.loadRunState(runId);
-      if (state.status === "completed" || state.status === "failed")
+      if (state.phase.tag === "completed" || state.phase.tag === "failed")
         return state;
       await new Promise((res) => setTimeout(res, 5));
     }
@@ -72,7 +73,7 @@ describe("@nagi-js/otel — end-to-end against a real nagi runtime", () => {
         });
         const c = b.task({
           needs: { a },
-          run: async ({ needs }) => ({ tripled: needs.a.doubled * 3 }),
+          run: async ({ needs }) => ({ tripled: unwrap(needs.a).doubled * 3 }),
         });
         return { a, c };
       },
@@ -92,7 +93,7 @@ describe("@nagi-js/otel — end-to-end against a real nagi runtime", () => {
 
     const runId = await wf.start(f, { x: 7 });
     const state = await runToEnd(wf, store, runId);
-    expect(state.status).toBe("completed");
+    expect(state.phase.tag).toBe("completed");
 
     const spans = exporter.getFinishedSpans();
     const flowSpan = spans.find((s) => s.name === "flow otel-two-step");

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { computeBackoff } from "../dispatch";
+import { unwrap } from "../state";
 import type {
   FlowCompleteEvent,
   FlowErrorEvent,
@@ -75,7 +76,7 @@ describe("dispatchMessage — driver", () => {
         const a = b.task({ run: async () => ({ v: 10 }) });
         const c = b.task({
           needs: { a },
-          run: async ({ needs }) => ({ doubled: needs.a.v * 2 }),
+          run: async ({ needs }) => ({ doubled: unwrap(needs.a).v * 2 }),
         });
         return { a, c };
       },
@@ -189,7 +190,7 @@ describe("dispatchMessage — driver", () => {
         });
         const c = b.task({
           needs: { a },
-          run: async ({ needs }) => ({ tripled: needs.a.doubled * 3 }),
+          run: async ({ needs }) => ({ tripled: unwrap(needs.a).doubled * 3 }),
         });
         return { a, c };
       },

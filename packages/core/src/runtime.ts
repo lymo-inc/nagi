@@ -25,6 +25,13 @@ import {
 } from "./internal";
 import { InMemoryClock } from "./memory";
 import { descendantsOf, stepStateOf } from "./scheduler";
+import {
+  attemptOf,
+  isStepTerminal,
+  isTerminalRun,
+  runStatusOf,
+  stepStatusOf,
+} from "./state";
 import type {
   Clock,
   Fact,
@@ -55,6 +62,7 @@ import type {
   StandardSchemaV1,
   StepId,
   Store,
+  StreamEvent,
   Trigger,
   Worker,
   WorkerConfig,
@@ -113,6 +121,25 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
   queryRuns(
     opts?: QueryRunsOpts<FlowIdOf<TFlows>>,
   ): Promise<QueryRunsResult<FlowIdOf<TFlows>>>;
+
+  /**
+   * Subscribe to the ephemeral chunk stream of a `b.streamingTask` step (RFC
+   * 0019). Returns a {@link StreamEvent} envelope iterable: `chunk` for each
+   * `ctx.emit`, `retry` between attempts, a final `error` on terminal failure,
+   * `dropped` on per-subscriber lag. The iterator ends when the step (or run)
+   * reaches a terminal fact — so a `for await` never hangs.
+   *
+   * Future-only by default; pass `{ replayBuffered: true }` for best-effort
+   * delivery of buffered chunks to a late subscriber (the buffer is dropped at
+   * terminal). `C` is caller-asserted (O6); the producer side infers its chunk
+   * type from the handler. Throws `NagiRuntimeError` if `stepId` is not a
+   * `streaming` step in any registered flow (fail-loud on typos).
+   */
+  subscribe<C = Json>(
+    runId: RunId,
+    stepId: StepId,
+    opts?: { readonly replayBuffered?: boolean },
+  ): AsyncIterable<StreamEvent<C>>;
 
   operator(): Operator;
 
@@ -214,6 +241,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
   const flowsById = new Map<string, Flow>();
   const flowHashById = new Map<string, string>();
+  // RFC 0019: the set of stepIds that name a `streaming` step in SOME registered
+  // flow. `wf.subscribe` validates against this to fail loud on typo'd stepIds.
+  const streamingStepIds = new Set<string>();
   for (const f of config.flows) {
     if (flowsById.has(f.id)) {
       throw new NagiRuntimeError(
@@ -221,6 +251,24 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       );
     }
     flowsById.set(f.id, f);
+
+    // RFC 0019 D4: gate the streaming capability at registration (boot-time),
+    // mirroring Queue.ensureSchema. A flow with a `streaming` step against a
+    // store that can't fan out chunks (no subscribeStream) must fail here, never
+    // silently at first dispatch. Also record streaming stepIds for subscribe's
+    // static validation.
+    for (const [stepId, step] of Object.entries(asStepMapWithDefs(f.steps))) {
+      if (getDef(step).kind !== "streaming") continue;
+      streamingStepIds.add(stepId);
+      if (config.store.subscribeStream === undefined) {
+        throw new NagiRuntimeError(
+          `Flow "${f.id}" has a streaming step "${stepId}" (b.streamingTask), ` +
+            `but the configured store does not implement subscribeStream — ` +
+            `it cannot transport ephemeral chunks. Use a store with streaming ` +
+            `support (e.g. the in-memory store) or remove the streaming step.`,
+        );
+      }
+    }
 
     const dag = await canonicalize(f);
     const flowHash = await sha256Canonical(dag);
@@ -416,15 +464,11 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     args: CancelArgs,
   ): Promise<void> {
     const state = await config.store.loadRunState(runId);
-    if (
-      state.status === "completed" ||
-      state.status === "failed" ||
-      state.status === "canceled"
-    ) {
+    if (isTerminalRun(state)) {
       emitLog({
         level: "info",
         msg: "nagi: cancel skipped — run already terminal",
-        attrs: { runId, status: state.status },
+        attrs: { runId, status: runStatusOf(state) },
       });
       return;
     }
@@ -549,8 +593,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       }
       const { stepId, def } = resolved;
       const stepState = stepStateOf(runState, stepId);
-      if (stepState.status !== "running") {
-        if (stepState.status === "completed") {
+      if (stepState.tag !== "awaitingSignal") {
+        if (stepState.tag === "completed") {
           emitLog({
             level: "info",
             msg: "nagi: signal arrived after step resolved",
@@ -559,12 +603,12 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
           return;
         }
         throw new NagiRuntimeError(
-          `Step "${stepId}" is not waiting for signal (status: ${stepState.status}).`,
+          `Step "${stepId}" is not waiting for signal (status: ${stepStatusOf(stepState)}).`,
         );
       }
 
       const validated = (await validate(def.schema, payload)) as Json;
-      const attempt = stepState.attempts > 0 ? stepState.attempts : 1;
+      const attempt = stepState.attempt;
       const carriesAlias = signalName !== stepId;
 
       await config.store.appendFact(runId, {
@@ -641,7 +685,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
           `Run ${runId} references flow "${runState.flowId}" which is not registered with nagi().`,
         );
       }
-      if (runState.status === "canceled") {
+      if (runState.phase.tag === "canceled") {
         throw new NagiRuntimeError(
           `Run ${runId} was canceled (superseded by a newer run with the same concurrency key). ` +
             `Replay is not supported for canceled runs — start a new run instead.`,
@@ -684,7 +728,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       }
 
       if (opts.from !== undefined) {
-        if (runState.status === "running") {
+        if (runState.phase.tag === "running") {
           throw new NagiRuntimeError(
             `Run ${runId} is still running — replay({ from }) would race in-flight workers. ` +
               `Wait for the run to settle (completed / failed) before resetting from a step.`,
@@ -732,6 +776,31 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         }
       }
       return config.store.queryRuns(opts);
+    },
+
+    subscribe<C = Json>(
+      runId: RunId,
+      stepId: StepId,
+      opts?: { readonly replayBuffered?: boolean },
+    ): AsyncIterable<StreamEvent<C>> {
+      // Fail loud on a typo'd / non-streaming stepId (RFC 0019). The capability
+      // throw at registration guarantees subscribeStream is present whenever a
+      // streaming step exists, so the `!` is sound once this check passes.
+      if (!streamingStepIds.has(stepId)) {
+        throw new NagiRuntimeError(
+          `wf.subscribe: step "${stepId}" is not a streaming step ` +
+            `(b.streamingTask) in any registered flow. ` +
+            `Only streaming steps can be subscribed to.`,
+        );
+      }
+      // O6: C is caller-asserted; the store yields StreamEvent<Json>. This single
+      // cast bridges the Json→C assertion (the runtime can't cross-check a
+      // runtime stepId against the producer's inferred chunk type).
+      return config.store.subscribeStream!(
+        runId,
+        stepId,
+        opts,
+      ) as AsyncIterable<StreamEvent<C>>;
     },
 
     async pruneFacts(opts: PruneOpts): Promise<PruneResult> {
@@ -950,26 +1019,17 @@ function makeOperator(o: OperatorDeps): Operator {
       ]);
     }
     const stepState = stepStateOf(state, stepId);
-    if (
-      stepState.status === "completed" ||
-      stepState.status === "failed" ||
-      stepState.status === "skipped" ||
-      stepState.status === "canceled"
-    ) {
+    if (isStepTerminal(stepState)) {
       emitLog({
         level: "info",
         msg: "nagi: operator.skip noop — step already terminal",
-        attrs: { runId, stepId, status: stepState.status },
+        attrs: { runId, stepId, status: stepStatusOf(stepState) },
       });
       return;
     }
-    if (
-      state.status === "completed" ||
-      state.status === "failed" ||
-      state.status === "canceled"
-    ) {
+    if (isTerminalRun(state)) {
       throw new NagiRuntimeError(
-        `operator.skip: run ${runId} is already terminal (${state.status}); cannot skip step "${stepId}".`,
+        `operator.skip: run ${runId} is already terminal (${runStatusOf(state)}); cannot skip step "${stepId}".`,
       );
     }
     const fact: Fact = {
@@ -997,22 +1057,9 @@ function makeOperator(o: OperatorDeps): Operator {
       const s = await store.loadRunState(runId);
       const ss = s.steps[stepId];
       if (ss === undefined) return;
-      if (
-        ss.status === "completed" ||
-        ss.status === "failed" ||
-        ss.status === "skipped" ||
-        ss.status === "canceled"
-      ) {
-        return;
-      }
-      if (
-        s.status === "completed" ||
-        s.status === "failed" ||
-        s.status === "canceled"
-      ) {
-        return;
-      }
-      if (ss.attempts > attempt) return;
+      if (isStepTerminal(ss)) return;
+      if (isTerminalRun(s)) return;
+      if (attemptOf(ss) > attempt) return;
       await new Promise((r) => setTimeout(r, 50));
     }
     throw new NagiRuntimeError(
@@ -1035,7 +1082,7 @@ function makeOperator(o: OperatorDeps): Operator {
       ]);
     }
     const state = await store.loadRunState(runId);
-    if (state.status === "canceled") {
+    if (state.phase.tag === "canceled") {
       throw new NagiRuntimeError(
         `operator.retry: run ${runId} is canceled; cannot retry. Start a new run instead.`,
       );
@@ -1051,18 +1098,18 @@ function makeOperator(o: OperatorDeps): Operator {
     }
     const stepState = stepStateOf(state, stepId);
 
-    if (stepState.status === "running") {
+    if (stepState.tag === "running") {
       const abortFact: Fact = {
         kind: "step.abort-requested",
         runId,
         at: clock.now(),
         stepId,
-        attempt: stepState.attempts,
+        attempt: stepState.attempt,
         actor: opts.actor,
         ...compact({ note: opts.note }),
       };
       await store.appendFact(runId, abortFact);
-      await waitForStepToSettle(runId, stepId, stepState.attempts, 30_000);
+      await waitForStepToSettle(runId, stepId, stepState.attempt, 30_000);
     }
 
     const cascade = descendantsOf(flow, stepId);

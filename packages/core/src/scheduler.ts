@@ -2,10 +2,16 @@ import {
   asStepMapWithDefs,
   getDef,
   needsStepIds,
-  readSelectedArm,
   resolveNeeds,
   type StepDef,
 } from "./internal";
+import {
+  attemptOf,
+  isStepTerminal,
+  outputOf,
+  resolvedOf,
+  stepStateOf,
+} from "./state";
 import type {
   AttemptNumber,
   Fact,
@@ -14,8 +20,9 @@ import type {
   RunState,
   SerializedError,
   StepId,
-  StepState,
 } from "./types";
+
+export { stepStateOf };
 
 export type SkipReason = "when-false" | "transitive";
 
@@ -35,21 +42,6 @@ export interface ScheduleArgs {
   readonly input: unknown;
 }
 
-/**
- * Total read of step state: a step with no projected fact yet reads as the
- * explicit `pending` variant, so engine logic never special-cases absence.
- */
-export function stepStateOf(runState: RunState, stepId: StepId): StepState {
-  return (
-    runState.steps[stepId] ?? {
-      stepId,
-      status: "pending",
-      attempts: 0,
-      output: null,
-    }
-  );
-}
-
 export function nextRunnable({
   flow,
   runState,
@@ -60,7 +52,7 @@ export function nextRunnable({
 
   for (const [stepId, step] of Object.entries(asStepMapWithDefs(flow.steps))) {
     const state = stepStateOf(runState, stepId);
-    if (state.status !== "pending") continue;
+    if (state.tag !== "pending") continue;
 
     const def = getDef(step);
 
@@ -80,7 +72,9 @@ export function nextRunnable({
 
     const when = def.kind === "match" ? undefined : def.when;
     if (when) {
-      const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
+      const needs = resolveNeeds(def, (id) =>
+        resolvedOf(stepStateOf(runState, id)),
+      );
       const shouldRun = when({ input, needs });
       if (!shouldRun) {
         skip.push({ stepId, reason: "when-false" });
@@ -99,12 +93,12 @@ type UpstreamStatus = "ready" | "blocked" | "transitive-skip";
 function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
   for (const upstream of Object.values(def.needs)) {
     const upstreamState = stepStateOf(runState, upstream.id);
-    if (upstreamState.status === "completed") continue;
-    if (upstreamState.status === "skipped") {
-      if (manualSkipCascade(upstream.id, runState) === "continue") continue;
+    if (upstreamState.tag === "completed") continue;
+    if (upstreamState.tag === "skipped") {
+      if (upstreamState.cascade === "continue") continue;
       return "transitive-skip";
     }
-    if (upstreamState.status === "failed") {
+    if (upstreamState.tag === "failed") {
       return "transitive-skip";
     }
     return "blocked";
@@ -112,31 +106,16 @@ function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
   return "ready";
 }
 
-function manualSkipCascade(
-  stepId: StepId,
-  runState: RunState,
-): "skip" | "continue" {
-  for (let i = runState.facts.length - 1; i >= 0; i--) {
-    const f = runState.facts[i];
-    if (f === undefined) continue;
-    if (f.kind !== "step.skipped") continue;
-    if (f.stepId !== stepId) continue;
-    if (f.reason !== "manual") return "skip";
-    return f.cascade ?? "skip";
-  }
-  return "skip";
-}
-
 function checkParentMatch(def: StepDef, runState: RunState): UpstreamStatus {
   if (!def.parentMatch) return "ready";
   const { matchId, armId } = def.parentMatch;
 
   const parentState = stepStateOf(runState, matchId);
-  if (parentState.status === "failed" || parentState.status === "skipped") {
+  if (parentState.tag === "failed" || parentState.tag === "skipped") {
     return "transitive-skip";
   }
 
-  const selected = readSelectedArm(matchId, runState);
+  const selected = runState.selectedArms[matchId] ?? null;
   if (selected === null) return "blocked";
   return selected === armId ? "ready" : "transitive-skip";
 }
@@ -159,7 +138,7 @@ export function aggregateMatch(
   const def = getDef(step);
   if (def.kind !== "match") return { kind: "pending" };
 
-  const selected = readSelectedArm(matchId, runState);
+  const selected = runState.selectedArms[matchId] ?? null;
   if (selected === null) return { kind: "pending" };
 
   const arm = def.arms.find((a) => a.id === selected);
@@ -171,17 +150,17 @@ export function aggregateMatch(
 
   for (const stepId of arm.stepIds) {
     const state = stepStateOf(runState, stepId);
-    if (state.status === "pending" || state.status === "running") {
+    if (!isStepTerminal(state)) {
       allTerminal = false;
       continue;
     }
-    if (state.status === "failed") {
+    if (state.tag === "failed") {
       return { kind: "fail-fast", failedStepId: stepId };
     }
     const localKey = stepId.startsWith(stripPrefix)
       ? stepId.slice(stripPrefix.length)
       : stepId;
-    output[localKey] = state.status === "completed" ? state.output : null;
+    output[localKey] = outputOf(state);
   }
 
   if (!allTerminal) return { kind: "pending" };
@@ -201,11 +180,11 @@ export function flowTermination(
   let failed = false;
   for (const stepId of Object.keys(flow.steps)) {
     const state = stepStateOf(runState, stepId);
-    if (state.status === "pending" || state.status === "running") {
+    if (!isStepTerminal(state)) {
       done = false;
       break;
     }
-    if (state.status === "failed") failed = true;
+    if (state.tag === "failed") failed = true;
   }
   return { done, failed };
 }
@@ -263,18 +242,21 @@ function readyPromotions(flow: Flow, runState: RunState): MatchPromotion[] {
     const def = getDef(step);
     if (def.kind !== "match") continue;
     const state = stepStateOf(runState, matchId);
-    if (state.status !== "running") continue;
+    if (state.tag !== "running") continue;
 
     const agg = aggregateMatch(matchId, flow, runState);
     if (agg.kind === "pending") continue;
 
-    const attempt: AttemptNumber = state.attempts > 0 ? state.attempts : 1;
+    const attempt: AttemptNumber = attemptOf(state);
     if (agg.kind === "fail-fast") {
       const failedNested = stepStateOf(runState, agg.failedStepId);
-      const error: SerializedError = failedNested.error ?? {
-        name: "Error",
-        message: `match "${matchId}": chosen-arm step "${agg.failedStepId}" failed`,
-      };
+      const error: SerializedError =
+        failedNested.tag === "failed"
+          ? failedNested.error
+          : {
+              name: "Error",
+              message: `match "${matchId}": chosen-arm step "${agg.failedStepId}" failed`,
+            };
       out.push({
         matchId: matchId as StepId,
         attempt,
@@ -292,10 +274,10 @@ function readyPromotions(flow: Flow, runState: RunState): MatchPromotion[] {
 }
 
 function flowFailureError(runState: RunState): SerializedError {
-  const failedStep = Object.values(runState.steps).find(
-    (s) => s.status === "failed",
-  );
-  return failedStep?.error ?? { name: "Error", message: "step failed" };
+  for (const s of Object.values(runState.steps)) {
+    if (s.tag === "failed") return s.error;
+  }
+  return { name: "Error", message: "step failed" };
 }
 
 export function isFlowTerminal(facts: readonly Fact[]): boolean {
@@ -317,7 +299,7 @@ export function computeFlowOutput(flow: Flow, runState: RunState): Json {
   if (flow.output === undefined) return null;
   const stepOutputs: Record<string, Json> = {};
   for (const [sid, sstate] of Object.entries(runState.steps)) {
-    if (sstate.status === "completed") stepOutputs[sid] = sstate.output;
+    if (sstate.tag === "completed") stepOutputs[sid] = sstate.output;
   }
   return flow.output(stepOutputs as never) as Json;
 }
