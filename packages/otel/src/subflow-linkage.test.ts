@@ -178,7 +178,15 @@ describe("otelHooks — subflow span linkage", () => {
 
   it("records nagi.parent.run.id, nagi.parent.step.id, nagi.parent.step.attempt as attributes when event.parent is set", async () => {
     const hooks = makeHooks();
-    registerParentStepSpan();
+    // Register the parent step span at attempt 3 so the lookup key actually
+    // hits — this proves the attempt threads into stepKey, not just attr 1.
+    const parentStepSpan = provider
+      .getTracer("@nagi-js/otel-subflow-linkage-tests")
+      .startSpan("step subflowStep", {
+        kind: SpanKind.INTERNAL,
+        startTime: at,
+      });
+    stepSpanRegistry.set(stepKey(parentRunId, parentStepId, 3), parentStepSpan);
     await hooks.onFlowStart!(
       childFlowStart({
         parent: { runId: parentRunId, stepId: parentStepId, attempt: 3 },
@@ -190,6 +198,7 @@ describe("otelHooks — subflow span linkage", () => {
       at,
       output: null,
     });
+    parentStepSpan.end(at);
 
     const spans = exporter.getFinishedSpans();
     const childSpan = bySpanName(spans, `flow ${childFlowId}`);
@@ -198,6 +207,8 @@ describe("otelHooks — subflow span linkage", () => {
       "nagi.parent.step.id": parentStepId,
       "nagi.parent.step.attempt": 3,
     });
+    // Nesting resolved via the attempt-3 key, confirming attempt is used.
+    expect(childSpan!.parentSpanId).toBe(parentStepSpan.spanContext().spanId);
   });
 
   it("does not record parent attributes when event.parent is undefined", async () => {

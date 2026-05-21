@@ -1,11 +1,12 @@
 # RFC 0010 — OTel parent-span linkage for subflow runs
 
-- **Status:** Draft
+- **Status:** Implemented (2026-05-21 JST) — `@nagi-js/otel` 54/54 tests pass, typecheck clean. See `0010-otel-subflow-span-linkage.handoff.md`.
 - **Author:** @jay (lymo-inc)
 - **Created:** 2026-05-20 (JST)
 - **Tracking issue:** lymo-inc/nagi#10 (follow-up — main runtime shipped in `c4e1459`)
 - **Related:** `docs/research/issue-10-subflow-runtime.md`, RFC 0004 (style template), `@nagi-js/otel`
 - **Decisions log:** authoritative — see "Decisions taken" below.
+- **Deferred (documented in handoff):** integration tests (items 8–10), type-d tests (items 11–12), cross-process `traceparent`, `FlowStartedFact` struct migration.
 
 ## Summary
 
