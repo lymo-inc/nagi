@@ -1,5 +1,6 @@
 import type {
   Json,
+  LogEntry,
   Millis,
   NeedsMap,
   RetryPolicy,
@@ -12,7 +13,49 @@ import type {
   StepMap,
   StepRetryEvent,
   StepStartEvent,
+  StreamingStepCtx,
 } from "./types";
+
+/**
+ * Internal emit choke point. Built once from {@link NagiConfig.onLog} and
+ * threaded everywhere a diagnostic is produced. Always a callable (a no-op when
+ * `onLog` is absent), so call sites never branch on its presence. Kept out of
+ * the public API surface (not re-exported from `index.ts`).
+ */
+export type EmitLog = (entry: LogEntry) => void;
+
+/**
+ * Wrap the host's `onLog` into the {@link EmitLog} choke point. When `onLog` is
+ * absent the result is a no-op and no {@link LogEntry} is constructed upstream
+ * (D3: silent by default). A throwing sink is swallowed so logging can never
+ * fail a workflow step (D5).
+ */
+export function makeEmit(onLog?: (entry: LogEntry) => void): EmitLog {
+  if (!onLog) return () => {};
+  return (entry) => {
+    try {
+      onLog(entry);
+    } catch {
+      /* D5: swallow; logging never fails a step */
+    }
+  };
+}
+
+/**
+ * Drop keys whose value is `undefined`, turning a `{ x: T | undefined }` bag
+ * into `{ x?: T }`. The single home for the `exactOptionalPropertyTypes`
+ * bridge, replacing per-field `...(x !== undefined ? { x } : {})` spreads. Pass
+ * only optional fields; keep required fields as explicit literal properties.
+ */
+export type Compacted<T> = { [K in keyof T]?: Exclude<T[K], undefined> };
+
+export function compact<T extends object>(obj: T): Compacted<T> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value !== undefined) out[key] = value;
+  }
+  return out as Compacted<T>;
+}
 
 export interface ParentMatchRef {
   readonly matchId: string;
@@ -32,6 +75,28 @@ export interface TaskDef {
     input: unknown;
     needs: Record<string, unknown>;
     ctx: StepCtx<unknown>;
+  }) => Promise<Json>;
+  readonly parentMatch?: ParentMatchRef;
+
+  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
+  readonly onComplete?: (event: StepCompleteEvent) => void | Promise<void>;
+  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
+  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
+}
+
+export interface StreamingTaskDef {
+  readonly kind: "streaming";
+  readonly needs: NeedsMap;
+  readonly retry?: RetryPolicy;
+  readonly timeoutMs?: Millis;
+  readonly when?: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+  }) => boolean;
+  readonly run: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+    ctx: StreamingStepCtx<unknown>;
   }) => Promise<Json>;
   readonly parentMatch?: ParentMatchRef;
 
@@ -110,33 +175,49 @@ export interface SubflowDef {
   readonly parentMatch?: ParentMatchRef;
 }
 
-export type StepDef = TaskDef | SignalDef | MatchDef | SubflowDef;
+export type StepDef =
+  | TaskDef
+  | StreamingTaskDef
+  | SignalDef
+  | MatchDef
+  | SubflowDef;
 
-const DEF = "__def" as const;
+export const DEF = Symbol("nagi.def");
 
 export type StepWithDef<Output = unknown> = Step<Output> & {
-  readonly [DEF]: StepDef;
+  readonly [DEF]: StepDef | PendingMatchDef;
 };
 
 export function attachDef<Output>(
   meta: { readonly kind: StepDef["kind"]; readonly id: string },
-  def: StepDef,
+  def: StepDef | PendingMatchDef,
 ): StepWithDef<Output> {
   return { kind: meta.kind, id: meta.id, [DEF]: def };
 }
 
-export function attachDefMut(step: Step<unknown>, def: StepDef): void {
-  (step as unknown as { [DEF]: StepDef })[DEF] = def;
+export function setDef(step: StepWithDef, def: StepDef): void {
+  (step as { [DEF]: StepDef })[DEF] = def;
 }
 
-export function getDef(step: Step<unknown>): StepDef {
-  const def = (step as Partial<StepWithDef>)[DEF];
-  if (def === undefined) {
-    throw new Error(
-      `Step "${step.id}" has no internal definition. Construct steps via the builder.`,
-    );
-  }
-  return def;
+/**
+ * Read a step's def in the runtime/projection phase, where {@link walkAndRewrite}
+ * has already finalized every match into a {@link MatchDef}. The stored slot is
+ * widened to admit the builder-only {@link PendingMatchDef}; narrowing it back to
+ * {@link StepDef} here is the single phase boundary, so runtime callers never
+ * have to consider the pending shape.
+ */
+export function getDef(step: StepWithDef): StepDef {
+  return step[DEF] as StepDef;
+}
+
+/**
+ * Read a step's def during the builder phase, where a match still carries its
+ * pre-walk {@link PendingMatchDef}. Runtime code should use {@link getDef}.
+ */
+export function peekDef(
+  step: Step<unknown>,
+): StepDef | PendingMatchDef | undefined {
+  return (step as Partial<StepWithDef>)[DEF];
 }
 
 export function isStepKind(def: StepDef, kind: StepDef["kind"]): boolean {

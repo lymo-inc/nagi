@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryClock, InMemoryTrigger } from "./memory";
-import type { RunId, StepId } from "./types";
+import { InMemoryClock, InMemoryTrigger } from "../memory";
+import type { RunId, StepId } from "../types";
 
 describe("InMemoryClock — wake-up via Trigger", () => {
   it("fires the trigger when a scheduled `at` elapses", async () => {

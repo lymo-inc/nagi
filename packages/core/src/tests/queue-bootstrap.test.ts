@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { type DispatchDeps, dispatchMessage } from "./dispatch";
-import { InMemoryQueue, InMemoryStore } from "./memory";
-import { nagi } from "./runtime";
+import { flow } from "../builder";
+import { type DispatchDeps, dispatchMessage } from "../dispatch";
+import { InMemoryQueue, InMemoryStore } from "../memory";
+import { nagi } from "../runtime";
 import { passthroughSchema, runFlow } from "./test-helpers";
 
 const echo = flow({

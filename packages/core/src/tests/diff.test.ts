@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { canonicalize } from "./canonicalize";
-import { diffSnapshots } from "./diff";
+import { flow } from "../builder";
+import { canonicalize } from "../canonicalize";
+import { diffSnapshots } from "../diff";
 import { passthroughSchema } from "./test-helpers";
 
 describe("diffSnapshots", () => {
@@ -170,7 +170,7 @@ describe("diffSnapshots", () => {
     const after = flow({
       id: "sorted",
       input: passthroughSchema<Record<string, never>>(),
-      build: (b) => ({}),
+      build: (_b) => ({}),
     });
     const diff = diffSnapshots(
       await canonicalize(before),

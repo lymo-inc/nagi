@@ -1,4 +1,5 @@
 import {
+  asStepMapWithDefs,
   getDef,
   needsStepIds,
   readSelectedArm,
@@ -34,14 +35,32 @@ export interface ScheduleArgs {
   readonly input: unknown;
 }
 
-export function nextRunnable(args: ScheduleArgs): ScheduleDecision {
-  const { flow, runState, input } = args;
+/**
+ * Total read of step state: a step with no projected fact yet reads as the
+ * explicit `pending` variant, so engine logic never special-cases absence.
+ */
+export function stepStateOf(runState: RunState, stepId: StepId): StepState {
+  return (
+    runState.steps[stepId] ?? {
+      stepId,
+      status: "pending",
+      attempts: 0,
+      output: null,
+    }
+  );
+}
+
+export function nextRunnable({
+  flow,
+  runState,
+  input,
+}: ScheduleArgs): ScheduleDecision {
   const runnable: string[] = [];
   const skip: { stepId: string; reason: SkipReason }[] = [];
 
-  for (const [stepId, step] of Object.entries(flow.steps)) {
-    const state = runState.steps[stepId];
-    if (state !== undefined && state.status !== "pending") continue;
+  for (const [stepId, step] of Object.entries(asStepMapWithDefs(flow.steps))) {
+    const state = stepStateOf(runState, stepId);
+    if (state.status !== "pending") continue;
 
     const def = getDef(step);
 
@@ -61,10 +80,7 @@ export function nextRunnable(args: ScheduleArgs): ScheduleDecision {
 
     const when = def.kind === "match" ? undefined : def.when;
     if (when) {
-      const needs = resolveNeeds(
-        def,
-        (id) => runState.steps[id]?.output ?? null,
-      );
+      const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
       const shouldRun = when({ input, needs });
       if (!shouldRun) {
         skip.push({ stepId, reason: "when-false" });
@@ -82,8 +98,7 @@ type UpstreamStatus = "ready" | "blocked" | "transitive-skip";
 
 function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
   for (const upstream of Object.values(def.needs)) {
-    const upstreamState = runState.steps[upstream.id];
-    if (upstreamState === undefined) return "blocked";
+    const upstreamState = stepStateOf(runState, upstream.id);
     if (upstreamState.status === "completed") continue;
     if (upstreamState.status === "skipped") {
       if (manualSkipCascade(upstream.id, runState) === "continue") continue;
@@ -116,8 +131,8 @@ function checkParentMatch(def: StepDef, runState: RunState): UpstreamStatus {
   if (!def.parentMatch) return "ready";
   const { matchId, armId } = def.parentMatch;
 
-  const parentState = runState.steps[matchId];
-  if (parentState?.status === "failed" || parentState?.status === "skipped") {
+  const parentState = stepStateOf(runState, matchId);
+  if (parentState.status === "failed" || parentState.status === "skipped") {
     return "transitive-skip";
   }
 
@@ -139,7 +154,7 @@ export function aggregateMatch(
   flow: Flow,
   runState: RunState,
 ): MatchAggregation {
-  const step = flow.steps[matchId];
+  const step = asStepMapWithDefs(flow.steps)[matchId];
   if (!step) return { kind: "pending" };
   const def = getDef(step);
   if (def.kind !== "match") return { kind: "pending" };
@@ -155,12 +170,8 @@ export function aggregateMatch(
   const stripPrefix = `${matchId}.${arm.id}.`;
 
   for (const stepId of arm.stepIds) {
-    const state: StepState | undefined = runState.steps[stepId];
-    if (
-      state === undefined ||
-      state.status === "pending" ||
-      state.status === "running"
-    ) {
+    const state = stepStateOf(runState, stepId);
+    if (state.status === "pending" || state.status === "running") {
       allTerminal = false;
       continue;
     }
@@ -170,8 +181,7 @@ export function aggregateMatch(
     const localKey = stepId.startsWith(stripPrefix)
       ? stepId.slice(stripPrefix.length)
       : stepId;
-    output[localKey] =
-      state.status === "completed" ? (state.output ?? null) : null;
+    output[localKey] = state.status === "completed" ? state.output : null;
   }
 
   if (!allTerminal) return { kind: "pending" };
@@ -190,12 +200,8 @@ export function flowTermination(
   let done = true;
   let failed = false;
   for (const stepId of Object.keys(flow.steps)) {
-    const state: StepState | undefined = runState.steps[stepId];
-    if (
-      state === undefined ||
-      state.status === "pending" ||
-      state.status === "running"
-    ) {
+    const state = stepStateOf(runState, stepId);
+    if (state.status === "pending" || state.status === "running") {
       done = false;
       break;
     }
@@ -253,19 +259,19 @@ export function nextTransition(flow: Flow, runState: RunState): Transition {
 
 function readyPromotions(flow: Flow, runState: RunState): MatchPromotion[] {
   const out: MatchPromotion[] = [];
-  for (const [matchId, step] of Object.entries(flow.steps)) {
+  for (const [matchId, step] of Object.entries(asStepMapWithDefs(flow.steps))) {
     const def = getDef(step);
     if (def.kind !== "match") continue;
-    const state = runState.steps[matchId];
-    if (state?.status !== "running") continue;
+    const state = stepStateOf(runState, matchId);
+    if (state.status !== "running") continue;
 
     const agg = aggregateMatch(matchId, flow, runState);
     if (agg.kind === "pending") continue;
 
     const attempt: AttemptNumber = state.attempts > 0 ? state.attempts : 1;
     if (agg.kind === "fail-fast") {
-      const failedNested = runState.steps[agg.failedStepId];
-      const error: SerializedError = failedNested?.error ?? {
+      const failedNested = stepStateOf(runState, agg.failedStepId);
+      const error: SerializedError = failedNested.error ?? {
         name: "Error",
         message: `match "${matchId}": chosen-arm step "${agg.failedStepId}" failed`,
       };
@@ -311,7 +317,7 @@ export function computeFlowOutput(flow: Flow, runState: RunState): Json {
   if (flow.output === undefined) return null;
   const stepOutputs: Record<string, Json> = {};
   for (const [sid, sstate] of Object.entries(runState.steps)) {
-    if (sstate.output !== undefined) stepOutputs[sid] = sstate.output;
+    if (sstate.status === "completed") stepOutputs[sid] = sstate.output;
   }
   return flow.output(stepOutputs as never) as Json;
 }
@@ -323,9 +329,7 @@ export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {
     if (bucket) bucket.push(to);
     else children.set(from, [to]);
   };
-  for (const [id, step] of Object.entries(flow.steps) as Array<
-    [StepId, (typeof flow.steps)[string]]
-  >) {
+  for (const [id, step] of Object.entries(asStepMapWithDefs(flow.steps))) {
     const def = getDef(step);
     for (const upstreamId of needsStepIds(def)) addEdge(upstreamId, id);
     if (def.kind === "match") {

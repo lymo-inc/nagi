@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { NagiRuntimeError, NagiValidationError } from "./runtime";
-import { makeHarness, passthroughSchema } from "./test-helpers";
+import { flow } from "../builder";
+import { NagiRuntimeError, NagiValidationError } from "../runtime";
 import type {
   FlowCanceledFact,
   StepAbortRequestedFact,
   StepResetFact,
   StepSkippedFact,
-} from "./types";
+} from "../types";
+import { makeHarness, passthroughSchema } from "./test-helpers";
 
 describe("wf.operator().skip()", () => {
   it("manual skip with cascade=skip transitively skips downstream", async () => {

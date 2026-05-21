@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { makeIdempotencyKey, makeOnce } from "./idempotency";
-import { InMemoryStore } from "./memory";
-import type { RunId } from "./types";
+import { makeIdempotencyKey, makeOnce } from "../idempotency";
+import { InMemoryStore } from "../memory";
+import type { RunId } from "../types";
 
 const RUN: RunId = "run-test" as RunId;
 

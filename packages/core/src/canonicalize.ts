@@ -1,10 +1,12 @@
 import {
+  asStepMapWithDefs,
   getDef,
   type MatchArmDef,
   type MatchDef,
   needsStepIds,
   type SignalDef,
   type StepDef,
+  type StreamingTaskDef,
   type SubflowDef,
   type TaskDef,
 } from "./internal";
@@ -79,10 +81,11 @@ function warnSourceHashOnce(): void {
 }
 
 export async function canonicalize(flow: Flow): Promise<CanonicalDag> {
-  const ids = Object.keys(flow.steps).sort();
+  const withDefs = asStepMapWithDefs(flow.steps);
+  const ids = Object.keys(withDefs).sort();
   const steps: CanonicalStep[] = [];
   for (const id of ids) {
-    const step = flow.steps[id];
+    const step = withDefs[id];
     if (step === undefined) continue;
     steps.push(await canonicalizeStep(id, getDef(step)));
   }
@@ -99,7 +102,11 @@ async function canonicalizeStep(
 ): Promise<CanonicalStep> {
   const needs = [...needsStepIds(def)].sort();
   const base: CanonicalStep = { id, kind: def.kind, needs };
-  if (def.kind === "task") return canonicalizeTask(base, def);
+  // A streaming step is a task for hashing/replay purposes (RFC 0019 D8): chunks
+  // are ephemeral and never affect the flow hash, so only its task-shaped fields
+  // (when/retry/timeoutMs) are canonicalized.
+  if (def.kind === "task" || def.kind === "streaming")
+    return canonicalizeTask(base, def);
   if (def.kind === "signal") return canonicalizeSignal(base, def);
   if (def.kind === "subflow") return canonicalizeSubflow(base, def);
   return canonicalizeMatch(base, def);
@@ -107,7 +114,7 @@ async function canonicalizeStep(
 
 async function canonicalizeTask(
   base: CanonicalStep,
-  def: TaskDef,
+  def: TaskDef | StreamingTaskDef,
 ): Promise<CanonicalStep> {
   const out: Mutable<CanonicalStep> = { ...base };
   if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);

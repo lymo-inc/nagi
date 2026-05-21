@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { InMemoryStore } from "./memory";
+import { flow } from "../builder";
+import { InMemoryStore } from "../memory";
 import {
   descendantsOf,
   extractInput,
   flowTermination,
   nextRunnable,
   nextTransition,
-} from "./scheduler";
+} from "../scheduler";
+import type { Fact, Flow, RunId, RunState } from "../types";
 import { passthroughSchema } from "./test-helpers";
-import type { Fact, Flow, RunId, RunState } from "./types";
 
 const RUN: RunId = "run-test" as RunId;
 

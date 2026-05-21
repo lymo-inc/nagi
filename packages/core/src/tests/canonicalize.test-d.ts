@@ -7,7 +7,7 @@ import type {
   CanonicalStep,
   canonicalize,
   sha256Canonical,
-} from "./canonicalize";
+} from "../canonicalize";
 
 describe("CanonicalDag — type shape", () => {
   it("CanonicalDag has flowId, inputSchema, steps", () => {

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { canonicalize, sha256Canonical, stableStringify } from "./canonicalize";
+import { flow } from "../builder";
+import {
+  canonicalize,
+  sha256Canonical,
+  stableStringify,
+} from "../canonicalize";
 import { passthroughSchema } from "./test-helpers";
 
 async function hashOf(f: Parameters<typeof canonicalize>[0]): Promise<string> {

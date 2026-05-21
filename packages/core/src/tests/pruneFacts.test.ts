@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
-import { NagiValidationError, nagi } from "./runtime";
+import { flow } from "../builder";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
+import { NagiValidationError, nagi } from "../runtime";
+import type { Fact, FlowStartedFact, PrunableStatus, RunId } from "../types";
 import { passthroughSchema } from "./test-helpers";
-import type { Fact, FlowStartedFact, PrunableStatus, RunId } from "./types";
 
 interface SeedCase {
   readonly flowId: string;

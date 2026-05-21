@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
-import { NagiValidationError, nagi } from "./runtime";
-import type { Fact, FlowStartedFact, RunId, StandardSchemaV1 } from "./types";
+import { flow } from "../builder";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
+import { NagiValidationError, nagi } from "../runtime";
+import type { Fact, FlowStartedFact, RunId, StandardSchemaV1 } from "../types";
 
 function passthroughSchema<T>(): StandardSchemaV1<T, T> {
   return {

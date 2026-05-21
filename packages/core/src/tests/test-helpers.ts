@@ -1,12 +1,13 @@
-import { type DispatchDeps, dispatchMessage } from "./dispatch";
-import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
-import { type NagiConfig, nagi, type Wf } from "./runtime";
+import { type DispatchDeps, dispatchMessage } from "../dispatch";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
+import { type NagiConfig, nagi, type Wf } from "../runtime";
 import type {
   Fact,
   Flow,
   FlowHooks,
   FlowInput,
   Json,
+  LogEntry,
   RetryPolicy,
   RunId,
   RunState,
@@ -15,7 +16,7 @@ import type {
   StandardSchemaV1,
   StepStatus,
   WorkerConfig,
-} from "./types";
+} from "../types";
 
 export function passthroughSchema<T>(): StandardSchemaV1<T, T> {
   return {
@@ -86,8 +87,24 @@ function makeResult(state: RunState): Result {
 
 export interface HarnessOpts {
   readonly defaultRetry?: RetryPolicy;
-  readonly logger?: NagiConfig["logger"];
+  readonly onLog?: NagiConfig["onLog"];
   readonly hooks?: FlowHooks;
+}
+
+/**
+ * Capture helper for the RFC 0020 `onLog` sink: returns an `onLog` callback and
+ * the array it appends every {@link LogEntry} into, for assertions on
+ * `{ level, msg, attrs }`.
+ */
+export function spyOnLog(): {
+  onLog: NonNullable<NagiConfig["onLog"]>;
+  entries: LogEntry[];
+} {
+  const entries: LogEntry[] = [];
+  return {
+    onLog: (entry) => entries.push(entry),
+    entries,
+  };
 }
 
 export interface Harness {
@@ -131,7 +148,7 @@ export async function makeHarness(
     ...(opts?.defaultRetry !== undefined
       ? { defaultRetry: opts.defaultRetry }
       : {}),
-    ...(opts?.logger !== undefined ? { logger: opts.logger } : {}),
+    ...(opts?.onLog !== undefined ? { onLog: opts.onLog } : {}),
     ...(opts?.hooks !== undefined ? { hooks: opts.hooks } : {}),
   });
 

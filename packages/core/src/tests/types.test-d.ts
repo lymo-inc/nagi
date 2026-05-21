@@ -1,7 +1,6 @@
 import { describe, expectTypeOf, it } from "vitest";
-import { flow } from "./builder";
-import { nagi, type Wf } from "./runtime";
-import { passthroughSchema } from "./test-helpers";
+import { flow } from "../builder";
+import { nagi, type Wf } from "../runtime";
 import type {
   Builder,
   Fact,
@@ -19,7 +18,8 @@ import type {
   StepOutput,
   Store,
   Tx,
-} from "./types";
+} from "../types";
+import { passthroughSchema } from "./test-helpers";
 
 declare const taskStep: Step<{ doubled: number }>;
 declare const transcribeStep: Step<{ text: string; recipientEmail: string }>;

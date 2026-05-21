@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
+import { flow } from "../builder";
+import type { FlowStartedFact } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
-import type { FlowStartedFact } from "./types";
 
 describe("b.subflow — happy path", () => {
   it("starts a child run, awaits completion, exposes { childRunId, output }", async () => {

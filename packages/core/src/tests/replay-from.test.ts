@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { NagiRuntimeError, NagiValidationError } from "./runtime";
+import { flow } from "../builder";
+import { NagiRuntimeError, NagiValidationError } from "../runtime";
+import type { StepResetFact } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
-import type { StepResetFact } from "./types";
 
 describe("wf.replay({ from }) — step-scoped replay", () => {
   it("re-runs `from` and downstream on a completed run; preserves upstream", async () => {

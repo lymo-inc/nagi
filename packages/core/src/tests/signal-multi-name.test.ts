@@ -1,35 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { canonicalize, sha256Canonical } from "./canonicalize";
-import { NagiRuntimeError } from "./runtime";
-import { makeHarness, passthroughSchema } from "./test-helpers";
-import type { Logger, SignalReceivedFact } from "./types";
-
-interface LogEntry {
-  readonly level: "debug" | "info" | "warn" | "error";
-  readonly msg: string;
-  readonly attrs?: Record<string, unknown>;
-}
-
-function memoryLogger(): { logger: Logger; entries: LogEntry[] } {
-  const entries: LogEntry[] = [];
-  const push =
-    (level: LogEntry["level"]) =>
-    (msg: string, attrs?: Record<string, unknown>): void => {
-      entries.push(
-        attrs !== undefined ? { level, msg, attrs } : { level, msg },
-      );
-    };
-  return {
-    logger: {
-      debug: push("debug"),
-      info: push("info"),
-      warn: push("warn"),
-      error: push("error"),
-    },
-    entries,
-  };
-}
+import { flow } from "../builder";
+import { canonicalize, sha256Canonical } from "../canonicalize";
+import { NagiRuntimeError } from "../runtime";
+import type { SignalReceivedFact } from "../types";
+import { makeHarness, passthroughSchema, spyOnLog } from "./test-helpers";
 
 describe("b.signal — single-name back-compat", () => {
   it("default (no name / names): resolves via step id, fact has no signalName", async () => {
@@ -167,8 +141,8 @@ describe("b.signal — multi-name", () => {
 
   it("late loser is a no-op + logged (no throw, no second fact)", async () => {
     const f = dualSourceFlow();
-    const { logger, entries } = memoryLogger();
-    const h = await makeHarness(f, { logger });
+    const { onLog, entries } = spyOnLog();
+    const h = await makeHarness(f, { onLog });
     const w = h.startWorker();
     try {
       const runId = await h.wf.start(f, {});

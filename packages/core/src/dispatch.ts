@@ -1,11 +1,15 @@
 import { makeIdempotencyKey, makeOnce } from "./idempotency";
 import {
+  asStepMapWithDefs,
+  compact,
+  type EmitLog,
   getDef,
   type MatchDef,
   resolveNeeds,
   type StepDef,
   type SubflowDef,
   selectArm,
+  type TaskDef,
 } from "./internal";
 import {
   extractInput,
@@ -13,6 +17,7 @@ import {
   type MatchPromotion,
   nextTransition,
   type SkipDecision,
+  stepStateOf,
 } from "./scheduler";
 import type {
   AttemptNumber,
@@ -49,7 +54,7 @@ export interface DispatchDeps {
   readonly queue: Queue;
   readonly clock: Clock;
   readonly hooks?: FlowHooks;
-  readonly logger?: Logger;
+  readonly emitLog: EmitLog;
   readonly defaultRetry?: RetryPolicy;
   readonly fireHooks?: boolean;
   readonly cancelPollIntervalMs?: Millis;
@@ -69,9 +74,10 @@ export async function fireHook<E>(
     await hook(event);
   } catch (err) {
     const { message, stack } = serializeError(err);
-    deps.logger?.error(`nagi hook "${hookName}" threw — swallowed`, {
-      error: message,
-      ...(stack !== undefined ? { stack } : {}),
+    deps.emitLog({
+      level: "error",
+      msg: `nagi hook "${hookName}" threw — swallowed`,
+      attrs: { error: message, ...(stack !== undefined ? { stack } : {}) },
     });
   }
 }
@@ -91,11 +97,12 @@ export async function dispatchMessage(
   const { runId, stepId, attempt } = message;
   const flow = await deps.flowFor(runId);
 
-  const step = flow.steps[stepId];
+  const step = asStepMapWithDefs(flow.steps)[stepId];
   if (!step) {
-    deps.logger?.warn(
-      `dispatch: step "${stepId}" not in flow "${flow.id}"; ack and skip`,
-    );
+    deps.emitLog({
+      level: "warn",
+      msg: `dispatch: step "${stepId}" not in flow "${flow.id}"; ack and skip`,
+    });
     await queue.ack(message.receipt);
     return;
   }
@@ -106,12 +113,11 @@ export async function dispatchMessage(
     await queue.ack(message.receipt);
     return;
   }
-  const preStep = preState.steps[stepId];
+  const preStep = stepStateOf(preState, stepId);
   if (
-    preStep &&
-    (preStep.status === "completed" ||
-      preStep.status === "failed" ||
-      preStep.status === "skipped")
+    preStep.status === "completed" ||
+    preStep.status === "failed" ||
+    preStep.status === "skipped"
   ) {
     await queue.ack(message.receipt);
     return;
@@ -131,7 +137,7 @@ export async function dispatchMessage(
     at: clock.now(),
   });
   const startEventInput: Json =
-    def.kind === "task" || def.kind === "subflow"
+    def.kind === "task" || def.kind === "streaming" || def.kind === "subflow"
       ? extractInput(await store.loadRunState(runId))
       : null;
   const startEvent = {
@@ -143,14 +149,17 @@ export async function dispatchMessage(
     input: startEventInput,
     at: clock.now(),
   };
-  const stepOnStart = def.kind === "task" ? def.onStart : undefined;
+  // TODO(RFC 0019 Phase C): streaming routes through the task path here; Phase C
+  // adds the StreamingStepCtx + emit wiring and a `retry` event on re-attempt.
+  const stepOnStart =
+    def.kind === "task" || def.kind === "streaming" ? def.onStart : undefined;
   await fireHook(stepOnStart, startEvent, "step.onStart", deps);
   await fireHook(deps.hooks?.onStepStart, startEvent, "onStepStart", deps);
 
   const startedAt = Date.now();
 
   try {
-    if (def.kind === "task") {
+    if (def.kind === "task" || def.kind === "streaming") {
       const { output, skipAdvance } = await executeTask({
         deps,
         message,
@@ -165,7 +174,7 @@ export async function dispatchMessage(
         flowId: flow.id,
         stepId,
         attempt,
-        kind: "task" as const,
+        kind: def.kind,
         output,
         durationMs: Date.now() - startedAt,
         at: clock.now(),
@@ -217,14 +226,14 @@ async function executeTask(args: {
   attempt: number;
 }): Promise<ExecuteTaskResult> {
   const { deps, message, def, runId, stepId, attempt } = args;
-  if (def.kind !== "task") {
+  if (def.kind !== "task" && def.kind !== "streaming") {
     throw new Error(`executeTask called with non-task def (kind: ${def.kind})`);
   }
 
   const { store, queue, clock } = deps;
   const runState = await store.loadRunState(runId);
   const input = extractInput(runState);
-  const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
+  const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
 
   const ac = new AbortController();
   const watcher = startCancelWatcher({
@@ -252,9 +261,14 @@ async function executeTask(args: {
           clock,
           tx,
           signal: ac.signal,
-          ...(deps.logger !== undefined ? { logger: deps.logger } : {}),
+          emitLog: deps.emitLog,
         });
-        const out = (await def.run({ input, needs, ctx })) as Json;
+        // TODO(RFC 0019 Phase C): a streaming step's `run` expects a
+        // StreamingStepCtx with `emit`; Phase A invokes it through the plain
+        // task ctx (no emit wiring yet). Phase C builds the StreamingStepCtx and
+        // routes `emit` to the out-of-band transport (D3).
+        const run = def.run as TaskDef["run"];
+        const out = (await run({ input, needs, ctx })) as Json;
         const postState = await store.loadRunState(runId);
         if (postState.status === "canceled") {
           const canceledFact: Fact = {
@@ -391,7 +405,7 @@ async function executeSubflow(args: {
   }
   const runState = await store.loadRunState(runId);
   const parentInput = extractInput(runState);
-  const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
+  const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
   const childInput = def.buildInput({ input: parentInput, needs });
   await deps.startChildRun({
     child,
@@ -413,7 +427,7 @@ async function executeMatch(args: {
 
   const runState = await store.loadRunState(runId);
   const input = extractInput(runState);
-  const needs = resolveNeeds(def, (id) => runState.steps[id]?.output ?? null);
+  const needs = resolveNeeds(def, (id) => stepStateOf(runState, id).output);
 
   const armId = selectArm(def, { input, needs });
 
@@ -463,7 +477,7 @@ async function handleStepError(args: {
   }
 
   const policy =
-    def.kind === "task" && def.retry
+    (def.kind === "task" || def.kind === "streaming") && def.retry
       ? def.retry
       : (deps.defaultRetry ?? DEFAULT_RETRY);
   const shouldRetry = attempt < policy.maxAttempts && retryAllows(policy, err);
@@ -488,7 +502,8 @@ async function handleStepError(args: {
       nextAttemptAt: new Date(Date.now() + delayMs),
       at: clock.now(),
     };
-    const stepOnRetry = def.kind === "task" ? def.onRetry : undefined;
+    const stepOnRetry =
+      def.kind === "task" || def.kind === "streaming" ? def.onRetry : undefined;
     await fireHook(stepOnRetry, retryEvent, "step.onRetry", deps);
     await fireHook(deps.hooks?.onStepRetry, retryEvent, "onStepRetry", deps);
     await queue.enqueue(runId, stepId, { attempt: attempt + 1, delayMs });
@@ -514,7 +529,8 @@ async function handleStepError(args: {
     error,
     at: clock.now(),
   };
-  const stepOnError = def.kind === "task" ? def.onError : undefined;
+  const stepOnError =
+    def.kind === "task" || def.kind === "streaming" ? def.onError : undefined;
   await fireHook(stepOnError, errorEvent, "step.onError", deps);
   await fireHook(deps.hooks?.onStepError, errorEvent, "onStepError", deps);
   await queue.ack(message.receipt);
@@ -685,9 +701,39 @@ function makeStepCtx(args: {
   clock: Clock;
   tx: Tx;
   signal: AbortSignal;
-  logger?: Logger;
+  emitLog: EmitLog;
 }): StepCtx<unknown> {
-  const { runId, stepId, attempt, input, store, clock, tx, signal } = args;
+  const { runId, stepId, attempt, input, store, clock, tx, signal, emitLog } =
+    args;
+
+  // O2: spread caller `attrs` first, then the correlation keys, so the runtime
+  // wins on collision — a handler can't clobber the real runId/stepId/attempt.
+  const stepLogger: Logger = {
+    debug: (m, a) =>
+      emitLog({
+        level: "debug",
+        msg: m,
+        attrs: { ...a, runId, stepId, attempt },
+      }),
+    info: (m, a) =>
+      emitLog({
+        level: "info",
+        msg: m,
+        attrs: { ...a, runId, stepId, attempt },
+      }),
+    warn: (m, a) =>
+      emitLog({
+        level: "warn",
+        msg: m,
+        attrs: { ...a, runId, stepId, attempt },
+      }),
+    error: (m, a) =>
+      emitLog({
+        level: "error",
+        msg: m,
+        attrs: { ...a, runId, stepId, attempt },
+      }),
+  };
 
   return {
     input,
@@ -697,18 +743,9 @@ function makeStepCtx(args: {
     signal,
     now: () => clock.now(),
     tx,
-    logger: args.logger ?? consoleLogger(),
+    logger: stepLogger,
     once: makeOnce({ runId, stepId, store }),
     idempotencyKey: makeIdempotencyKey(runId, stepId),
-  };
-}
-
-function consoleLogger(): Logger {
-  return {
-    debug: (m, a) => console.debug(m, a),
-    info: (m, a) => console.info(m, a),
-    warn: (m, a) => console.warn(m, a),
-    error: (m, a) => console.error(m, a),
   };
 }
 
@@ -796,24 +833,29 @@ export async function propagateToParent(
     parentState.status === "failed" ||
     parentState.status === "canceled"
   ) {
-    deps.logger?.info(
-      "nagi: subflow wake skipped — parent run already terminal",
-      {
+    deps.emitLog({
+      level: "info",
+      msg: "nagi: subflow wake skipped — parent run already terminal",
+      attrs: {
         parentRunId,
         parentStepId,
         childRunId,
         parentStatus: parentState.status,
       },
-    );
+    });
     return;
   }
-  const parentStep = parentState.steps[parentStepId];
-  if (parentStep?.status !== "running") {
-    deps.logger?.info("nagi: subflow wake skipped — parent step not running", {
-      parentRunId,
-      parentStepId,
-      childRunId,
-      parentStepStatus: parentStep?.status ?? "missing",
+  const parentStep = stepStateOf(parentState, parentStepId);
+  if (parentStep.status !== "running") {
+    deps.emitLog({
+      level: "info",
+      msg: "nagi: subflow wake skipped — parent step not running",
+      attrs: {
+        parentRunId,
+        parentStepId,
+        childRunId,
+        parentStepStatus: parentStep.status,
+      },
     });
     return;
   }
@@ -855,7 +897,7 @@ export function serializeError(err: unknown): SerializedError {
     return {
       name: err.name,
       message: err.message,
-      ...(err.stack !== undefined ? { stack: err.stack } : {}),
+      ...compact({ stack: err.stack }),
     };
   }
   return { name: "Error", message: String(err) };

@@ -104,8 +104,10 @@ class WorkerImpl implements Worker {
     try {
       await dispatchMessage(this.deps, msg);
     } catch (err) {
-      this.deps.logger?.error("worker.dispatch threw uncaught", {
-        error: String(err),
+      this.deps.emitLog({
+        level: "error",
+        msg: "worker.dispatch threw uncaught",
+        attrs: { error: String(err) },
       });
       try {
         await this.deps.queue.nack(msg.receipt);

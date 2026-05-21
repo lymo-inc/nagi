@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { fingerprintFlows } from "./canonicalize";
-import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
-import { nagi } from "./runtime";
+import { flow } from "../builder";
+import { fingerprintFlows } from "../canonicalize";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
+import { nagi } from "../runtime";
 import { passthroughSchema } from "./test-helpers";
 
 function makeStores() {

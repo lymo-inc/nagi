@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { InMemoryClock, InMemoryQueue, InMemoryStore } from "./memory";
-import { NagiRuntimeError, NagiValidationError, nagi } from "./runtime";
-import { makeHarness, passthroughSchema } from "./test-helpers";
+import { flow } from "../builder";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
+import { NagiRuntimeError, NagiValidationError, nagi } from "../runtime";
 import type {
   FlowErrorEvent,
   FlowStartEvent,
   RunId,
   StepErrorEvent,
-} from "./types";
+} from "../types";
+import { makeHarness, passthroughSchema } from "./test-helpers";
 
 interface VideoInput {
   readonly videoId: string;

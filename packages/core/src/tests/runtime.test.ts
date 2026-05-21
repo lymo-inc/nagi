@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { NagiRuntimeError, NagiValidationError } from "./runtime";
+import { flow } from "../builder";
+import { NagiRuntimeError, NagiValidationError } from "../runtime";
+import type { RunId, StandardSchemaV1 } from "../types";
 import {
   emptySchema,
   makeHarness,
   passthroughSchema,
   runFlow,
 } from "./test-helpers";
-import type { RunId, StandardSchemaV1 } from "./types";
 
 describe("e2e: linear task chain", () => {
   it("runs both steps and threads upstream output through needs", async () => {

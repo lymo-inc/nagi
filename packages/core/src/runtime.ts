@@ -12,9 +12,19 @@ import {
   propagateToParent,
   serializeError,
 } from "./dispatch";
-import { attachDef, getDef, type SignalDef, type StepDef } from "./internal";
+import {
+  asStepMapWithDefs,
+  attachDef,
+  compact,
+  type EmitLog,
+  getDef,
+  makeEmit,
+  type SignalDef,
+  type StepDef,
+  setDef,
+} from "./internal";
 import { InMemoryClock } from "./memory";
-import { descendantsOf } from "./scheduler";
+import { descendantsOf, stepStateOf } from "./scheduler";
 import type {
   Clock,
   Fact,
@@ -27,7 +37,7 @@ import type {
   FlowInput,
   FlowStartedFact,
   Json,
-  Logger,
+  LogEntry,
   Operator,
   OperatorAuditOpts,
   OperatorSkipOpts,
@@ -58,7 +68,7 @@ export interface NagiConfig {
   readonly clock?: Clock;
   readonly trigger?: Trigger;
   readonly hooks?: FlowHooks;
-  readonly logger?: Logger;
+  readonly onLog?: (entry: LogEntry) => void;
   readonly defaultRetry?: RetryPolicy;
   readonly codeVersion?: string;
 }
@@ -129,21 +139,26 @@ export class NagiCanceledError extends Error {
   readonly runId: RunId;
   readonly canceledByRunId: RunId;
   readonly concurrencyKey: string;
-  constructor(args: {
+  constructor({
+    runId,
+    canceledByRunId,
+    concurrencyKey,
+  }: {
     readonly runId: RunId;
     readonly canceledByRunId: RunId;
     readonly concurrencyKey: string;
   }) {
     super(
-      `Run ${args.runId} was canceled (superseded by run ${args.canceledByRunId} for concurrency key "${args.concurrencyKey}").`,
+      `Run ${runId} was canceled (superseded by run ${canceledByRunId} for concurrency key "${concurrencyKey}").`,
     );
+
     this.name = "NagiCanceledError";
-    this.runId = args.runId;
-    this.canceledByRunId = args.canceledByRunId;
-    this.concurrencyKey = args.concurrencyKey;
+    this.runId = runId;
+    this.canceledByRunId = canceledByRunId;
+    this.concurrencyKey = concurrencyKey;
     this.cause = {
-      canceledByRunId: args.canceledByRunId,
-      concurrencyKey: args.concurrencyKey,
+      canceledByRunId: canceledByRunId,
+      concurrencyKey: concurrencyKey,
     };
   }
 }
@@ -164,20 +179,24 @@ export class NagiSnapshotDriftError extends Error {
   readonly runId: RunId;
   readonly expected: string;
   readonly actual: string;
-  constructor(args: {
+  constructor({
+    runId,
+    expected,
+    actual,
+  }: {
     readonly runId: RunId;
     readonly expected: string;
     readonly actual: string;
   }) {
     super(
-      `Run ${args.runId} was pinned to flow hash ${args.expected.slice(0, 12)}… ` +
-        `but the live flow's hash is ${args.actual.slice(0, 12)}…. ` +
+      `Run ${runId} was pinned to flow hash ${expected.slice(0, 12)}… ` +
+        `but the live flow's hash is ${actual.slice(0, 12)}…. ` +
         `Pass replayOpts.allowDrift = true to replay against the live code anyway.`,
     );
     this.name = "NagiSnapshotDriftError";
-    this.runId = args.runId;
-    this.expected = args.expected;
-    this.actual = args.actual;
+    this.runId = runId;
+    this.expected = expected;
+    this.actual = actual;
   }
 }
 
@@ -185,6 +204,10 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   config: NagiConfig & { flows: TFlows },
 ): Promise<Wf<TFlows>> {
   const clock = config.clock ?? new InMemoryClock();
+  // Single diagnostic choke point (RFC 0020): built once from config.onLog and
+  // threaded everywhere a log is produced. A no-op when onLog is absent (silent
+  // by default), so call sites never branch on its presence.
+  const emitLog = makeEmit(config.onLog);
   // One-shot queue provisioning (RFC 0013): eager + fail-fast at construction,
   // before any run can enqueue. A no-op for adapters without the hook.
   await config.queue.ensureSchema?.();
@@ -239,13 +262,17 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     return flowsById.get(flowId);
   }
 
-  async function startRunInternal(args: {
+  async function startRunInternal({
+    flow,
+    validatedInput,
+    runId,
+    parent,
+  }: {
     readonly flow: Flow;
     readonly validatedInput: Json;
     readonly runId: RunId;
     readonly parent?: ParentRef;
   }): Promise<{ readonly started: boolean }> {
-    const { flow, validatedInput, runId, parent } = args;
     const startedAt = clock.now();
     const flowHash = flowHashById.get(flow.id);
 
@@ -255,11 +282,14 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       flowId: flow.id,
       input: validatedInput,
       at: startedAt,
-      ...(flowHash !== undefined ? { flowHash } : {}),
       codeVersion,
-      ...(parent !== undefined
-        ? { parent: { runId: parent.runId, stepId: parent.stepId } }
-        : {}),
+      ...compact({
+        flowHash,
+        parent:
+          parent !== undefined
+            ? { runId: parent.runId, stepId: parent.stepId }
+            : undefined,
+      }),
     };
 
     let concurrencyArg:
@@ -391,9 +421,10 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       state.status === "failed" ||
       state.status === "canceled"
     ) {
-      config.logger?.info("nagi: cancel skipped — run already terminal", {
-        runId,
-        status: state.status,
+      emitLog({
+        level: "info",
+        msg: "nagi: cancel skipped — run already terminal",
+        attrs: { runId, status: state.status },
       });
       return;
     }
@@ -450,11 +481,11 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     store: config.store,
     queue: config.queue,
     clock,
-    ...(config.hooks !== undefined ? { hooks: config.hooks } : {}),
-    ...(config.logger !== undefined ? { logger: config.logger } : {}),
-    ...(config.defaultRetry !== undefined
-      ? { defaultRetry: config.defaultRetry }
-      : {}),
+    emitLog,
+    ...compact({
+      hooks: config.hooks,
+      defaultRetry: config.defaultRetry,
+    }),
   };
 
   const wf: Wf = {
@@ -510,43 +541,25 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
           `Run ${runId} references flow "${runState.flowId}" which is not registered with nagi().`,
         );
       }
-      let stepId: string | undefined;
-      let def: SignalDef | undefined;
-      const direct = flow.steps[signalName];
-      if (direct !== undefined) {
-        const d = getDef(direct);
-        if (d.kind === "signal" && d.names === undefined) {
-          stepId = signalName;
-          def = d;
-        }
-      }
-      if (stepId === undefined) {
-        for (const [id, s] of Object.entries(flow.steps)) {
-          const d = getDef(s);
-          if (d.kind === "signal" && d.names?.includes(signalName)) {
-            stepId = id;
-            def = d;
-            break;
-          }
-        }
-      }
-      if (stepId === undefined || def === undefined) {
+      const resolved = resolveSignalStep(flow, signalName);
+      if (resolved === null) {
         throw new NagiRuntimeError(
           `Flow "${flow.id}" has no signal step accepting "${signalName}".`,
         );
       }
-      const stepState = runState.steps[stepId];
-      if (stepState?.status !== "running") {
-        if (stepState?.status === "completed") {
-          config.logger?.info("nagi: signal arrived after step resolved", {
-            runId,
-            stepId,
-            signalName,
+      const { stepId, def } = resolved;
+      const stepState = stepStateOf(runState, stepId);
+      if (stepState.status !== "running") {
+        if (stepState.status === "completed") {
+          emitLog({
+            level: "info",
+            msg: "nagi: signal arrived after step resolved",
+            attrs: { runId, stepId, signalName },
           });
           return;
         }
         throw new NagiRuntimeError(
-          `Step "${stepId}" is not waiting for signal (status: ${stepState?.status ?? "pending"}).`,
+          `Step "${stepId}" is not waiting for signal (status: ${stepState.status}).`,
         );
       }
 
@@ -604,7 +617,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         clock,
         flowsById,
         cancelRunRecursive,
-        ...(config.logger !== undefined ? { logger: config.logger } : {}),
+        emitLog,
       });
     },
 
@@ -792,7 +805,7 @@ export interface NagiRunConfig extends NagiConfig {
  * Handle returned by {@link nagi.run}. `stop()` aborts the internal controller,
  * awaits the worker loop, and is idempotent (safe to call twice or concurrently).
  * It resolves cleanly even if the loop crashed — a true crash is logged once via
- * the configured `logger`.
+ * the configured `onLog`.
  */
 export interface RuntimeHandle<
   TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>,
@@ -814,11 +827,14 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
   // The loop promise is held privately: it resolves on graceful drain and
   // rejects only on a true loop crash (e.g. queue.dequeue throws while the
   // runtime is not shutting down).
+  const emitLog = makeEmit(config.onLog);
   const loop = worker.run();
   loop.catch((err: unknown) => {
     if (signal.aborted) return; // graceful shutdown — not a crash
-    config.logger?.error("nagi.run: worker exited unexpectedly", {
-      error: String(err),
+    emitLog({
+      level: "error",
+      msg: "nagi.run: worker exited unexpectedly",
+      attrs: { error: String(err) },
     });
   });
 
@@ -851,6 +867,30 @@ function mintRunId(): RunId {
   return `run-${crypto.randomUUID()}` as RunId;
 }
 
+function resolveSignalStep(
+  flow: Flow,
+  signalName: string,
+): { readonly stepId: StepId; readonly def: SignalDef } | null {
+  const steps = asStepMapWithDefs(flow.steps);
+
+  const direct = steps[signalName];
+  if (direct !== undefined) {
+    const d = getDef(direct);
+    if (d.kind === "signal" && d.names === undefined) {
+      return { stepId: signalName, def: d };
+    }
+  }
+
+  for (const [id, s] of Object.entries(steps)) {
+    const d = getDef(s);
+    if (d.kind === "signal" && d.names?.includes(signalName)) {
+      return { stepId: id, def: d };
+    }
+  }
+
+  return null;
+}
+
 const MAX_REPLAY_DISPATCHES = 4096;
 async function drainInline(deps: DispatchDeps): Promise<void> {
   for (let i = 0; i < MAX_REPLAY_DISPATCHES; i++) {
@@ -868,11 +908,11 @@ interface OperatorDeps {
     runId: RunId,
     args: CancelArgs,
   ) => Promise<void>;
-  readonly logger?: Logger;
+  readonly emitLog: EmitLog;
 }
 
 function makeOperator(o: OperatorDeps): Operator {
-  const { deps, clock, flowsById, cancelRunRecursive } = o;
+  const { deps, clock, flowsById, cancelRunRecursive, emitLog } = o;
   const store = deps.store;
 
   function resolveFlow(flowId: string, runId: RunId): Flow {
@@ -909,18 +949,17 @@ function makeOperator(o: OperatorDeps): Operator {
         },
       ]);
     }
-    const stepState = state.steps[stepId];
+    const stepState = stepStateOf(state, stepId);
     if (
-      stepState !== undefined &&
-      (stepState.status === "completed" ||
-        stepState.status === "failed" ||
-        stepState.status === "skipped" ||
-        stepState.status === "canceled")
+      stepState.status === "completed" ||
+      stepState.status === "failed" ||
+      stepState.status === "skipped" ||
+      stepState.status === "canceled"
     ) {
-      o.logger?.info("nagi: operator.skip noop — step already terminal", {
-        runId,
-        stepId,
-        status: stepState.status,
+      emitLog({
+        level: "info",
+        msg: "nagi: operator.skip noop — step already terminal",
+        attrs: { runId, stepId, status: stepState.status },
       });
       return;
     }
@@ -941,7 +980,7 @@ function makeOperator(o: OperatorDeps): Operator {
       reason: "manual",
       actor: opts.actor,
       cascade,
-      ...(opts.note !== undefined ? { note: opts.note } : {}),
+      ...compact({ note: opts.note }),
     };
     await store.appendFact(runId, fact);
     await advance(deps, runId);
@@ -1010,9 +1049,9 @@ function makeOperator(o: OperatorDeps): Operator {
         },
       ]);
     }
-    const stepState = state.steps[stepId];
+    const stepState = stepStateOf(state, stepId);
 
-    if (stepState !== undefined && stepState.status === "running") {
+    if (stepState.status === "running") {
       const abortFact: Fact = {
         kind: "step.abort-requested",
         runId,
@@ -1020,7 +1059,7 @@ function makeOperator(o: OperatorDeps): Operator {
         stepId,
         attempt: stepState.attempts,
         actor: opts.actor,
-        ...(opts.note !== undefined ? { note: opts.note } : {}),
+        ...compact({ note: opts.note }),
       };
       await store.appendFact(runId, abortFact);
       await waitForStepToSettle(runId, stepId, stepState.attempts, 30_000);
@@ -1037,7 +1076,7 @@ function makeOperator(o: OperatorDeps): Operator {
               at,
               stepId: id,
               actor: opts.actor,
-              ...(opts.note !== undefined ? { note: opts.note } : {}),
+              ...compact({ note: opts.note }),
             }
           : {
               kind: "step.reset",
@@ -1064,7 +1103,7 @@ function makeOperator(o: OperatorDeps): Operator {
       cause: "operator",
       reason: opts.note ?? `aborted by operator ${opts.actor}`,
       actor: opts.actor,
-      ...(opts.note !== undefined ? { note: opts.note } : {}),
+      ...compact({ note: opts.note }),
     });
   }
 
@@ -1083,24 +1122,29 @@ async function validate<S extends StandardSchemaV1>(
 }
 
 function synthesizeReplayFlow(dag: CanonicalDag, liveFlow: Flow): Flow {
+  const liveSteps = asStepMapWithDefs(liveFlow.steps);
   const synthesized: Record<string, ReturnType<typeof attachDef>> = {};
 
+  // Phase 1: a shell per canonical step, seeded with its live def. needs still
+  // point at the live upstream identities; phase 2 rewires them to the shells.
   for (const canonStep of dag.steps) {
-    synthesized[canonStep.id] = attachDef(
-      { kind: canonStep.kind, id: canonStep.id },
-      { kind: canonStep.kind } as unknown as StepDef,
-    );
-  }
-
-  for (const canonStep of dag.steps) {
-    const liveStep = liveFlow.steps[canonStep.id];
+    const liveStep = liveSteps[canonStep.id];
     if (liveStep === undefined) {
       throw new NagiRuntimeError(
         `Drift-allowed replay: step "${canonStep.id}" exists in snapshot but ` +
           `is missing from the live flow "${liveFlow.id}". Cannot synthesize a handler.`,
       );
     }
-    const liveDef = getDef(liveStep);
+    synthesized[canonStep.id] = attachDef(
+      { kind: canonStep.kind, id: canonStep.id },
+      getDef(liveStep),
+    );
+  }
+
+  // Phase 2: rewire each step's needs to reference the synthesized shells.
+  for (const canonStep of dag.steps) {
+    const shell = synthesized[canonStep.id];
+    if (shell === undefined) continue;
 
     const synthesizedNeeds: Record<string, unknown> = {};
     for (const upstreamId of canonStep.needs) {
@@ -1114,19 +1158,13 @@ function synthesizeReplayFlow(dag: CanonicalDag, liveFlow: Flow): Flow {
       synthesizedNeeds[upstreamId] = upstreamShell;
     }
 
-    const rewiredDef = {
-      ...liveDef,
-      needs: synthesizedNeeds,
-    } as StepDef;
-    const shell = synthesized[canonStep.id];
-    if (shell === undefined) continue;
-    (shell as unknown as { __def: StepDef }).__def = rewiredDef;
+    setDef(shell, { ...getDef(shell), needs: synthesizedNeeds } as StepDef);
   }
 
   return {
     id: liveFlow.id,
     input: liveFlow.input,
     steps: synthesized,
-    ...(liveFlow.output !== undefined ? { output: liveFlow.output } : {}),
+    ...compact({ output: liveFlow.output }),
   };
 }

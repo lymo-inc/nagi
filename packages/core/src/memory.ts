@@ -1,3 +1,5 @@
+import { compact } from "./internal";
+import { InMemoryStreamHub } from "./stream-hub";
 import type {
   AttemptNumber,
   ClaimToken,
@@ -29,6 +31,7 @@ import type {
   StepId,
   StepState,
   Store,
+  StreamEvent,
   Trigger,
   Tx,
 } from "./types";
@@ -59,6 +62,10 @@ export class InMemoryStore implements Store {
   private readonly keyByActiveRun = new Map<RunId, string>();
   private readonly childrenByParent = new Map<RunId, Set<RunId>>();
   private readonly summaries = new Map<RunId, RunSummary>();
+  // Ephemeral streaming-chunk broadcast transport (RFC 0019). Phase C wires
+  // closeOk/closeError into completeStep/failStep; for now only the read/write
+  // capability methods delegate here.
+  private readonly streamHub = new InMemoryStreamHub();
   private readonly leaseMs: Millis;
 
   constructor(opts: InMemoryStoreOpts = {}) {
@@ -379,6 +386,18 @@ export class InMemoryStore implements Store {
 
     return { runsPruned, factsPruned };
   }
+
+  subscribeStream(
+    runId: RunId,
+    stepId: StepId,
+    opts?: { readonly replayBuffered?: boolean },
+  ): AsyncIterable<StreamEvent<Json>> {
+    return this.streamHub.subscribeStream(runId, stepId, opts);
+  }
+
+  publishChunk(runId: RunId, stepId: StepId, chunk: Json): void {
+    this.streamHub.publishChunk(runId, stepId, chunk);
+  }
 }
 
 function deleteByRunPrefix<V>(map: Map<string, V>, runId: RunId): void {
@@ -515,6 +534,7 @@ export function projectRunState(
           stepId: fact.stepId,
           status: "running",
           attempts: fact.attempt,
+          output: null,
         };
         break;
       case "step.completed":
@@ -530,6 +550,7 @@ export function projectRunState(
           stepId: fact.stepId,
           status: "failed",
           attempts: fact.attempt,
+          output: null,
           error: fact.error,
         };
         break;
@@ -538,7 +559,8 @@ export function projectRunState(
           stepId: fact.stepId,
           status: "canceled",
           attempts: fact.attempt,
-          ...(fact.error !== undefined ? { error: fact.error } : {}),
+          output: null,
+          ...compact({ error: fact.error }),
         };
         break;
       case "step.skipped":
@@ -546,6 +568,7 @@ export function projectRunState(
           stepId: fact.stepId,
           status: "skipped",
           attempts: 0,
+          output: null,
         };
         break;
       case "step.reset":
@@ -567,8 +590,7 @@ export function projectRunState(
     status,
     steps,
     facts,
-    ...(flowHash !== undefined ? { flowHash } : {}),
-    ...(codeVersion !== undefined ? { codeVersion } : {}),
+    ...compact({ flowHash, codeVersion }),
   };
 }
 

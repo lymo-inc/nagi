@@ -62,7 +62,7 @@ export interface Register {}
 
 export type Tx = Register extends { tx: infer T } ? T : unknown;
 
-export type StepKind = "task" | "signal" | "match" | "subflow";
+export type StepKind = "task" | "signal" | "match" | "subflow" | "streaming";
 
 export interface Step<Output = unknown> {
   readonly kind: StepKind;
@@ -77,6 +77,14 @@ export type NeedsMap = StepMap;
 export type NeedsOutputs<N extends NeedsMap> = {
   readonly [K in keyof N]: StepOutput<N[K]>;
 };
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+export interface LogEntry {
+  readonly level: LogLevel;
+  readonly msg: string;
+  readonly attrs?: Record<string, unknown>;
+}
 
 export interface Logger {
   debug(message: string, attrs?: Record<string, unknown>): void;
@@ -98,6 +106,26 @@ export interface StepCtx<Input = unknown> {
   once<T extends Json>(scope: string, fn: () => Promise<T>): Promise<T>;
 
   idempotencyKey(scope: string): string;
+}
+
+/**
+ * The element delivered by {@link Store.subscribeStream} / `wf.subscribe`: a
+ * discriminated control+data envelope. A real streamed value only ever arrives
+ * as `{ kind: "chunk" }`; `dropped`/`retry`/`error` are framework markers, so a
+ * consumer that switches on `kind` cannot confuse a marker with a data chunk.
+ * Generated as: `chunk` from `ctx.emit`, `dropped` on per-subscriber buffer
+ * overflow, `retry` when a streaming step is re-attempted, `error` on terminal
+ * `step.failed` (retries exhausted).
+ */
+export type StreamEvent<C = Json> =
+  | { readonly kind: "chunk"; readonly chunk: C }
+  | { readonly kind: "dropped"; readonly count: number }
+  | { readonly kind: "retry"; readonly attempt: AttemptNumber }
+  | { readonly kind: "error"; readonly error: SerializedError };
+
+export interface StreamingStepCtx<Input = unknown, Chunk = Json>
+  extends StepCtx<Input> {
+  readonly emit: (chunk: Chunk) => Promise<void>;
 }
 
 export type BackoffStrategy = "exponential" | "linear" | "fixed";
@@ -126,6 +154,23 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<NeedsOutputs<N>>;
     readonly ctx: StepCtx<NoInfer<Input>>;
+  }) => Promise<Output>;
+
+  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
+  readonly onComplete?: (
+    event: StepCompleteEvent & { readonly output: NoInfer<Output> },
+  ) => void | Promise<void>;
+  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
+  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
+}
+
+export interface StreamingTaskConfig<Input, N extends NeedsMap, Output, Chunk>
+  extends StepConfigBase<Input, N> {
+  readonly retry?: RetryPolicy;
+  readonly run: (args: {
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<NeedsOutputs<N>>;
+    readonly ctx: StreamingStepCtx<NoInfer<Input>, Chunk>;
   }) => Promise<Output>;
 
   readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
@@ -209,6 +254,10 @@ export interface Builder<Input = unknown> {
   task<N extends NeedsMap, Output>(
     config: TaskConfig<Input, N, Output>,
   ): Step<Output>;
+
+  streamingTask<N extends NeedsMap, O, C = Json>(
+    config: StreamingTaskConfig<Input, N, O, C>,
+  ): Step<O>;
 
   signal<N extends NeedsMap, S extends StandardSchemaV1>(
     config: SignalConfig<Input, N, S>,
@@ -504,6 +553,29 @@ export interface Store {
 
   // MUST never prune non-terminal runs; delete in batches of opts.batchSize.
   pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult>;
+
+  /**
+   * Optional streaming transport read-side. Present only on adapters that can
+   * fan out ephemeral chunks (e.g. the in-memory store). When any registered
+   * flow contains a `streaming` step and this is undefined, `nagi()` throws at
+   * registration (fail-fast), mirroring {@link Queue.ensureSchema}'s gating.
+   * Yields a {@link StreamEvent} envelope; the iterator closes when the step
+   * reaches a terminal fact. `replayBuffered` is best-effort against a bounded,
+   * terminal-dropped buffer.
+   */
+  subscribeStream?(
+    runId: RunId,
+    stepId: StepId,
+    opts?: { readonly replayBuffered?: boolean },
+  ): AsyncIterable<StreamEvent<Json>>;
+
+  /**
+   * Optional streaming transport write-side. `ctx.emit` pushes a raw chunk; the
+   * transport wraps it as `{ kind: "chunk", chunk }` and fans out. The
+   * `dropped`/`retry`/`error` events are transport/dispatch-generated, not
+   * published here. Fire-and-forget and out-of-band — never routed through `tx`.
+   */
+  publishChunk?(runId: RunId, stepId: StepId, chunk: Json): void;
 }
 
 export interface QueryRunsWhere<FlowId extends string = string> {
@@ -802,7 +874,7 @@ export interface StepState {
   readonly stepId: StepId;
   readonly status: StepStatus;
   readonly attempts: AttemptNumber;
-  readonly output?: Json;
+  readonly output: Json;
   readonly error?: SerializedError;
 }
 

@@ -1,12 +1,15 @@
 import {
   attachDef,
+  compact,
   type MatchArmDef,
   type MatchDef,
   type ParentMatchRef,
   type PendingMatchArm,
   type PendingMatchDef,
+  peekDef,
   type SignalDef,
   type StepDef,
+  type StreamingTaskDef,
   type SubflowDef,
   type TaskDef,
 } from "./internal";
@@ -26,8 +29,8 @@ import type {
   SignalConfig,
   StandardSchemaV1,
   Step,
-  StepCompleteEvent,
   StepMap,
+  StreamingTaskConfig,
   SubflowConfig,
   SubflowStepOutput,
   TaskConfig,
@@ -40,31 +43,38 @@ function makeBuilder<Input>(): Builder<Input> {
     const def: TaskDef = {
       kind: "task",
       needs: (config.needs ?? {}) as NeedsMap,
-      ...(config.retry !== undefined ? { retry: config.retry } : {}),
-      ...(config.timeoutMs !== undefined
-        ? { timeoutMs: config.timeoutMs }
-        : {}),
-      ...(config.when !== undefined
-        ? {
-            when: config.when as (args: {
-              input: unknown;
-              needs: Record<string, unknown>;
-            }) => boolean,
-          }
-        : {}),
       run: config.run as TaskDef["run"],
-      ...(config.onStart !== undefined ? { onStart: config.onStart } : {}),
-      ...(config.onComplete !== undefined
-        ? {
-            onComplete: config.onComplete as (
-              event: StepCompleteEvent,
-            ) => void | Promise<void>,
-          }
-        : {}),
-      ...(config.onError !== undefined ? { onError: config.onError } : {}),
-      ...(config.onRetry !== undefined ? { onRetry: config.onRetry } : {}),
+      ...compact({
+        retry: config.retry,
+        timeoutMs: config.timeoutMs,
+        when: config.when as TaskDef["when"],
+        onStart: config.onStart,
+        onComplete: config.onComplete as TaskDef["onComplete"],
+        onError: config.onError,
+        onRetry: config.onRetry,
+      }),
     };
     return attachDef<O>({ kind: "task", id: "" }, def);
+  }
+
+  function streamingTask<N extends NeedsMap, O, C = Json>(
+    config: StreamingTaskConfig<Input, N, O, C>,
+  ): Step<O> {
+    const def: StreamingTaskDef = {
+      kind: "streaming",
+      needs: (config.needs ?? {}) as NeedsMap,
+      run: config.run as StreamingTaskDef["run"],
+      ...compact({
+        retry: config.retry,
+        timeoutMs: config.timeoutMs,
+        when: config.when as StreamingTaskDef["when"],
+        onStart: config.onStart,
+        onComplete: config.onComplete as StreamingTaskDef["onComplete"],
+        onError: config.onError,
+        onRetry: config.onRetry,
+      }),
+    };
+    return attachDef<O>({ kind: "streaming", id: "" }, def);
   }
 
   function signal<N extends NeedsMap, S extends StandardSchemaV1>(
@@ -74,18 +84,11 @@ function makeBuilder<Input>(): Builder<Input> {
       kind: "signal",
       needs: (config.needs ?? {}) as NeedsMap,
       schema: config.schema,
-      ...(config.names !== undefined ? { names: config.names } : {}),
-      ...(config.timeoutMs !== undefined
-        ? { timeoutMs: config.timeoutMs }
-        : {}),
-      ...(config.when !== undefined
-        ? {
-            when: config.when as (args: {
-              input: unknown;
-              needs: Record<string, unknown>;
-            }) => boolean,
-          }
-        : {}),
+      ...compact({
+        names: config.names,
+        timeoutMs: config.timeoutMs,
+        when: config.when as SignalDef["when"],
+      }),
     };
     return attachDef<InferSchemaOutput<S>>({ kind: "signal", id: "" }, def);
   }
@@ -99,17 +102,10 @@ function makeBuilder<Input>(): Builder<Input> {
       needs: (config.needs ?? {}) as NeedsMap,
       childFlowId: child.id,
       buildInput: config.input as SubflowDef["buildInput"],
-      ...(config.timeoutMs !== undefined
-        ? { timeoutMs: config.timeoutMs }
-        : {}),
-      ...(config.when !== undefined
-        ? {
-            when: config.when as (args: {
-              input: unknown;
-              needs: Record<string, unknown>;
-            }) => boolean,
-          }
-        : {}),
+      ...compact({
+        timeoutMs: config.timeoutMs,
+        when: config.when as SubflowDef["when"],
+      }),
     };
     return attachDef<SubflowStepOutput<FlowOutput<Child>>>(
       { kind: "subflow", id: "" },
@@ -141,14 +137,12 @@ function makeBuilder<Input>(): Builder<Input> {
       });
     }
     const def: PendingMatchDef = { kind: "match", needs, arms };
-    return attachDef<unknown>(
-      { kind: "match", id: "" },
-      def as unknown as StepDef,
-    );
+    return attachDef<unknown>({ kind: "match", id: "" }, def);
   }
 
   return {
     task,
+    streamingTask,
     signal,
     subflow,
     match: match as Builder<Input>["match"],
@@ -185,16 +179,14 @@ export function flow<
     id: config.id,
     input: config.input,
     steps: finalSteps as R,
-    ...(config.output !== undefined ? { output: config.output } : {}),
-    ...(config.onStart !== undefined ? { onStart: config.onStart } : {}),
-    ...(config.onComplete !== undefined
-      ? {
-          onComplete: config.onComplete as (
-            event: FlowCompleteEvent,
-          ) => void | Promise<void>,
-        }
-      : {}),
-    ...(config.onError !== undefined ? { onError: config.onError } : {}),
+    ...compact({
+      output: config.output,
+      onStart: config.onStart,
+      onComplete: config.onComplete as
+        | ((event: FlowCompleteEvent) => void | Promise<void>)
+        | undefined,
+      onError: config.onError,
+    }),
     ...(config.concurrency !== undefined
       ? { concurrency: normalizeConcurrency(config.concurrency) }
       : {}),
@@ -226,9 +218,9 @@ function collectIds(
   for (const [key, step] of Object.entries(map)) {
     const id = prefix ? `${prefix}.${key}` : key;
     idByIdentity.set(step, id);
-    const def = (step as { __def?: StepDef }).__def;
+    const def = peekDef(step);
     if (def?.kind === "match") {
-      const pending = def as unknown as PendingMatchDef;
+      const pending = def as PendingMatchDef;
       for (const arm of pending.arms) {
         collectIds(arm.nested, `${id}.${arm.id}`, idByIdentity);
       }
@@ -250,7 +242,7 @@ function walkAndRewrite(args: WalkArgs): void {
 
   for (const [key, step] of Object.entries(map)) {
     const id = prefix ? `${prefix}.${key}` : key;
-    const def = (step as { __def?: StepDef }).__def;
+    const def = peekDef(step);
     if (def === undefined) {
       throw new Error(
         `Flow "${flowId}": step "${id}" has no internal def. ` +
@@ -283,7 +275,7 @@ function walkAndRewrite(args: WalkArgs): void {
     }
 
     if (def.kind === "match") {
-      const pending = def as unknown as PendingMatchDef;
+      const pending = def as PendingMatchDef;
       const finalizedArms: MatchArmDef[] = [];
 
       for (const arm of pending.arms) {
@@ -338,7 +330,7 @@ function assertSignalNameUniqueness(
   }
 
   for (const [stepId, step] of Object.entries(finalSteps)) {
-    const def = (step as { __def?: StepDef }).__def;
+    const def = peekDef(step);
     if (def === undefined || def.kind !== "signal") continue;
     if (def.names === undefined) continue;
 

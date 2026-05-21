@@ -21,7 +21,8 @@
       },
       "complexity": {
         "noForEach": "off",
-        "noStaticOnlyClass": "off"
+        "noStaticOnlyClass": "off",
+        "useLiteralKeys": "off"
       },
       "suspicious": {
         "noArrayIndexKey": "warn",

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { getDef } from "./internal";
+import { flow } from "../builder";
+import { getDef } from "../internal";
+import type { Step } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
 describe("flow()", () => {
@@ -34,7 +35,6 @@ describe("flow()", () => {
     });
 
     const downstreamDef = getDef(f.steps.downstream as never);
-    // biome-ignore lint/complexity/useLiteralKeys: index-signature access requires bracket notation under TS strict
     const upstreamRef = downstreamDef.needs["foo"] as { id: string };
     expect(upstreamRef.id).toBe("upstream");
   });
@@ -55,7 +55,6 @@ describe("flow()", () => {
 
     const def = getDef(f.steps.downstream as never);
     expect(Object.keys(def.needs)).toEqual(["localName"]);
-    // biome-ignore lint/complexity/useLiteralKeys: index-signature access requires bracket notation under TS strict
     expect((def.needs["localName"] as { id: string }).id).toBe("a");
   });
 
@@ -138,5 +137,79 @@ describe("flow()", () => {
     });
     expect(f.id).toBe("preserves");
     expect(f.input).toBe(inputSchema);
+  });
+});
+
+describe("flow() — streamingTask", () => {
+  it('assigns an id and an internal def with kind "streaming"', () => {
+    const f = flow({
+      id: "streaming-kind",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const generate = b.streamingTask({
+          run: async ({ ctx }) => {
+            await ctx.emit({ token: "hi" });
+            return { text: "hi" };
+          },
+        });
+        return { generate };
+      },
+    });
+
+    expect(f.steps.generate?.id).toBe("generate");
+    expect(f.steps.generate?.kind).toBe("streaming");
+    expect(getDef(f.steps.generate as never).kind).toBe("streaming");
+  });
+
+  it("rewrites needs so a downstream task sees the streaming step's id", () => {
+    const f = flow({
+      id: "streaming-needs",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const generate = b.streamingTask({
+          run: async () => ({ text: "y" }),
+        });
+        const persist = b.task({
+          needs: { gen: generate },
+          run: async ({ needs }) => ({ saved: needs.gen.text }),
+        });
+        return { generate, persist };
+      },
+    });
+
+    const persistDef = getDef(f.steps.persist as never);
+    const upstreamRef = persistDef.needs["gen"] as { id: string };
+    expect(upstreamRef.id).toBe("generate");
+  });
+
+  it("nests under a match arm with the arm-prefixed id", () => {
+    const f = flow({
+      id: "streaming-in-match",
+      input: passthroughSchema<{ kind: "a" | "b" }>(),
+      build: (b) =>
+        ({
+          m: b.match({
+            arms: [
+              {
+                when: ({ input }) => input.kind === "a",
+                build: (b1) => ({
+                  gen: b1.streamingTask({ run: async () => ({ text: "x" }) }),
+                }),
+              },
+              {
+                otherwise: true,
+                build: (b1) => ({ noop: b1.task({ run: async () => null }) }),
+              },
+            ],
+          }),
+        }) as never,
+    });
+
+    const allSteps = f.steps as Record<string, Step<unknown>>;
+    const nested = allSteps["m.arm0.gen"];
+    expect(nested?.kind).toBe("streaming");
+    const nestedDef = getDef(nested as never);
+    expect(nestedDef.kind).toBe("streaming");
+    expect(nestedDef.parentMatch).toEqual({ matchId: "m", armId: "arm0" });
   });
 });

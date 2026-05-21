@@ -13,7 +13,6 @@ import { migrate } from "./migrations";
 import { postgresStore } from "./store";
 import { uuidv7 } from "./uuidv7";
 
-// biome-ignore lint/complexity/useLiteralKeys: index-signature access requires bracket notation under TS strict
 const url = process.env["NAGI_POSTGRES_TEST_URL"];
 const d = url ? describe : describe.skip;
 

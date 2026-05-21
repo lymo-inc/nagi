@@ -1,17 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "./builder";
-import { computeBackoff } from "./dispatch";
-import { makeHarness, passthroughSchema } from "./test-helpers";
+import { flow } from "../builder";
+import { computeBackoff } from "../dispatch";
 import type {
   FlowCompleteEvent,
   FlowErrorEvent,
   FlowStartEvent,
-  Logger,
+  LogEntry,
   RetryPolicy,
   StepErrorEvent,
   StepRetryEvent,
   StepStartEvent,
-} from "./types";
+} from "../types";
+import { makeHarness, passthroughSchema, spyOnLog } from "./test-helpers";
 
 describe("computeBackoff", () => {
   const exp: RetryPolicy = {
@@ -413,13 +413,7 @@ describe("step-local lifecycle hooks", () => {
   });
 
   it("swallows a thrown step-local hook and continues the run", async () => {
-    const logs: string[] = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: (m) => logs.push(m),
-    };
+    const { onLog, entries } = spyOnLog();
     const f = flow({
       id: "hook-throws",
       input: passthroughSchema<Record<string, never>>(),
@@ -432,14 +426,19 @@ describe("step-local lifecycle hooks", () => {
         }),
       }),
     });
-    const h = await makeHarness(f, { logger });
+    const h = await makeHarness(f, { onLog });
     const runId = await h.wf.start(f, {});
     await h.drain();
 
     const result = await h.result(runId);
     expect(result.status).toBe("completed");
     expect(result.output("only")).toEqual({ ok: true });
-    expect(logs.some((m) => m.includes("step.onComplete"))).toBe(true);
+    expect(
+      entries.some(
+        (e: LogEntry) =>
+          e.level === "error" && e.msg.includes("step.onComplete"),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -525,13 +524,7 @@ describe("flow-level lifecycle hooks", () => {
   });
 
   it("swallows a thrown flow-local hook and finalizes the run", async () => {
-    const logs: string[] = [];
-    const logger: Logger = {
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: (m) => logs.push(m),
-    };
+    const { onLog, entries } = spyOnLog();
     const completes: FlowCompleteEvent[] = [];
     const f = flow({
       id: "flow-onComplete-throws",
@@ -542,7 +535,7 @@ describe("flow-level lifecycle hooks", () => {
       },
     });
     const h = await makeHarness(f, {
-      logger,
+      onLog,
       hooks: {
         onFlowComplete: (event) => {
           completes.push(event);
@@ -554,7 +547,12 @@ describe("flow-level lifecycle hooks", () => {
 
     const result = await h.result(runId);
     expect(result.status).toBe("completed");
-    expect(logs.some((m) => m.includes("flow.onComplete"))).toBe(true);
+    expect(
+      entries.some(
+        (e: LogEntry) =>
+          e.level === "error" && e.msg.includes("flow.onComplete"),
+      ),
+    ).toBe(true);
     expect(completes).toHaveLength(1);
   });
 });

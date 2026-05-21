@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { flow } from "./builder";
-import { InMemoryQueue, InMemoryStore } from "./memory";
-import { nagi } from "./runtime";
+import { flow } from "../builder";
+import { InMemoryQueue, InMemoryStore } from "../memory";
+import { nagi } from "../runtime";
+import type { LogEntry, QueueDequeueOpts, QueueMessage } from "../types";
 import { passthroughSchema } from "./test-helpers";
-import type { Logger, QueueDequeueOpts, QueueMessage } from "./types";
 
 const echo = flow({
   id: "echo",
@@ -13,8 +13,17 @@ const echo = flow({
   }),
 });
 
-function spyLogger(): Logger {
-  return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+function captureOnLog(): {
+  onLog: (entry: LogEntry) => void;
+  entries: LogEntry[];
+  errors: () => LogEntry[];
+} {
+  const entries: LogEntry[] = [];
+  return {
+    onLog: (entry) => entries.push(entry),
+    entries,
+    errors: () => entries.filter((e) => e.level === "error"),
+  };
 }
 
 // A queue whose dequeue always throws — the one path that rejects worker.run()
@@ -116,47 +125,46 @@ describe("nagi.run — stop() lifecycle", () => {
 });
 
 describe("nagi.run — graceful vs crash", () => {
-  it("graceful stop() never calls logger.error", async () => {
-    const logger = spyLogger();
+  it("graceful stop() never emits an error entry", async () => {
+    const { onLog, errors } = captureOnLog();
     const store = new InMemoryStore();
     const handle = await nagi.run({
       flows: [echo],
       store,
       queue: new InMemoryQueue(),
       worker: { pollIntervalMs: 5 },
-      logger,
+      onLog,
     });
     const runId = await handle.wf.start(echo, { x: 5 });
     await vi.waitFor(async () => {
       expect((await store.loadRunState(runId)).status).toBe("completed");
     });
     await handle.stop();
-    expect(logger.error).not.toHaveBeenCalled();
+    expect(errors()).toHaveLength(0);
   });
 
-  it("a true loop crash is logged once via logger.error; stop() still resolves", async () => {
-    const logger = spyLogger();
+  it("a true loop crash emits exactly one error entry; stop() still resolves", async () => {
+    const { onLog, errors } = captureOnLog();
     const handle = await nagi.run({
       flows: [echo],
       store: new InMemoryStore(),
       queue: new CrashingQueue(),
       worker: { pollIntervalMs: 5 },
-      logger,
+      onLog,
     });
-    await vi.waitFor(() => expect(logger.error).toHaveBeenCalledTimes(1));
-    expect(logger.error).toHaveBeenCalledWith(
-      "nagi.run: worker exited unexpectedly",
-      expect.objectContaining({
-        error: expect.stringContaining("queue connection lost"),
-      }),
-    );
+    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+    const crash = errors()[0];
+    expect(crash?.msg).toBe("nagi.run: worker exited unexpectedly");
+    expect(crash?.attrs).toMatchObject({
+      error: expect.stringContaining("queue connection lost"),
+    });
     await expect(handle.stop()).resolves.toBeUndefined();
   });
 });
 
 describe("nagi.run — external signal", () => {
-  it("aborting an external signal triggers graceful shutdown (no logger.error)", async () => {
-    const logger = spyLogger();
+  it("aborting an external signal triggers graceful shutdown (no error entry)", async () => {
+    const { onLog, errors } = captureOnLog();
     const ac = new AbortController();
     const handle = await nagi.run({
       flows: [echo],
@@ -164,15 +172,15 @@ describe("nagi.run — external signal", () => {
       queue: new InMemoryQueue(),
       worker: { pollIntervalMs: 5 },
       signal: ac.signal,
-      logger,
+      onLog,
     });
     ac.abort();
     await handle.stop();
-    expect(logger.error).not.toHaveBeenCalled();
+    expect(errors()).toHaveLength(0);
   });
 
   it("an already-aborted external signal yields an immediately-stopped runtime", async () => {
-    const logger = spyLogger();
+    const { onLog, errors } = captureOnLog();
     const ac = new AbortController();
     ac.abort();
     const handle = await nagi.run({
@@ -180,10 +188,10 @@ describe("nagi.run — external signal", () => {
       store: new InMemoryStore(),
       queue: new InMemoryQueue(),
       signal: ac.signal,
-      logger,
+      onLog,
     });
     await handle.stop();
-    expect(logger.error).not.toHaveBeenCalled();
+    expect(errors()).toHaveLength(0);
   });
 });
 
