@@ -282,3 +282,68 @@ describe("wf.queryRuns — runtime layer", () => {
     ).rejects.toBeInstanceOf(NagiValidationError);
   });
 });
+
+describe("wf.queryRuns — no runtime delta after RFC 0018 typing", () => {
+  const f = flow({
+    id: "a",
+    input: passthroughSchema<{ videoId: string }>(),
+    build: (b) => ({ only: b.task({ run: async ({ input }) => input }) }),
+  });
+  const g = flow({
+    id: "b",
+    input: passthroughSchema<{ dealId: string }>(),
+    build: (b) => ({ only: b.task({ run: async ({ input }) => input }) }),
+  });
+
+  async function setup() {
+    const wf = await nagi({
+      flows: [f, g],
+      store: new InMemoryStore(),
+      queue: new InMemoryQueue(),
+      clock: new InMemoryClock(),
+    });
+    await wf.start(f, { videoId: "v-1" });
+    await wf.start(g, { dealId: "d-1" });
+    return wf;
+  }
+
+  it("returns the same { runs, cursor } shape; flowId values are the registered id strings", async () => {
+    const wf = await setup();
+    const r = await wf.queryRuns();
+    expect(Object.keys(r).sort()).toEqual(["cursor", "runs"]);
+    expect(Array.isArray(r.runs)).toBe(true);
+    expect(r.runs).toHaveLength(2);
+    // The literal type narrows at compile time; the runtime value is the
+    // plain registered id string — unchanged from before.
+    expect(r.runs.map((x) => x.flowId).sort()).toEqual(["a", "b"]);
+    expect(r.cursor === null || typeof r.cursor === "string").toBe(true);
+  });
+
+  it("flowId filter still narrows to a single flow at runtime", async () => {
+    const wf = await setup();
+    const r = await wf.queryRuns({ where: { flowId: "b" } });
+    expect(r.runs).toHaveLength(1);
+    expect(r.runs[0]?.flowId).toBe("b");
+  });
+
+  it("`latest: true` still returns at most the newest single run", async () => {
+    const wf = await setup();
+    const r = await wf.queryRuns({ latest: true });
+    expect(r.runs).toHaveLength(1);
+    expect(r.cursor).toBeNull();
+  });
+
+  it("limit/cursor pagination still walks all rows", async () => {
+    const wf = await setup();
+    const first = await wf.queryRuns({ limit: 1 });
+    expect(first.runs).toHaveLength(1);
+    expect(first.cursor).not.toBeNull();
+    const second = await wf.queryRuns({
+      limit: 1,
+      cursor: first.cursor as string,
+    });
+    expect(second.runs).toHaveLength(1);
+    const ids = [...first.runs, ...second.runs].map((x) => x.runId);
+    expect(new Set(ids).size).toBe(2);
+  });
+});

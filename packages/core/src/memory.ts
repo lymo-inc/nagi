@@ -133,11 +133,11 @@ export class InMemoryStore implements Store {
     }
 
     this.facts.set(runId, [fact]);
-    if (fact.parentRunId !== undefined) {
-      const set =
-        this.childrenByParent.get(fact.parentRunId) ?? new Set<RunId>();
+    const parentRunId = fact.parent?.runId;
+    if (parentRunId !== undefined) {
+      const set = this.childrenByParent.get(parentRunId) ?? new Set<RunId>();
       set.add(runId);
-      this.childrenByParent.set(fact.parentRunId, set);
+      this.childrenByParent.set(parentRunId, set);
     }
     return { started: true, canceled };
   }
@@ -343,7 +343,7 @@ export class InMemoryStore implements Store {
       const first = factList[0];
       const parentRunId =
         first !== undefined && first.kind === "flow.started"
-          ? first.parentRunId
+          ? first.parent?.runId
           : undefined;
       victims.push({
         runId: runId as RunId,

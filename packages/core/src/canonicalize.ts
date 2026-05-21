@@ -68,8 +68,9 @@ const DEFAULT_RETRY: CanonicalRetryPolicy = {
 let warnedAboutSourceHash = false;
 function warnSourceHashOnce(): void {
   if (warnedAboutSourceHash) return;
+
   warnedAboutSourceHash = true;
-  // biome-ignore lint/suspicious/noConsole: one-time runtime advisory by design
+
   console.warn(
     "[nagi] canonicalize: hashing `when`/schema source via Function.prototype.toString(). " +
       "Cosmetic source changes (minification, whitespace, identifier renames) will flip " +

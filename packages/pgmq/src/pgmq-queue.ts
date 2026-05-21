@@ -14,8 +14,8 @@ import { type Kysely, sql } from "kysely";
 const DEFAULT_QUEUE_NAME = "nagi";
 const DEFAULT_VISIBILITY_TIMEOUT_MS: Millis = 30_000;
 
-export interface PgmqQueueOpts {
-  readonly db: Kysely<unknown>;
+export interface PgmqQueueOpts<DB = unknown> {
+  readonly db: Kysely<DB>;
   readonly queueName?: string;
   readonly visibilityTimeoutMs?: Millis;
   readonly partitioned?: boolean;
@@ -39,8 +39,10 @@ interface QueueConfig {
   readonly archiveOnAck: boolean;
 }
 
-export function pgmqQueue(opts: PgmqQueueOpts): PgmqQueue {
-  const db = opts.db;
+export function pgmqQueue<DB = unknown>(opts: PgmqQueueOpts<DB>): PgmqQueue {
+  // Single internal erasure: callers keep their concrete Kysely<DB> (no cast at
+  // the callsite); the queue body is schema-agnostic, so widen once here.
+  const db = opts.db as unknown as Kysely<unknown>;
   const queueName = opts.queueName ?? DEFAULT_QUEUE_NAME;
   const vtSeconds = Math.max(
     1,

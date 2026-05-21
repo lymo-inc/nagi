@@ -230,8 +230,19 @@ export interface Builder<Input = unknown> {
 
 export type ConcurrencyMode = "cancel-in-progress";
 
-export interface FlowConcurrency<Input = Json> {
-  readonly keyFn: (input: Input) => string;
+export type StringKeyOf<Input> = {
+  [K in keyof Input]-?: Input[K] extends string ? K : never;
+}[keyof Input];
+
+export type FlowConcurrency<Input = Json> =
+  | StringKeyOf<Input>
+  | {
+      readonly keyFn: (input: Input) => string;
+      readonly mode?: ConcurrencyMode;
+    };
+
+export interface ResolvedConcurrency {
+  readonly keyFn: (input: Json) => string;
   readonly mode: ConcurrencyMode;
 }
 
@@ -269,7 +280,7 @@ export interface Flow<
   readonly onStart?: (event: FlowStartEvent) => void | Promise<void>;
   readonly onComplete?: (event: FlowCompleteEvent) => void | Promise<void>;
   readonly onError?: (event: FlowErrorEvent) => void | Promise<void>;
-  readonly concurrency?: FlowConcurrency<Json>;
+  readonly concurrency?: ResolvedConcurrency;
 }
 
 export type FlowInput<F> =
@@ -279,6 +290,27 @@ export type FlowInput<F> =
 
 export type FlowOutput<F> =
   F extends Flow<string, StandardSchemaV1, StepMap, infer O> ? O : never;
+
+export type FlowIdOf<T extends ReadonlyArray<Flow>> =
+  T[number] extends Flow<infer Id> ? Id : never;
+
+/**
+ * Durable parent linkage persisted on {@link FlowStartedFact}. Present when a
+ * run was started as a subflow child; absent for top-level runs.
+ */
+export interface ParentLink {
+  readonly runId: RunId;
+  readonly stepId: StepId;
+}
+
+/**
+ * In-process parent reference: a {@link ParentLink} plus the parent step's
+ * attempt, used to thread otel spans and registry lookups. Not persisted — the
+ * attempt is re-derived from parent run state when a subflow wakes its parent.
+ */
+export interface ParentRef extends ParentLink {
+  readonly attempt: AttemptNumber;
+}
 
 export interface FlowEvent {
   readonly runId: RunId;
@@ -291,13 +323,9 @@ export interface FlowStartEvent extends FlowEvent {
   /**
    * Set when this run was started as a subflow child. Undefined for
    * top-level runs (start / startById). Carried in-process only — for
-   * durable linkage see FlowStartedFact.parentRunId / parentStepId.
+   * durable linkage see {@link FlowStartedFact.parent}.
    */
-  readonly parent?: {
-    readonly runId: RunId;
-    readonly stepId: StepId;
-    readonly attempt: AttemptNumber;
-  };
+  readonly parent?: ParentRef;
 }
 
 export interface FlowCompleteEvent extends FlowEvent {
@@ -478,37 +506,37 @@ export interface Store {
   pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult>;
 }
 
-export interface QueryRunsWhere {
-  readonly flowId?: string;
+export interface QueryRunsWhere<FlowId extends string = string> {
+  readonly flowId?: FlowId;
   readonly status?: RunStatus | ReadonlyArray<RunStatus>;
   readonly input?: Record<string, Json>;
 }
 
-export type QueryRunsOpts =
+export type QueryRunsOpts<FlowId extends string = string> =
   | {
-      readonly where?: QueryRunsWhere;
+      readonly where?: QueryRunsWhere<FlowId>;
       readonly latest: true;
       readonly limit?: never;
       readonly cursor?: never;
     }
   | {
-      readonly where?: QueryRunsWhere;
+      readonly where?: QueryRunsWhere<FlowId>;
       readonly latest?: false;
       readonly limit?: number;
       readonly cursor?: string;
     };
 
-export interface RunSummary {
+export interface RunSummary<FlowId extends string = string> {
   readonly runId: RunId;
-  readonly flowId: string;
+  readonly flowId: FlowId;
   readonly status: RunStatus;
   readonly startedAt: Date;
   readonly completedAt: Date | null;
   readonly input: Json;
 }
 
-export interface QueryRunsResult {
-  readonly runs: ReadonlyArray<RunSummary>;
+export interface QueryRunsResult<FlowId extends string = string> {
+  readonly runs: ReadonlyArray<RunSummary<FlowId>>;
   readonly cursor: string | null;
 }
 
@@ -553,6 +581,13 @@ export interface Queue {
   ack(receipt: string): Promise<void>;
   nack(receipt: string, opts?: { delayMs?: Millis }): Promise<void>;
   extend(receipt: string, leaseMs: Millis): Promise<void>;
+  /**
+   * Optional one-shot, idempotent provisioning of the queue's backing schema.
+   * When present, `nagi()` awaits it once at construction (fail-fast), so a
+   * misconfigured queue surfaces at boot instead of on first enqueue. Adapters
+   * needing no provisioning (e.g. in-memory) omit it.
+   */
+  ensureSchema?(): Promise<void>;
 }
 
 export interface Clock {
@@ -594,8 +629,8 @@ export interface FlowStartedFact extends FactBase {
   readonly input: Json;
   readonly flowHash?: string;
   readonly codeVersion?: string;
-  readonly parentRunId?: RunId;
-  readonly parentStepId?: StepId;
+  /** Present when this run was started as a subflow child; absent for roots. */
+  readonly parent?: ParentLink;
 }
 
 export interface FlowRefUpdatedFact {

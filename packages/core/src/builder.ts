@@ -22,6 +22,7 @@ import type {
   MatchArm,
   MatchGuardConfig,
   NeedsMap,
+  ResolvedConcurrency,
   SignalConfig,
   StandardSchemaV1,
   Step,
@@ -195,8 +196,25 @@ export function flow<
       : {}),
     ...(config.onError !== undefined ? { onError: config.onError } : {}),
     ...(config.concurrency !== undefined
-      ? { concurrency: config.concurrency as FlowConcurrency<Json> }
+      ? { concurrency: normalizeConcurrency(config.concurrency) }
       : {}),
+  };
+}
+
+function normalizeConcurrency<Input>(
+  c: FlowConcurrency<Input>,
+): ResolvedConcurrency {
+  if (typeof c === "object") {
+    return {
+      keyFn: c.keyFn as (input: Json) => string,
+      mode: c.mode ?? "cancel-in-progress",
+    };
+  }
+  const key = c;
+  return {
+    keyFn: (input) =>
+      (input as Record<string, unknown>)[key as string] as string,
+    mode: "cancel-in-progress",
   };
 }
 

@@ -1,5 +1,5 @@
 ---
-"@nagi-js/core": minor
+"@nagi-js/core": patch
 "@nagi-js/postgres": patch
 ---
 

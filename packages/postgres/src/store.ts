@@ -96,7 +96,7 @@ class PostgresStore<DB = unknown> implements Store {
           INSERT INTO ${sql.raw(this.t("workflow_run"))}
             (run_id, flow_id, status, input, started_at, flow_hash, code_version, parent_run_id, parent_step_id)
           VALUES
-            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${fact.parentRunId ?? null}, ${fact.parentStepId ?? null})
+            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
           ON CONFLICT (run_id) DO NOTHING
           RETURNING run_id
         `.execute(trx);
@@ -172,7 +172,7 @@ class PostgresStore<DB = unknown> implements Store {
         INSERT INTO ${sql.raw(this.t("workflow_run"))}
           (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key, parent_run_id, parent_step_id)
         VALUES
-          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parentRunId ?? null}, ${fact.parentStepId ?? null})
+          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
       `.execute(trx);
       await this.insertFact(trx, runId, fact);
 

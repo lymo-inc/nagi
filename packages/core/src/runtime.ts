@@ -16,12 +16,14 @@ import { attachDef, getDef, type SignalDef, type StepDef } from "./internal";
 import { InMemoryClock } from "./memory";
 import { descendantsOf } from "./scheduler";
 import type {
-  AttemptNumber,
   Clock,
   Fact,
   Flow,
+  FlowCanceledByOperatorFact,
+  FlowCanceledExplicitlyFact,
   FlowCanceledFact,
   FlowHooks,
+  FlowIdOf,
   FlowInput,
   FlowStartedFact,
   Json,
@@ -29,6 +31,7 @@ import type {
   Operator,
   OperatorAuditOpts,
   OperatorSkipOpts,
+  ParentRef,
   PrunableStatus,
   PruneOpts,
   PruneResult,
@@ -68,8 +71,8 @@ export interface CancelOpts {
   readonly reason?: string;
 }
 
-export interface Wf {
-  start<F extends Flow>(
+export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
+  start<F extends TFlows[number]>(
     flow: F,
     input: FlowInput<F>,
     opts?: StartOpts,
@@ -97,7 +100,9 @@ export interface Wf {
 
   replay(runId: RunId, opts?: ReplayOpts): Promise<void>;
 
-  queryRuns(opts?: QueryRunsOpts): Promise<QueryRunsResult>;
+  queryRuns(
+    opts?: QueryRunsOpts<FlowIdOf<TFlows>>,
+  ): Promise<QueryRunsResult<FlowIdOf<TFlows>>>;
 
   operator(): Operator;
 
@@ -143,18 +148,17 @@ export class NagiCanceledError extends Error {
   }
 }
 
-type CancelArgs =
-  | {
-      readonly cause: "explicit";
-      readonly reason: string;
-      readonly note?: string;
-    }
-  | {
-      readonly cause: "operator";
-      readonly reason: string;
-      readonly actor: string;
-      readonly note?: string;
-    };
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+  ? Omit<T, K>
+  : never;
+
+// The human-initiated cancel causes minus the persisted-fact envelope, derived
+// from the facts so cancel intent and the recorded fact can't drift.
+// Concurrency cancellation is system-internal and intentionally excluded.
+type CancelArgs = DistributiveOmit<
+  FlowCanceledExplicitlyFact | FlowCanceledByOperatorFact,
+  "kind" | "runId" | "at"
+>;
 
 export class NagiSnapshotDriftError extends Error {
   readonly runId: RunId;
@@ -177,8 +181,14 @@ export class NagiSnapshotDriftError extends Error {
   }
 }
 
-export async function nagi(config: NagiConfig): Promise<Wf> {
+async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
+  config: NagiConfig & { flows: TFlows },
+): Promise<Wf<TFlows>> {
   const clock = config.clock ?? new InMemoryClock();
+  // One-shot queue provisioning (RFC 0013): eager + fail-fast at construction,
+  // before any run can enqueue. A no-op for adapters without the hook.
+  await config.queue.ensureSchema?.();
+
   const flowsById = new Map<string, Flow>();
   const flowHashById = new Map<string, string>();
   for (const f of config.flows) {
@@ -233,20 +243,12 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
     readonly flow: Flow;
     readonly validatedInput: Json;
     readonly runId: RunId;
-    readonly parentRunId?: RunId;
-    readonly parentStepId?: StepId;
-    readonly parentStepAttempt?: AttemptNumber;
+    readonly parent?: ParentRef;
   }): Promise<{ readonly started: boolean }> {
-    const {
-      flow,
-      validatedInput,
-      runId,
-      parentRunId,
-      parentStepId,
-      parentStepAttempt,
-    } = args;
+    const { flow, validatedInput, runId, parent } = args;
     const startedAt = clock.now();
     const flowHash = flowHashById.get(flow.id);
+
     const fact: FlowStartedFact = {
       kind: "flow.started",
       runId,
@@ -255,8 +257,9 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       at: startedAt,
       ...(flowHash !== undefined ? { flowHash } : {}),
       codeVersion,
-      ...(parentRunId !== undefined ? { parentRunId } : {}),
-      ...(parentStepId !== undefined ? { parentStepId } : {}),
+      ...(parent !== undefined
+        ? { parent: { runId: parent.runId, stepId: parent.stepId } }
+        : {}),
     };
 
     let concurrencyArg:
@@ -320,19 +323,13 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
     }
 
     const startEvent =
-      parentRunId !== undefined &&
-      parentStepId !== undefined &&
-      parentStepAttempt !== undefined
+      parent !== undefined
         ? {
             runId,
             flowId: flow.id,
             input: validatedInput,
             at: startedAt,
-            parent: {
-              runId: parentRunId,
-              stepId: parentStepId,
-              attempt: parentStepAttempt,
-            },
+            parent,
           }
         : {
             runId,
@@ -360,12 +357,9 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
   async function startChildRun(args: {
     readonly child: Flow;
     readonly childInput: unknown;
-    readonly parentRunId: RunId;
-    readonly parentStepId: StepId;
-    readonly parentStepAttempt: AttemptNumber;
+    readonly parent: ParentRef;
   }): Promise<RunId> {
-    const { child, childInput, parentRunId, parentStepId, parentStepAttempt } =
-      args;
+    const { child, childInput, parent } = args;
     if (!flowsById.has(child.id)) {
       throw new NagiRuntimeError(
         `Subflow child "${child.id}" not registered with nagi(). Pass it to flows[].`,
@@ -377,9 +371,7 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       flow: child,
       validatedInput: validated,
       runId: childRunId,
-      parentRunId,
-      parentStepId,
-      parentStepAttempt,
+      parent,
     });
     if (!started) {
       throw new NagiRuntimeError(
@@ -406,25 +398,12 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       return;
     }
     const flow = flowsById.get(state.flowId);
-    const canceledFact: FlowCanceledFact =
-      args.cause === "operator"
-        ? {
-            kind: "flow.canceled",
-            cause: "operator",
-            runId,
-            at: clock.now(),
-            actor: args.actor,
-            reason: args.reason,
-            ...(args.note !== undefined ? { note: args.note } : {}),
-          }
-        : {
-            kind: "flow.canceled",
-            cause: "explicit",
-            runId,
-            at: clock.now(),
-            reason: args.reason,
-            ...(args.note !== undefined ? { note: args.note } : {}),
-          };
+    const canceledFact: FlowCanceledFact = {
+      ...args,
+      kind: "flow.canceled",
+      runId,
+      at: clock.now(),
+    };
     await config.store.appendFact(runId, canceledFact);
     const cancelError: SerializedError = {
       name: "NagiCanceledError",
@@ -791,8 +770,82 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
     writable: false,
     configurable: false,
   });
-  return wf;
+  // Trust boundary: persisted flow_id values were registered flow ids at write
+  // time. The text column erases the literal type, so queryRuns returns
+  // QueryRunsResult<string>; assert it back to the registered union here, the
+  // single read-side boundary (RFC 0012 D7). All other Wf<TFlows> members are
+  // structurally identical to the bare Wf, so this one cast covers the widening.
+  return wf as unknown as Wf<TFlows>;
 }
+
+/**
+ * Config for {@link nagi.run}: a `NagiConfig` plus optional worker tuning and an
+ * external shutdown signal. The signal is merged with an internal controller, so
+ * aborting either source drains the worker.
+ */
+export interface NagiRunConfig extends NagiConfig {
+  readonly worker?: Omit<WorkerConfig, "signal">;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * Handle returned by {@link nagi.run}. `stop()` aborts the internal controller,
+ * awaits the worker loop, and is idempotent (safe to call twice or concurrently).
+ * It resolves cleanly even if the loop crashed — a true crash is logged once via
+ * the configured `logger`.
+ */
+export interface RuntimeHandle<
+  TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>,
+> {
+  readonly wf: Wf<TFlows>;
+  stop(): Promise<void>;
+}
+
+async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
+  config: NagiRunConfig & { flows: TFlows },
+): Promise<RuntimeHandle<TFlows>> {
+  const wf = await nagiImpl(config);
+  const internal = new AbortController();
+  const signal: AbortSignal = config.signal
+    ? AbortSignal.any([internal.signal, config.signal])
+    : internal.signal;
+  const worker = wf.worker({ ...config.worker, signal });
+
+  // The loop promise is held privately: it resolves on graceful drain and
+  // rejects only on a true loop crash (e.g. queue.dequeue throws while the
+  // runtime is not shutting down).
+  const loop = worker.run();
+  loop.catch((err: unknown) => {
+    if (signal.aborted) return; // graceful shutdown — not a crash
+    config.logger?.error("nagi.run: worker exited unexpectedly", {
+      error: String(err),
+    });
+  });
+
+  let stopping: Promise<void> | undefined;
+  const stop = (): Promise<void> => {
+    stopping ??= (async () => {
+      internal.abort();
+      try {
+        await loop;
+      } catch {
+        // graceful abort, or a crash already logged above — stop() never throws.
+      }
+    })();
+    return stopping;
+  };
+
+  return { wf, stop };
+}
+
+/**
+ * The nagi runtime factory. Call `nagi(config)` for fine-grained control, or
+ * `nagi.run(config)` for a turnkey worker lifecycle returning `{ wf, stop }`.
+ */
+export const nagi: typeof nagiImpl & { run: typeof nagiRun } = Object.assign(
+  nagiImpl,
+  { run: nagiRun },
+);
 
 function mintRunId(): RunId {
   return `run-${crypto.randomUUID()}` as RunId;

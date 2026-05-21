@@ -1,12 +1,12 @@
-# RFC 0012 — Parameterize `Wf` over registered flows (typed `flowId`)
+# RFC 0018 — Parameterize `Wf` over registered flows (typed `flowId`)
 
-- **Status:** Draft (2026-05-21) — decisions log pending Jay's approval. **Do not implement until approved.**
+- **Status:** Decisions resolved (2026-05-21, Jay) — **awaiting approval of this log before implementation.**
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking:** issue #18
 - **Scope:** `@nagi-js/core` public types only. Pure typing change, **no runtime delta**, no fact-shape change, no migration. Patch release. `@nagi-js/postgres` touched only if D7 goes the "generic Store" way (it does not, by recommendation).
 - **Decisions log:** authoritative — see "Decisions taken". Items marked **⚠ OPEN** are the grilling branches; everything else is a recommended call you can still veto.
-- **RFC number:** sequential after 0011 (the 0011 precedent decoupled RFC# from issue#). Tracking issue is #18; file is `0012`. Rename to `0018` if you prefer issue-matched numbering.
+- **RFC number:** `0018`, matched to tracking issue #18 — chosen 2026-05-21 to resolve a parallel-session collision (originally drafted `0012` alongside the concurrency RFC, issue #20). Issue-matched numbering is collision-proof under concurrent work.
 
 ## Summary
 
@@ -83,12 +83,11 @@ drops it.
    types.ts:487 must thread the param into both arms). Bare usage anywhere is
    unchanged.
 
-6. **⚠ OPEN — Q1: `QueryRunsWhere` filter key name.** The shipped code uses
-   `flowId?: string` (types.ts:482). The issue text proposes renaming it to
-   `flow?: FlowId`. Rename is a **breaking** change (existing callers,
-   `queryRuns.test.ts:171`, lymo, and the `memory.ts:272` / `store.ts` runtime
-   filter all key on `flowId`). **Recommendation: keep `flowId`** — add the
-   generic, do not rename. The issue text predates the shipped implementation.
+6. **Q1 RESOLVED (Jay) — keep `flowId`.** Add the generic
+   (`flowId?: FlowId`) but do **not** rename to the issue text's `flow?`.
+   Non-breaking: existing callers, `queryRuns.test.ts:171`, the `memory.ts:272`
+   / `store.ts` runtime filters, and lymo all keep working untouched. The issue
+   text predates the shipped implementation.
 
 7. **D7 — narrowing boundary (the irreducible cast).** Keep `Store.queryRuns`
    **non-generic** (`Promise<QueryRunsResult>`, `flowId: string`) and localize
@@ -104,22 +103,21 @@ drops it.
    *(Confident recommendation, not grilling — flagging because it involves an
    `as`, and you are opinionated about casts.)*
 
-8. **⚠ OPEN — Q3: filter-input strictness.** Should the `where` filter accept a
-   strict `FlowId` union (typo-proof, autocomplete; dynamic callers must cast)
-   or `FlowId | (string & {})` (autocomplete preserved **and** accepts a runtime
-   string)? **Recommendation: strict `FlowId`** — aligns with "make invalid
-   states unrepresentable"; a filter on a non-registered flow is a bug worth a
-   compile error. Depends on Q1's key name.
+8. **Q3 RESOLVED (Jay) — strict `FlowId` union.** `where.flowId?: FlowId`
+   accepts only registered ids; `queryRuns({ where: { flowId: "notAFlow" } })`
+   is a compile error. Typo-proof + autocomplete. A filter on a non-registered
+   flow is a bug worth catching at compile time; the rare dynamic-string caller
+   casts explicitly. No `(string & {})` escape hatch. Aligns with "make invalid
+   states unrepresentable."
 
-9. **⚠ OPEN — Q2 (scope): also constrain `start`?** The issue proposes
+9. **Q2 RESOLVED (Jay) — yes, also constrain `start`.**
    `start<F extends TFlows[number]>` (today: `start<F extends Flow>`,
-   runtime.ts:72), which makes `wf.start(unregisteredFlow, …)` a **compile
-   error** instead of a runtime throw (`flowsById` miss, runtime.ts:185).
+   runtime.ts:72) makes `wf.start(unregisteredFlow, …)` a **compile error**
+   instead of a runtime throw (`flowsById` miss, runtime.ts:185).
    Backwards-compatible via the default (`TFlows[number]` → `Flow` for bare
-   `Wf`). **This expands scope from read-side to write-side.** Recommendation:
-   *lean yes* — it's the same single-source-of-truth win on the write path and
-   directly serves "unrepresentable invalid states" — but it is scope beyond the
-   issue's title, so it's your call.
+   `Wf`). Expands the change from read-side to write-side — accepted for the
+   single-source-of-truth win and to make the adjacent invalid state
+   unrepresentable.
 
 10. **`startById(flowId: string)` stays `string` — NOT narrowed.** Its docstring
     (runtime.ts:78-89) targets transactional-outbox reconcilers, DLQ replay, and
@@ -285,9 +283,12 @@ Commands: `pnpm test` (vitest run), `pnpm test:types` (vitest --typecheck),
 - **Runtime narrowing guard in `queryRuns`** — rejected: violates "no runtime
   delta" and the house preference against runtime guards over structural typing.
 
-## Open questions — to resolve by grilling
+## Resolved questions (2026-05-21, Jay)
 
-- **Q1 (D6):** keep `flowId` or rename to `flow`?
-- **Q2 (D9):** also constrain `start<F extends TFlows[number]>` (write-side
-  scope), or read-side only?
-- **Q3 (D8):** strict `FlowId` filter vs `FlowId | (string & {})`?
+1. **Q1 (D6) — filter key.** Keep `flowId`; do not rename to `flow`.
+   (Non-breaking; issue text predates the implementation.)
+2. **Q2 (D9) — write-side scope.** **Yes** — also constrain
+   `start<F extends TFlows[number]>`. Unregistered-flow start becomes a compile
+   error; backwards-compatible via the default param.
+3. **Q3 (D8) — filter strictness.** Strict `FlowId` union; no
+   `(string & {})` escape hatch. Typo'd `where.flowId` is a compile error.

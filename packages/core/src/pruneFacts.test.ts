@@ -269,7 +269,7 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
       flowId: "child",
       input: null,
       at: new Date(1100),
-      parentRunId: parentId,
+      parent: { runId: parentId, stepId: "sub" },
     });
     await store.completeStep(
       childId,

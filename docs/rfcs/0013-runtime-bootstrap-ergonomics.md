@@ -1,6 +1,6 @@
 # RFC 0013 — Runtime bootstrap ergonomics (`nagi.run` + auto queue init + pgmq typing)
 
-- **Status:** Draft — decisions log awaiting Jay's sign-off (grill in progress)
+- **Status:** Accepted (2026-05-21, Jay) — decisions resolved via grill; pending implementation approval
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking issue:** lymo-inc/nagi#17
@@ -93,7 +93,7 @@ construction — the same argument as RFC 0003. The library should absorb this.
    name `nagi` (for the existing `"... passed to nagi()"` error messages). `nagi`
    stays callable AND gains `.run`. Rationale: Graphile Worker's top-level entry is
    literally `run()`; `nagi.start()` would collide with `wf.start(flow, input)`;
-   `nagi.spawn()` is unidiomatic. (Confirm — see Open question N1.)
+   `nagi.spawn()` is unidiomatic. (Resolved N1, 2026-05-21: `nagi.run`.)
 
 2. **`nagi.run` config = `NagiConfig` + lifecycle extras.**
    ```ts
@@ -103,18 +103,18 @@ construction — the same argument as RFC 0003. The library should absorb this.
    }
    ```
 
-3. **Handle shape = `{ wf, stop, done }`. [GRILL — N2]**
+3. **Handle shape = `{ wf, stop }`. (Resolved N2, 2026-05-21: minimal; `done` deferred.)**
    ```ts
    export interface RuntimeHandle {
      readonly wf: Wf;
-     stop(): Promise<void>;        // abort internal controller + await loop; idempotent; resolves cleanly even after a crash
-     readonly done: Promise<void>; // the held loop promise: resolves on graceful exit, REJECTS on a true crash
+     stop(): Promise<void>;   // abort internal controller + await loop; idempotent; resolves cleanly even after a crash
    }
    ```
-   `done` is the Graphile/Temporal/pg-boss pattern (a lifecycle promise a supervisor
-   can `await` to learn the loop died, without subscribing to the logger). It already
-   exists internally — exposing it is free. The minimal alternative is `{ wf, stop }`
-   (crash observable only via `logger.error`). I lean toward including `done`.
+   The loop promise is held **privately** by `stop()` (which awaits it); it is not
+   exposed. A crash is observable only via `logger.error` (decision 4). `done` (the
+   Graphile/Temporal/pg-boss lifecycle promise) was considered and **deferred** — it
+   is non-breaking to add later if a supervisor ever needs programmatic crash
+   detection, and "complexity must pay for itself" until then.
 
 4. **Graceful-vs-crash is owned once, inside `nagi.run`.**
    ```ts
@@ -156,14 +156,17 @@ construction — the same argument as RFC 0003. The library should absorb this.
    double-log, never throws.
 
 7. **`ensureSchema?()` is optional on the core `Queue` contract; `nagi()` invokes it
-   once, eagerly, fail-fast. [GRILL — N3]**
+   once, eagerly, fail-fast. (Resolved N3, 2026-05-21.)**
    `types.ts:550` gains `ensureSchema?(): Promise<void>`. `nagi()` calls
    `await config.queue.ensureSchema?.()` early (right after `const clock = …`,
    before the flow loop). Adapters without the hook (e.g. `InMemoryQueue`) are
    unaffected. **Eager** (not lazy-on-first-enqueue) so a misconfigured queue fails
    at boot, not hours later at first dispatch. **Fail-fast** (a rejection rejects
-   `nagi()`). The research doc flags a no-`CREATE`-privilege deployment as a reason
-   to instead be *best-effort* + add an opt-out knob — that is the grill.
+   `nagi()`). Best-effort was rejected: swallowing the error re-introduces the silent
+   enqueue-before-schema failure this change exists to kill. No opt-out knob in v1; if
+   a no-`CREATE`-privilege deployment ever needs one, it belongs on the **pgmq
+   adapter** (`pgmqQueue({ ensureSchema: false })` → no hook → `nagi()` skips it),
+   non-breaking to add then.
 
 8. **Graceful shutdown is silent at `error`/`warn`.** Only a true crash (decision 4)
    logs `error`. `stop()`, external abort, and an already-aborted signal log nothing
@@ -182,13 +185,15 @@ construction — the same argument as RFC 0003. The library should absorb this.
     `buildQueue` keeps its internal `Kysely<unknown>` erasure cast — runtime is
     byte-identical. Pure typing change.
 
-11. **`use-after-stop` is documented, not guarded. [GRILL — N4]**
-    `wf` stays usable after `stop()`; a `wf.start()` afterward enqueues work that this
-    (now-stopped) handle's worker won't process — it sits until another worker runs.
-    No "stopped" guard is added, because `wf` is legitimately reusable (the non-goal
-    explicitly supports running another worker). Making it throw would forbid the
-    intended pattern. The grill: is "no guard, documented" acceptable, or do you want
-    a structural guard?
+11. **`use-after-stop` is a non-case — no guard, no hazard-doc. (Resolved N4, 2026-05-21.)**
+    Verified: `wf.start()` → `advance()` → `queue.enqueue` is decoupled from the
+    worker, which polls the durable queue independently (`runtime.ts:356`,
+    `worker.ts:47`). So after `stop()`, `wf` is simply "a durable producer with no
+    co-located consumer" — nagi's canonical "produce here, drain elsewhere" topology.
+    A post-stop `wf.start()` durably enqueues and is drained by whatever worker next
+    polls. A guard would be *wrong* — it would reject the legitimate distributed
+    pattern. One-line doc only: `nagi.run` co-locates exactly one worker; `stop()`
+    removes it; `wf` remains a normal producer.
 
 ## Proposed shape
 
@@ -203,7 +208,6 @@ export interface NagiRunConfig extends NagiConfig {
 export interface RuntimeHandle {
   readonly wf: Wf;
   stop(): Promise<void>;
-  readonly done: Promise<void>;   // [GRILL N2] omit if {wf,stop} wins
 }
 
 async function nagi(config: NagiConfig): Promise<Wf> { /* unchanged + decision 7 */ }
@@ -229,7 +233,7 @@ async function run(config: NagiRunConfig): Promise<RuntimeHandle> {
       try { await done; } catch { /* graceful or already-logged crash */ }
     })());
 
-  return { wf, stop, done };
+  return { wf, stop };   // loop promise (done) stays private — held by stop()
 }
 
 export const nagi = Object.assign(_nagiImpl, { run });
@@ -278,8 +282,10 @@ export function pgmqQueue<DB = unknown>(opts: PgmqQueueOpts<DB>): PgmqQueue;
   consumption). **Not** prevented — it is the documented way to get two workers (a
   non-goal of single-handle orchestration). A "started" flag would forbid the
   intended use. Rejected.
-- `wf.start()` after `stop()` enqueues work no live worker drains. Not structurally
-  prevented — `wf` is legitimately reusable. Documented (decision 11). **[GRILL N4]**
+- `wf.start()` after `stop()` enqueues work no co-located worker drains. **Not an
+  invalid state** — it's the durable "produce here, drain elsewhere" topology;
+  another worker (or a fresh `nagi.run`) drains it. No guard, no special doc
+  (decision 11).
 
 ## Outbox / crash-recovery review
 
@@ -309,13 +315,12 @@ existing `worker`/runtime/`dispatch` tests must pass **unchanged**. New coverage
 (full enumeration in the test-spec; key files below):
 
 - **`packages/core/src/runtime-run.test.ts`** (new) — `nagi.run` lifecycle: returns
-  `{ wf, stop[, done] }`; `wf` processes work via the internal worker with no manual
+  `{ wf, stop }`; `wf` processes work via the internal worker with no manual
   drain; `stop()` awaits an in-flight handler before resolving; `stop()` idempotent
   (twice + concurrent, no throw, no double-log); graceful `stop()` never calls
-  `logger.error`; a `dequeue`-throwing crash calls `logger.error` once (and rejects
-  `done`, if N2 keeps it); external-signal abort triggers the same graceful path;
-  already-aborted signal yields an immediately-stopped runtime; legacy path
-  unchanged.
+  `logger.error`; a `dequeue`-throwing crash calls `logger.error` exactly once;
+  external-signal abort triggers the same graceful path; already-aborted signal
+  yields an immediately-stopped runtime; legacy path unchanged.
 - **`packages/core/src/queue-bootstrap.test.ts`** (new, or folded into runtime
   tests) — `nagi()` calls `ensureSchema` exactly once at construction, never
   per-enqueue/per-worker; an adapter without the hook constructs and runs; a
@@ -328,9 +333,9 @@ existing `worker`/runtime/`dispatch` tests must pass **unchanged**. New coverage
 
 ## Alternatives considered
 
-- **`{ wf, stop }` (no `done`)** — smaller surface, but a supervisor can only learn
-  the loop crashed by subscribing to the logger. Loses the idiomatic
-  `await handle.done`. This is the **N2 grill**.
+- **`{ wf, stop, done }` (add `done`)** — exposes the loop promise so a supervisor
+  can `await handle.done` instead of subscribing to the logger. **Deferred (N2)** —
+  non-breaking to add later; not needed by the reference consumer in v1.
 - **Free `runRuntime(config)` export** instead of a `nagi.run` static — avoids
   `Object.assign`. Rejected: `nagi.run` reads better and `Object.assign` is trivial;
   the bare `runRuntime` is the fallback if you dislike mutating the function object.
@@ -342,17 +347,18 @@ existing `worker`/runtime/`dispatch` tests must pass **unchanged**. New coverage
 - **`nagi.start()` / `nagi.spawn()`** — `start` collides with `wf.start(flow)`;
   `spawn` is unidiomatic for "run a worker." Rejected (relates to **N1**).
 
-## Open questions to resolve (the grill)
+## Resolved questions (2026-05-21, Jay — via grill)
 
-These gate implementation; I'll resolve them with you one at a time, then fold the
-answers into a "Resolved" section.
+All four open decisions are resolved; the decisions log above is final.
 
-- **N1 — Name.** `nagi.run` (recommended) vs `nagi.start` vs `runRuntime`.
-- **N2 — Handle shape.** `{ wf, stop, done }` (recommended) vs `{ wf, stop }`.
-- **N3 — `ensureSchema` failure policy.** Eager + fail-fast (recommended) vs
-  best-effort + opt-out knob for no-`CREATE`-privilege deployments.
-- **N4 — `use-after-stop`.** Documented-reusable, no guard (recommended) vs a
-  structural guard.
+- **N1 — Name.** ✅ `nagi.run` (static via `Object.assign`).
+- **N2 — Handle shape.** ✅ `{ wf, stop }` (minimal). The loop promise stays private;
+  `done` deferred (non-breaking to add later). Crash → `logger.error` only.
+- **N3 — `ensureSchema` failure policy.** ✅ Eager + fail-fast, no opt-out knob.
+  Best-effort rejected (reintroduces the silent bug). Future opt-out, if ever needed,
+  lives on the pgmq adapter (`pgmqQueue({ ensureSchema: false })`).
+- **N4 — `use-after-stop`.** ✅ Non-case: no guard, no hazard-doc. It's the durable
+  "produce here, drain elsewhere" topology; a guard would be wrong.
 
 ## Non-goals (from the issue)
 

@@ -5,6 +5,11 @@ import { type PgmqQueue, type PgmqQueueOpts, pgmqQueue } from "./pgmq-queue";
 
 declare const db: Kysely<unknown>;
 
+interface SampleDb {
+  readonly users: { readonly id: string; readonly email: string };
+}
+declare const typedDb: Kysely<SampleDb>;
+
 describe("pgmqQueue type surface", () => {
   it("returns a PgmqQueue, which is structurally assignable to Queue", () => {
     expectTypeOf(pgmqQueue({ db })).toMatchTypeOf<Queue>();
@@ -36,5 +41,16 @@ describe("pgmqQueue type surface", () => {
     expectTypeOf<PgmqQueueOpts["archiveOnAck"]>().toEqualTypeOf<
       boolean | undefined
     >();
+  });
+
+  it("pgmqQueue<DB> accepts a typed Kysely<DB> with no cast and infers DB", () => {
+    // Before RFC 0013 this callsite required `db as unknown as Kysely<unknown>`.
+    expectTypeOf(pgmqQueue({ db: typedDb })).toEqualTypeOf<PgmqQueue>();
+    expectTypeOf(pgmqQueue({ db: typedDb })).toMatchTypeOf<Queue>();
+    expectTypeOf<PgmqQueueOpts<SampleDb>["db"]>().toEqualTypeOf<
+      Kysely<SampleDb>
+    >();
+    // The default type parameter keeps the bare form resolving to Kysely<unknown>.
+    expectTypeOf<PgmqQueueOpts["db"]>().toEqualTypeOf<Kysely<unknown>>();
   });
 });

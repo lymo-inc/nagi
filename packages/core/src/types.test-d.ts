@@ -1,19 +1,23 @@
 import { describe, expectTypeOf, it } from "vitest";
 import { flow } from "./builder";
-import type { Wf } from "./runtime";
+import { nagi, type Wf } from "./runtime";
 import { passthroughSchema } from "./test-helpers";
 import type {
   Builder,
   Fact,
+  FlowIdOf,
   FlowOutput,
   Json,
   MatchArm,
   NeedsOutputs,
+  Queue,
   RunId,
+  RunSummary,
   Step,
   StepCtx,
   StepMap,
   StepOutput,
+  Store,
   Tx,
 } from "./types";
 
@@ -27,6 +31,10 @@ declare const builderX: Builder<{ x: number }>;
 declare const builderU: Builder<unknown>;
 declare const factEx: Fact;
 declare const wfEx: Wf;
+
+// Stubs to construct `nagi(...)` in type-level tests — bodies never run.
+declare const store: Store;
+declare const queue: Queue;
 
 describe("Step output inference", () => {
   it("StepOutput extracts the Output type parameter", () => {
@@ -289,5 +297,155 @@ describe("Fact discriminated union", () => {
         expectTypeOf(factEx.arm).toBeString();
         break;
     }
+  });
+});
+
+describe("Wf parameterized over registered flows (RFC 0018)", () => {
+  const a = flow({
+    id: "a",
+    input: passthroughSchema<{ x: number }>(),
+    build: (b) => ({ s: b.task({ run: async () => null }) }),
+  });
+  const b = flow({
+    id: "b",
+    input: passthroughSchema<{ y: string }>(),
+    build: (bld) => ({ s: bld.task({ run: async () => null }) }),
+  });
+
+  it("nagi({ flows: [a, b] }) — no `as const` — narrows flowId to the union", async () => {
+    const wf = await nagi({ flows: [a, b], store, queue });
+    type Runs = Awaited<ReturnType<typeof wf.queryRuns>>["runs"];
+    expectTypeOf<Runs[number]["flowId"]>().toEqualTypeOf<"a" | "b">();
+  });
+
+  it("single-flow tuple [a] narrows to the lone literal (not widened)", async () => {
+    const wf = await nagi({ flows: [a], store, queue });
+    type Runs = Awaited<ReturnType<typeof wf.queryRuns>>["runs"];
+    expectTypeOf<Runs[number]["flowId"]>().toEqualTypeOf<"a">();
+  });
+
+  it("bare Wf (no type arg) keeps flowId as string", () => {
+    type Runs = Awaited<ReturnType<typeof wfEx.queryRuns>>["runs"];
+    expectTypeOf<Runs[number]["flowId"]>().toBeString();
+  });
+
+  it("bare RunSummary (no type arg) keeps flowId as string", () => {
+    expectTypeOf<RunSummary["flowId"]>().toBeString();
+  });
+
+  it("FlowIdOf<typeof flows> resolves to the literal union", () => {
+    const flows = [a, b] as const;
+    expectTypeOf<FlowIdOf<typeof flows>>().toEqualTypeOf<"a" | "b">();
+  });
+
+  it("where.flowId accepts a registered id", async () => {
+    const wf = await nagi({ flows: [a, b], store, queue });
+    const r = wf.queryRuns({ where: { flowId: "a" } });
+    expectTypeOf(r).toEqualTypeOf<ReturnType<typeof wf.queryRuns>>();
+  });
+
+  it("where.flowId rejects a non-registered id (strict union, no escape hatch)", async () => {
+    const wf = await nagi({ flows: [a, b], store, queue });
+    // @ts-expect-error "notAFlow" is not a registered flow id
+    void wf.queryRuns({ where: { flowId: "notAFlow" } });
+  });
+
+  it("start still infers FlowInput for a registered flow", async () => {
+    const wf = await nagi({ flows: [a, b], store, queue });
+    expectTypeOf(wf.start).parameter(0).toEqualTypeOf<typeof a | typeof b>();
+    expectTypeOf(wf.start(a, { x: 1 })).toEqualTypeOf<Promise<RunId>>();
+    expectTypeOf(wf.start(b, { y: "ok" })).toEqualTypeOf<Promise<RunId>>();
+  });
+
+  it("start rejects a flow not in the nagi({ flows }) array (Q2 constraint)", async () => {
+    const wf = await nagi({ flows: [a, b], store, queue });
+    const unregistered = flow({
+      id: "unregistered",
+      input: passthroughSchema<{ z: boolean }>(),
+      build: (bld) => ({ s: bld.task({ run: async () => null }) }),
+    });
+    // @ts-expect-error `unregistered` was not passed to nagi({ flows })
+    void wf.start(unregistered, { z: true });
+  });
+
+  it("RunSummary.input is still Json", () => {
+    expectTypeOf<RunSummary["input"]>().toEqualTypeOf<Json>();
+    expectTypeOf<RunSummary<"a" | "b">["input"]>().toEqualTypeOf<Json>();
+  });
+});
+
+describe("Flow concurrency shorthand typing", () => {
+  it("bare string that is a string-valued key typechecks", () => {
+    flow({
+      id: "conc-bare-ok",
+      input: passthroughSchema<{ videoId: string; count: number }>(),
+      concurrency: "videoId",
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+  });
+
+  it("misspelled key is rejected", () => {
+    flow({
+      id: "conc-bare-typo",
+      input: passthroughSchema<{ videoId: string; count: number }>(),
+      // @ts-expect-error misspelled key is not in StringKeyOf<Input>
+      concurrency: "videold",
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+  });
+
+  it("numeric-valued key is rejected (strict string-only)", () => {
+    flow({
+      id: "conc-bare-numeric",
+      input: passthroughSchema<{ videoId: string; count: number }>(),
+      // @ts-expect-error numeric-valued key is excluded by StringKeyOf
+      concurrency: "count",
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+  });
+
+  it("an arbitrary string value is rejected (StringKeyOf, not string)", () => {
+    const k: string = "videoId";
+    flow({
+      id: "conc-bare-widestring",
+      input: passthroughSchema<{ videoId: string; count: number }>(),
+      // @ts-expect-error a plain `string` is wider than StringKeyOf<Input>
+      concurrency: k,
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+  });
+
+  it("keyFn object form typechecks without mode", () => {
+    flow({
+      id: "conc-keyfn-no-mode",
+      input: passthroughSchema<{ videoId: string; count: number }>(),
+      concurrency: { keyFn: (input) => input.videoId },
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+  });
+
+  it("keyFn object form typechecks with mode", () => {
+    flow({
+      id: "conc-keyfn-with-mode",
+      input: passthroughSchema<{ videoId: string; count: number }>(),
+      concurrency: {
+        keyFn: (input) => input.videoId,
+        mode: "cancel-in-progress",
+      },
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
+  });
+
+  it("invalid mode literal is rejected", () => {
+    flow({
+      id: "conc-keyfn-bad-mode",
+      input: passthroughSchema<{ videoId: string; count: number }>(),
+      concurrency: {
+        keyFn: (input) => input.videoId,
+        // @ts-expect-error "nope" is not a ConcurrencyMode
+        mode: "nope",
+      },
+      build: (b) => ({ a: b.task({ run: async () => null }) }),
+    });
   });
 });

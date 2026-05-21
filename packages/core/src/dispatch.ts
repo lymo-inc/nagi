@@ -24,6 +24,7 @@ import type {
   Json,
   Logger,
   Millis,
+  ParentRef,
   Queue,
   QueueMessage,
   RetryPolicy,
@@ -42,9 +43,7 @@ export interface DispatchDeps {
   readonly startChildRun: (args: {
     readonly child: Flow;
     readonly childInput: unknown;
-    readonly parentRunId: RunId;
-    readonly parentStepId: StepId;
-    readonly parentStepAttempt: AttemptNumber;
+    readonly parent: ParentRef;
   }) => Promise<RunId>;
   readonly store: Store;
   readonly queue: Queue;
@@ -63,7 +62,9 @@ export async function fireHook<E>(
   deps: DispatchDeps,
 ): Promise<void> {
   if (deps.fireHooks === false) return;
+
   if (hook === undefined) return;
+
   try {
     await hook(event);
   } catch (err) {
@@ -395,9 +396,7 @@ async function executeSubflow(args: {
   await deps.startChildRun({
     child,
     childInput,
-    parentRunId: runId,
-    parentStepId: stepId,
-    parentStepAttempt: message.attempt,
+    parent: { runId, stepId, attempt: message.attempt },
   });
 }
 
@@ -786,14 +785,10 @@ export async function propagateToParent(
   const startedFact = childState.facts.find((f) => f.kind === "flow.started") as
     | FlowStartedFact
     | undefined;
-  if (
-    startedFact?.parentRunId === undefined ||
-    startedFact?.parentStepId === undefined
-  ) {
+  if (startedFact?.parent === undefined) {
     return;
   }
-  const parentRunId = startedFact.parentRunId;
-  const parentStepId = startedFact.parentStepId;
+  const { runId: parentRunId, stepId: parentStepId } = startedFact.parent;
 
   const parentState = await store.loadRunState(parentRunId);
   if (

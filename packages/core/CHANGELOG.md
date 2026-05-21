@@ -1,5 +1,100 @@
 # @nagi-js/core
 
+## 0.1.1-rc.10
+
+### Patch Changes
+
+- Fold the subflow parent linkage on `FlowStartedFact` from two independently
+  optional fields (`parentRunId?` / `parentStepId?`) into a single optional
+  `parent?: ParentLink` (`{ runId, stepId }`). A run is either a root (no
+  `parent`) or a child (a complete `parent`); the previous shape allowed the
+  unrepresentable half-state of a `parentRunId` with no `parentStepId`, which the
+  runtime then had to guard against at every read. Two new types are exported:
+  `ParentLink` (the durable link persisted on the fact) and
+  `ParentRef extends ParentLink` (adds `attempt`, the in-process reference used
+  for otel span/registry lookups). `FlowStartEvent.parent` now references
+  `ParentRef` — its `{ runId, stepId, attempt }` shape is unchanged.
+
+  Optionality now lives only at the boundary: `startRunInternal` keeps a single
+  `parent?: ParentRef` (the one genuine root-vs-child fork), while the
+  subflow-only internals (`startChildRun`, `DispatchDeps.startChildRun`,
+  `executeSubflow`) take a required `parent: ParentRef`. `propagateToParent`
+  collapses its two `=== undefined` guards into one `parent === undefined` check.
+  The fact still drops `attempt` (it is re-derived from parent run state on wake),
+  so the durable record is unchanged in information, only in shape.
+
+  **Persisted-shape change (breaking for in-flight subflows across upgrade).**
+  The Postgres event log serializes/revives fact payloads structurally
+  (`{...rest}` → JSONB → `{...body}`), so new `flow.started` payloads round-trip
+  the nested `parent` object with no adapter change; only the two denormalized
+  column writes were repointed to `fact.parent?.runId` / `fact.parent?.stepId`
+  (the `parent_run_id` / `parent_step_id` columns and `listChildren` are
+  unchanged). However, child runs persisted **before** this release carry the old
+  top-level `parentRunId` / `parentStepId` keys in their payload and will revive
+  with `parent === undefined`, so their parent will not be woken on completion. No
+  migration shim is provided (pre-1.0); drain in-flight subflows before upgrading,
+  or backfill the payloads. The in-memory store has no cross-restart persistence
+  and is unaffected.
+
+- `Wf` is now generic over the registered flow tuple, so `flowId` carries its
+  literal type through queries instead of widening to `string`.
+  `nagi({ flows: [videoAnalysisFlow, dealAnalysisFlow] })` (no `as const` needed —
+  the factory uses a `const` type parameter) yields a `Wf` whose
+  `queryRuns()` returns `RunSummary<"videoAnalysis" | "dealAnalysis">`. Consumers
+  with a closed flow set can delete hand-maintained id sets / `narrowFlowId`
+  helpers at the `queryRuns` projection boundary — the union is now derived from
+  the registration and cannot drift.
+
+  `RunSummary`, `QueryRunsResult`, `QueryRunsWhere`, and `QueryRunsOpts` each gain
+  a `FlowId extends string = string` type parameter, and a `FlowIdOf<TFlows>`
+  helper is exported. `Wf.start` is narrowed to `start<F extends TFlows[number]>`,
+  so starting a flow that was not registered with `nagi({ flows })` is now a
+  compile error rather than a runtime throw. `where.flowId` accepts only the
+  registered union (a typo is a compile error).
+
+  Pure typing change — **no runtime delta**, no fact-shape change, no migration.
+  Fully backwards-compatible: every new type parameter defaults to today's
+  behavior, so bare `Wf` / `RunSummary` / `queryRuns` still resolve `flowId` to
+  `string`. `startById(flowId: string)` is intentionally left untyped for
+  outbox/DLQ-replay callers holding a serialized id. The `Store` contract is
+  unchanged (adapters read `flow_id` as `string`); the literal narrowing is a
+  single documented assertion at the `wf.queryRuns` read boundary. Tracks #18.
+
+- Runtime bootstrap ergonomics (RFC 0013, #17) — three additive, backwards-compatible changes.
+
+  - **`nagi.run({ ... }) → { wf, stop }`** — a turnkey worker lifecycle. Collapses
+    the four-step `nagi()` + `new AbortController()` + `wf.worker({ signal })` +
+    `worker.run().catch(graceful-vs-crash)` bootstrap (and its three module-level
+    refs) into one call with a single idempotent `stop()` that aborts an internal
+    controller and awaits the loop. Graceful shutdown resolves cleanly; only a true
+    loop crash is logged once via the configured `logger`. Accepts an optional
+    external `signal`, merged with the internal controller via `AbortSignal.any`.
+    The existing `nagi()` + `wf.worker()` + `worker.run()` path is unchanged.
+
+  - **Auto queue-schema bootstrap** — the `Queue` contract gains an optional
+    `ensureSchema?(): Promise<void>`. `nagi()` awaits it once at construction
+    (eager, fail-fast), closing the "runtime error on first enqueue" trap when the
+    pgmq queue schema was never provisioned. Adapters without the hook (e.g. the
+    in-memory queue) are unaffected.
+
+  - **`pgmqQueue<DB>`** — `pgmqQueue` and `PgmqQueueOpts` are now generic over the
+    Kysely schema (`db: Kysely<DB>`, defaulting to `unknown`), erasing the
+    `db as unknown as Kysely<unknown>` cast at every callsite. Pure typing change;
+    runtime is byte-identical.
+
+- `flow()`'s `concurrency` config gains a bare-string shorthand and an optional
+  `mode`. `concurrency: "videoId"` is now equivalent to
+  `{ keyFn: (i) => i.videoId, mode: "cancel-in-progress" }`, and `mode` may be
+  omitted on the object form (defaults to `"cancel-in-progress"`). The existing
+  `{ keyFn, mode }` form is unchanged.
+
+  The string shorthand is typed against the string-valued keys of the flow's
+  input (`StringKeyOf<Input>`), so a misspelled or non-string key is a compile
+  error; composite / computed keys continue to use `keyFn`. Internally the config
+  normalizes to a canonical `{ keyFn, mode }` at the builder boundary, so the
+  runtime cancellation path (`store.tryStartRun`) is untouched and dedupe / crash
+  semantics are identical. See `docs/rfcs/0012-shorthand-concurrency-config.md`.
+
 ## 0.1.1-rc.9
 
 ### Patch Changes

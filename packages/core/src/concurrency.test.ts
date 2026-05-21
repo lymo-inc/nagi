@@ -413,6 +413,193 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
   });
 });
 
+function makeBareStringVideoFlow() {
+  return flow({
+    id: "videoAnalysisBareString",
+    input: passthroughSchema<VideoInput>(),
+    concurrency: "videoId",
+    build: (b) => ({
+      analyze: b.task({
+        run: async ({ input }) => ({ videoId: input.videoId, analyzed: true }),
+      }),
+    }),
+  });
+}
+
+describe("@nagi-js/core — flow concurrency shorthands", () => {
+  it("bare-string shorthand cancels the prior run on the same key", async () => {
+    const f = makeBareStringVideoFlow();
+    const h = await makeHarness(f);
+
+    const firstRunId = await h.wf.start(f, { videoId: "v123" });
+    const secondRunId = await h.wf.start(f, { videoId: "v123" });
+
+    expect(firstRunId).not.toBe(secondRunId);
+
+    const first = await h.result(firstRunId);
+    expect(first.status).toBe("canceled");
+    const cancelFacts = first.factsOf("flow.canceled");
+    expect(cancelFacts.length).toBe(1);
+    const cancelFact = cancelFacts[0];
+    expect(cancelFact?.cause).toBe("concurrency");
+    if (cancelFact?.cause === "concurrency") {
+      expect(cancelFact.canceledByRunId).toBe(secondRunId);
+      expect(cancelFact.concurrencyKey).toBe("v123");
+    }
+
+    const second = await h.result(secondRunId);
+    expect(second.status).toBe("running");
+  });
+
+  it("bare-string shorthand: different keys do not interfere", async () => {
+    const f = makeBareStringVideoFlow();
+    const h = await makeHarness(f);
+
+    const v1 = await h.wf.start(f, { videoId: "v1" });
+    const v2 = await h.wf.start(f, { videoId: "v2" });
+
+    const r1 = await h.result(v1);
+    const r2 = await h.result(v2);
+    expect(r1.status).toBe("running");
+    expect(r2.status).toBe("running");
+    expect(r1.factCount("flow.canceled")).toBe(0);
+    expect(r2.factCount("flow.canceled")).toBe(0);
+  });
+
+  it("bare-string shorthand defaults mode to cancel-in-progress", async () => {
+    // No `mode` is specified anywhere — cancellation must still occur.
+    const f = makeBareStringVideoFlow();
+    const h = await makeHarness(f);
+
+    const firstRunId = await h.wf.start(f, { videoId: "vDefault" });
+    const secondRunId = await h.wf.start(f, { videoId: "vDefault" });
+
+    const first = await h.result(firstRunId);
+    expect(first.status).toBe("canceled");
+    const cancelFact = first.factsOf("flow.canceled")[0];
+    expect(cancelFact?.cause).toBe("concurrency");
+    if (cancelFact?.cause === "concurrency") {
+      expect(cancelFact.canceledByRunId).toBe(secondRunId);
+    }
+  });
+
+  it("bare-string shorthand extracts the key value from the named field", async () => {
+    const f = makeBareStringVideoFlow();
+    const h = await makeHarness(f);
+
+    const firstRunId = await h.wf.start(f, { videoId: "extracted-key-99" });
+    await h.wf.start(f, { videoId: "extracted-key-99" });
+
+    const first = await h.result(firstRunId);
+    const cancelFact = first.factsOf("flow.canceled")[0];
+    expect(cancelFact?.cause).toBe("concurrency");
+    if (cancelFact?.cause === "concurrency") {
+      expect(cancelFact.concurrencyKey).toBe("extracted-key-99");
+    }
+  });
+
+  it("keyFn form with mode omitted defaults to cancel-in-progress", async () => {
+    const f = flow({
+      id: "videoAnalysisKeyFnNoMode",
+      input: passthroughSchema<VideoInput>(),
+      concurrency: { keyFn: (input) => input.videoId },
+      build: (b) => ({
+        analyze: b.task({
+          run: async ({ input }) => ({ videoId: input.videoId }),
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+
+    const firstRunId = await h.wf.start(f, { videoId: "vKeyFn" });
+    const secondRunId = await h.wf.start(f, { videoId: "vKeyFn" });
+
+    const first = await h.result(firstRunId);
+    expect(first.status).toBe("canceled");
+    const cancelFact = first.factsOf("flow.canceled")[0];
+    expect(cancelFact?.cause).toBe("concurrency");
+    if (cancelFact?.cause === "concurrency") {
+      expect(cancelFact.canceledByRunId).toBe(secondRunId);
+      expect(cancelFact.concurrencyKey).toBe("vKeyFn");
+    }
+  });
+
+  it("bare-string and verbose forms record an identical concurrencyKey for the same input", async () => {
+    const bare = makeBareStringVideoFlow();
+    const verbose = makeVideoFlow();
+
+    const hBare = await makeHarness(bare);
+    const bareFirst = await hBare.wf.start(bare, { videoId: "same-key" });
+    await hBare.wf.start(bare, { videoId: "same-key" });
+    const bareResult = await hBare.result(bareFirst);
+    const bareFact = bareResult.factsOf("flow.canceled")[0];
+
+    const hVerbose = await makeHarness(verbose);
+    const verboseFirst = await hVerbose.wf.start(verbose, {
+      videoId: "same-key",
+    });
+    await hVerbose.wf.start(verbose, { videoId: "same-key" });
+    const verboseResult = await hVerbose.result(verboseFirst);
+    const verboseFact = verboseResult.factsOf("flow.canceled")[0];
+
+    expect(bareFact?.cause).toBe("concurrency");
+    expect(verboseFact?.cause).toBe("concurrency");
+    if (
+      bareFact?.cause === "concurrency" &&
+      verboseFact?.cause === "concurrency"
+    ) {
+      expect(bareFact.concurrencyKey).toBe(verboseFact.concurrencyKey);
+      expect(bareFact.concurrencyKey).toBe("same-key");
+    }
+  });
+
+  it("existing keyFn+mode object form is unchanged", async () => {
+    // Regression guard: mode explicitly present, behaves as before.
+    const f = makeVideoFlow();
+    const h = await makeHarness(f);
+
+    const firstRunId = await h.wf.start(f, { videoId: "vRegression" });
+    const secondRunId = await h.wf.start(f, { videoId: "vRegression" });
+
+    const first = await h.result(firstRunId);
+    expect(first.status).toBe("canceled");
+    const cancelFact = first.factsOf("flow.canceled")[0];
+    expect(cancelFact?.cause).toBe("concurrency");
+    if (cancelFact?.cause === "concurrency") {
+      expect(cancelFact.canceledByRunId).toBe(secondRunId);
+      expect(cancelFact.concurrencyKey).toBe("vRegression");
+    }
+
+    const second = await h.result(secondRunId);
+    expect(second.status).toBe("running");
+  });
+
+  it("runId-idempotency still wins over bare-string shorthand", async () => {
+    const f = makeBareStringVideoFlow();
+    const h = await makeHarness(f);
+    const fixedId = "run-bare-explicit-1" as RunId;
+
+    const a = await h.wf.start(f, { videoId: "v1" }, { runId: fixedId });
+    const b = await h.wf.start(f, { videoId: "v1" }, { runId: fixedId });
+    expect(a).toBe(fixedId);
+    expect(b).toBe(fixedId);
+
+    const r = await h.result(fixedId);
+    expect(r.status).toBe("running");
+    expect(r.factCount("flow.started")).toBe(1);
+    expect(r.factCount("flow.canceled")).toBe(0);
+  });
+
+  it("bare-string key whose extracted value is empty throws NagiValidationError", async () => {
+    const f = makeBareStringVideoFlow();
+    const h = await makeHarness(f);
+
+    await expect(h.wf.start(f, { videoId: "" })).rejects.toThrow(
+      NagiValidationError,
+    );
+  });
+});
+
 interface Barrier {
   readonly wait: Promise<void>;
   release(): void;

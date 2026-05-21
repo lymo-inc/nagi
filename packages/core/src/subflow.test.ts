@@ -69,8 +69,8 @@ describe("b.subflow — happy path", () => {
     const startedFact = childState.facts.find(
       (f) => f.kind === "flow.started",
     ) as FlowStartedFact | undefined;
-    expect(startedFact?.parentRunId).toBe(parentRunId);
-    expect(startedFact?.parentStepId).toBe("sub");
+    expect(startedFact?.parent?.runId).toBe(parentRunId);
+    expect(startedFact?.parent?.stepId).toBe("sub");
   });
 
   it("passes parent input AND needs through to the buildInput callback", async () => {
@@ -211,7 +211,7 @@ describe("b.subflow — nesting", () => {
     const childStarted = childState.facts.find(
       (f) => f.kind === "flow.started",
     ) as FlowStartedFact;
-    expect(childStarted.parentRunId).toBe(parentRunId);
+    expect(childStarted.parent?.runId).toBe(parentRunId);
 
     const gcStepOutput = childState.steps["gc"]?.output as {
       childRunId: string;
@@ -222,8 +222,8 @@ describe("b.subflow — nesting", () => {
     const gcStarted = gcState.facts.find(
       (f) => f.kind === "flow.started",
     ) as FlowStartedFact;
-    expect(gcStarted.parentRunId).toBe(subOutput.childRunId);
-    expect(gcStarted.parentStepId).toBe("gc");
+    expect(gcStarted.parent?.runId).toBe(subOutput.childRunId);
+    expect(gcStarted.parent?.stepId).toBe("gc");
   });
 });
 

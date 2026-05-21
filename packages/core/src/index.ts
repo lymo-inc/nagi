@@ -25,10 +25,12 @@ export {
 export {
   NagiCanceledError,
   type NagiConfig,
+  type NagiRunConfig,
   NagiRuntimeError,
   NagiSnapshotDriftError,
   NagiValidationError,
   nagi,
+  type RuntimeHandle,
   type StartOpts,
   type Wf,
 } from "./runtime";
