@@ -271,10 +271,11 @@ describe("wf.operator().abort()", () => {
       (f): f is FlowCanceledFact => f.kind === "flow.canceled",
     );
     expect(canceled?.cause).toBe("operator");
-    expect(canceled?.actor).toBe("ops@nagi");
-    expect(canceled?.note).toBe("stuck");
-    expect(canceled?.canceledByRunId).toBe(runId);
-    expect(canceled?.concurrencyKey).toBe("");
+    if (canceled?.cause === "operator") {
+      expect(canceled.actor).toBe("ops@nagi");
+      expect(canceled.note).toBe("stuck");
+      expect(canceled.reason).toBe("stuck");
+    }
   });
 
   it("is a logged no-op on an already-terminal run", async () => {
@@ -292,9 +293,9 @@ describe("wf.operator().abort()", () => {
     expect(after).toBe(before);
   });
 
-  it("preserves wf.cancel back-compat with cause=explicit", async () => {
+  it("wf.cancel writes flow.canceled with cause=explicit and reason", async () => {
     const f = flow({
-      id: "cancel-explicit-back-compat",
+      id: "cancel-explicit",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         a: b.signal({ schema: passthroughSchema<Record<string, never>>() }),
@@ -309,7 +310,8 @@ describe("wf.operator().abort()", () => {
       (f): f is FlowCanceledFact => f.kind === "flow.canceled",
     );
     expect(canceled?.cause).toBe("explicit");
-    expect(canceled?.concurrencyKey).toBe("manual via wf.cancel");
-    expect(canceled?.actor).toBeUndefined();
+    if (canceled?.cause === "explicit") {
+      expect(canceled.reason).toBe("manual via wf.cancel");
+    }
   });
 });

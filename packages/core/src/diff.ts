@@ -7,8 +7,6 @@ export type SnapshotChangedField =
   | "retry"
   | "timeoutMs"
   | "signalSchema"
-  | "matchMode"
-  | "matchOn"
   | "matchArms";
 
 export interface SnapshotChangedEdge {
@@ -120,12 +118,6 @@ function diffFields(
   }
   if (!schemaEq(before.signalSchema, after.signalSchema)) {
     out.push({ stepId: id, field: "signalSchema" });
-  }
-  if (before.matchMode !== after.matchMode) {
-    out.push({ stepId: id, field: "matchMode" });
-  }
-  if (before.matchOnHash !== after.matchOnHash) {
-    out.push({ stepId: id, field: "matchOn" });
   }
   if (!armsEq(before.matchArms, after.matchArms)) {
     out.push({ stepId: id, field: "matchArms" });

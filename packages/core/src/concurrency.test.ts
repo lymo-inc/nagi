@@ -65,8 +65,12 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     expect(first.status).toBe("canceled");
     const cancelFacts = first.factsOf("flow.canceled");
     expect(cancelFacts.length).toBe(1);
-    expect(cancelFacts[0]?.canceledByRunId).toBe(secondRunId);
-    expect(cancelFacts[0]?.concurrencyKey).toBe("v123");
+    const cancelFact = cancelFacts[0];
+    expect(cancelFact?.cause).toBe("concurrency");
+    if (cancelFact?.cause === "concurrency") {
+      expect(cancelFact.canceledByRunId).toBe(secondRunId);
+      expect(cancelFact.concurrencyKey).toBe("v123");
+    }
 
     const second = await h.result(secondRunId);
     expect(second.status).toBe("running");
@@ -247,6 +251,7 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
 
     await h.store.appendFact(runId, {
       kind: "flow.canceled",
+      cause: "concurrency",
       runId,
       at: h.clock.now(),
       canceledByRunId: "external-run-XYZ" as RunId,

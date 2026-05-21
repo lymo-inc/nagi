@@ -62,30 +62,37 @@ export interface MatchArmDef {
   }) => boolean;
   readonly otherwise?: true;
   readonly stepIds: readonly string[];
-  readonly _nested?: StepMap;
 }
 
-interface MatchDefBase {
+export interface MatchDef {
   readonly kind: "match";
   readonly needs: NeedsMap;
+  readonly arms: readonly MatchArmDef[];
   readonly parentMatch?: ParentMatchRef;
 }
 
-export interface DiscriminatorMatchDef extends MatchDefBase {
-  readonly mode: "discriminator";
-  readonly on: (args: {
+/**
+ * Builder-only, pre-walk shape of a match. `match()` produces this with each
+ * arm's un-walked nested step map; `walkAndRewrite` collapses it into the
+ * finalized {@link MatchDef} (arms gain `stepIds`, lose `nested`). The runtime
+ * never sees this type.
+ */
+export interface PendingMatchArm {
+  readonly id: string;
+  readonly when?: (args: {
     input: unknown;
     needs: Record<string, unknown>;
-  }) => string;
-  readonly arms: Readonly<Record<string, MatchArmDef>>;
+  }) => boolean;
+  readonly otherwise?: true;
+  readonly nested: StepMap;
 }
 
-export interface GuardMatchDef extends MatchDefBase {
-  readonly mode: "guard";
-  readonly arms: readonly MatchArmDef[];
+export interface PendingMatchDef {
+  readonly kind: "match";
+  readonly needs: NeedsMap;
+  readonly arms: readonly PendingMatchArm[];
+  readonly parentMatch?: ParentMatchRef;
 }
-
-export type MatchDef = DiscriminatorMatchDef | GuardMatchDef;
 
 export interface SubflowDef {
   readonly kind: "subflow";
@@ -141,18 +148,7 @@ export function needsKeys(def: StepDef): readonly string[] {
 }
 
 export function needsStepIds(def: StepDef): readonly string[] {
-  const out: string[] = [];
-  for (const upstream of Object.values(def.needs)) {
-    if (
-      upstream &&
-      typeof upstream === "object" &&
-      "id" in upstream &&
-      typeof upstream.id === "string"
-    ) {
-      out.push(upstream.id);
-    }
-  }
-  return out;
+  return Object.values(def.needs).map((upstream) => upstream.id);
 }
 
 export function resolveNeeds(
@@ -161,14 +157,7 @@ export function resolveNeeds(
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [localKey, upstream] of Object.entries(def.needs)) {
-    if (
-      upstream &&
-      typeof upstream === "object" &&
-      "id" in upstream &&
-      typeof upstream.id === "string"
-    ) {
-      result[localKey] = loadOutput(upstream.id);
-    }
+    result[localKey] = loadOutput(upstream.id);
   }
   return result;
 }
@@ -179,12 +168,7 @@ export function asStepMapWithDefs(steps: StepMap): StepMapWithDefs {
   return steps as StepMapWithDefs;
 }
 
-export function matchArms(def: MatchDef): readonly MatchArmDef[] {
-  return def.mode === "discriminator" ? Object.values(def.arms) : def.arms;
-}
-
 export function findArm(def: MatchDef, armId: string): MatchArmDef | undefined {
-  if (def.mode === "discriminator") return def.arms[armId];
   return def.arms.find((a) => a.id === armId);
 }
 
@@ -207,22 +191,11 @@ export function selectArm(
   def: MatchDef,
   args: { readonly input: unknown; readonly needs: Record<string, unknown> },
 ): string {
-  if (def.mode === "discriminator") {
-    const key = def.on(args);
-    if (def.arms[key] === undefined) {
-      const available = Object.keys(def.arms).join(", ");
-      throw new Error(
-        `match: discriminator returned "${key}" which has no arm (available: ${available || "<none>"})`,
-      );
-    }
-    return key;
-  }
-
   for (const arm of def.arms) {
     if (arm.otherwise) return arm.id;
     if (arm.when?.(args)) return arm.id;
   }
   throw new Error(
-    `match: no guard arm matched and no { otherwise: true } fallback was provided`,
+    `match: no arm matched and no { otherwise: true } fallback was provided`,
   );
 }

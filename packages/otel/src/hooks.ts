@@ -94,6 +94,17 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
     );
   }
 
+  function resolveParentContext(event: FlowStartEvent): Context {
+    if (!event.parent) return context.active();
+    const stepSpan = stepSpanRegistry.get(
+      stepKey(event.parent.runId, event.parent.stepId, event.parent.attempt),
+    );
+    if (stepSpan) return trace.setSpan(context.active(), stepSpan);
+    const parentFlowCtx = flowCtxs.get(event.parent.runId);
+    if (parentFlowCtx) return parentFlowCtx;
+    return context.active();
+  }
+
   function endStepSpanOk(event: StepCompleteEvent, span: Span): void {
     const k = stepKey(event.runId, event.stepId, event.attempt);
     const startedAt = stepStartTimes.get(k);
@@ -130,11 +141,22 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
 
   return {
     onFlowStart: withGuard<FlowStartEvent>("onFlowStart", (event) => {
-      const span = tracer.startSpan(`${flowPrefix} ${event.flowId}`, {
-        kind: SpanKind.INTERNAL,
-        startTime: event.at,
-        attributes: flowAttrs(event),
-      });
+      const parentCtx = resolveParentContext(event);
+      const attrs: Attributes = { ...flowAttrs(event) };
+      if (event.parent) {
+        attrs["nagi.parent.run.id"] = event.parent.runId;
+        attrs["nagi.parent.step.id"] = event.parent.stepId;
+        attrs["nagi.parent.step.attempt"] = event.parent.attempt;
+      }
+      const span = tracer.startSpan(
+        `${flowPrefix} ${event.flowId}`,
+        {
+          kind: SpanKind.INTERNAL,
+          startTime: event.at,
+          attributes: attrs,
+        },
+        parentCtx,
+      );
       flowCtxs.set(event.runId, trace.setSpan(context.active(), span));
     }),
 

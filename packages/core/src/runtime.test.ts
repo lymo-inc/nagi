@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "./builder";
-import { NagiValidationError } from "./runtime";
+import { NagiRuntimeError, NagiValidationError } from "./runtime";
 import {
   emptySchema,
   makeHarness,
   passthroughSchema,
   runFlow,
 } from "./test-helpers";
-import type { RunId } from "./types";
+import type { RunId, StandardSchemaV1 } from "./types";
 
 describe("e2e: linear task chain", () => {
   it("runs both steps and threads upstream output through needs", async () => {
@@ -235,83 +235,93 @@ describe("start: caller-supplied runId", () => {
   });
 });
 
-describe("e2e: b.step chain parity (RFC 0002)", () => {
-  it("linear chain runs identically when authored via b.step()", async () => {
-    const f = flow({
-      id: "step-linear",
-      input: passthroughSchema<{ start: number }>(),
-      build: (b) =>
-        b
-          .step("a", {
-            run: async ({ input }) => ({ doubled: input.start * 2 }),
-          })
-          .step("c", {
-            needs: ["a"],
-            run: async ({ needs }) => ({ plusTen: needs.a.doubled + 10 }),
-          }),
+describe("startById: registry-aware dispatch", () => {
+  // Schema that actually rejects bad input — passthroughSchema accepts
+  // anything, which would let an invalid payload sneak through and mask
+  // the validation behavior we want to assert on.
+  const strictNumberXSchema: StandardSchemaV1<{ x: number }, { x: number }> = {
+    "~standard": {
+      version: 1,
+      vendor: "nagi-test",
+      validate: (value: unknown) => {
+        if (
+          typeof value !== "object" ||
+          value === null ||
+          typeof (value as { x: unknown }).x !== "number"
+        ) {
+          return {
+            issues: [{ message: "x must be a number", path: ["x"] }],
+          };
+        }
+        return { value: value as { x: number } };
+      },
+    },
+  };
+
+  const strictFlow = () =>
+    flow({
+      id: "start-by-id",
+      input: strictNumberXSchema,
+      build: (b) => ({
+        only: b.task({ run: async ({ input }) => ({ tripled: input.x * 3 }) }),
+      }),
     });
 
-    const result = await runFlow(f, { start: 5 });
-    expect(result.status).toBe("completed");
-    expect(result.output("a")).toEqual({ doubled: 10 });
-    expect(result.output("c")).toEqual({ plusTen: 20 });
+  it("starts the flow when the id is registered and input validates", async () => {
+    const f = strictFlow();
+    const h = await makeHarness(f);
+    const w = h.startWorker();
+    try {
+      const runId = await h.wf.startById("start-by-id", { x: 4 });
+      const result = await h.waitForEnd(runId);
+      expect(result.output("only")).toEqual({ tripled: 12 });
+    } finally {
+      await w.stop();
+    }
   });
 
-  it("when:false skip cascade works via b.step()", async () => {
-    const f = flow({
-      id: "step-skip",
-      input: passthroughSchema<{ enable: boolean }>(),
-      build: (b) =>
-        b
-          .step("gate", {
-            run: async ({ input }) => ({ enabled: input.enable }),
-          })
-          .step("branch", {
-            needs: ["gate"],
-            when: ({ needs }) => needs.gate.enabled,
-            run: async () => ({ ran: true }),
-          })
-          .step("after", {
-            needs: ["branch"],
-            run: async () => ({ ran: true }),
-          }),
-    });
-
-    const result = await runFlow(f, { enable: false });
-    expect(result.stepStatus("gate")).toBe("completed");
-    expect(result.stepStatus("branch")).toBe("skipped");
-    expect(result.stepStatus("after")).toBe("skipped");
-
-    const skips = result.factsOf("step.skipped");
-    expect(skips.find((s) => s.stepId === "branch")?.reason).toBe("when-false");
-    expect(skips.find((s) => s.stepId === "after")?.reason).toBe("transitive");
+  it("honors caller-supplied runId", async () => {
+    const f = strictFlow();
+    const h = await makeHarness(f);
+    const supplied = "run-by-id-xyz" as RunId;
+    const runId = await h.wf.startById(
+      "start-by-id",
+      { x: 2 },
+      { runId: supplied },
+    );
+    expect(runId).toBe(supplied);
   });
 
-  it("retry policy on a b.step entry is wired to dispatch", async () => {
-    let attempts = 0;
-    const f = flow({
-      id: "step-retry",
-      input: emptySchema(),
-      build: (b) =>
-        b.step("flaky", {
-          retry: {
-            maxAttempts: 3,
-            backoff: "exponential",
-            initialDelayMs: 10,
-            maxDelayMs: 50,
-          },
-          run: async () => {
-            attempts++;
-            if (attempts < 3) throw new Error(`fail ${attempts}`);
-            return { attempts };
-          },
-        }),
-    });
+  it("throws NagiRuntimeError when the flowId is not registered", async () => {
+    const f = strictFlow();
+    const h = await makeHarness(f);
+    await expect(
+      h.wf.startById("not-a-real-flow", { x: 1 }),
+    ).rejects.toBeInstanceOf(NagiRuntimeError);
+  });
 
-    const result = await runFlow(f, {});
-    expect(attempts).toBe(3);
-    expect(result.output("flaky")).toEqual({ attempts: 3 });
-    expect(result.factCount("step.retried")).toBe(2);
+  it("throws NagiValidationError when input fails the flow's schema", async () => {
+    const f = strictFlow();
+    const h = await makeHarness(f);
+    await expect(
+      h.wf.startById("start-by-id", { x: "not-a-number" }),
+    ).rejects.toBeInstanceOf(NagiValidationError);
+  });
+
+  it("start(flow, input, opts) is observably equivalent to startById(flow.id, ...)", async () => {
+    const f = strictFlow();
+    const h = await makeHarness(f);
+    const w = h.startWorker();
+    try {
+      const viaStart = await h.wf.start(f, { x: 5 });
+      const viaById = await h.wf.startById("start-by-id", { x: 6 });
+      const r1 = await h.waitForEnd(viaStart);
+      const r2 = await h.waitForEnd(viaById);
+      expect(r1.output("only")).toEqual({ tripled: 15 });
+      expect(r2.output("only")).toEqual({ tripled: 18 });
+    } finally {
+      await w.stop();
+    }
   });
 });
 

@@ -51,6 +51,7 @@ async function seedRuns(
               }
             : {
                 kind: "flow.canceled",
+                cause: "concurrency",
                 runId,
                 at,
                 canceledByRunId: runId,

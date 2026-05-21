@@ -679,6 +679,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       } else {
         await store.appendFact(runId, {
           kind: "flow.canceled",
+          cause: "concurrency",
           runId,
           at,
           canceledByRunId: runId,

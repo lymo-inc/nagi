@@ -4,7 +4,7 @@ import type {
   Clock,
   ConcurrencyMode,
   Fact,
-  FlowCanceledFact,
+  FlowCanceledByConcurrencyFact,
   FlowStartedFact,
   GlobalFact,
   Json,
@@ -102,20 +102,24 @@ export class InMemoryStore implements Store {
     readonly started: boolean;
     readonly canceled: ReadonlyArray<{
       readonly runId: RunId;
-      readonly fact: FlowCanceledFact;
+      readonly fact: FlowCanceledByConcurrencyFact;
     }>;
   }> {
     if (this.facts.has(runId) || this.summaries.has(runId)) {
       return { started: false, canceled: [] };
     }
 
-    const canceled: Array<{ runId: RunId; fact: FlowCanceledFact }> = [];
+    const canceled: Array<{
+      runId: RunId;
+      fact: FlowCanceledByConcurrencyFact;
+    }> = [];
     if (concurrency !== undefined) {
       const slot = `${fact.flowId}::${concurrency.key}`;
       const priorRunId = this.activeByKey.get(slot);
       if (priorRunId !== undefined) {
-        const cancelFact: FlowCanceledFact = {
+        const cancelFact: FlowCanceledByConcurrencyFact = {
           kind: "flow.canceled",
+          cause: "concurrency",
           runId: priorRunId,
           at: fact.at,
           canceledByRunId: runId,

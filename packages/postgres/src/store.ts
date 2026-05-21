@@ -3,7 +3,7 @@ import type {
   ClaimToken,
   ConcurrencyMode,
   Fact,
-  FlowCanceledFact,
+  FlowCanceledByConcurrencyFact,
   FlowStartedFact,
   GlobalFact,
   Json,
@@ -87,7 +87,7 @@ class PostgresStore<DB = unknown> implements Store {
     readonly started: boolean;
     readonly canceled: ReadonlyArray<{
       readonly runId: RunId;
-      readonly fact: FlowCanceledFact;
+      readonly fact: FlowCanceledByConcurrencyFact;
     }>;
   }> {
     if (concurrency === undefined) {
@@ -130,7 +130,7 @@ class PostgresStore<DB = unknown> implements Store {
           started: false,
           canceled: [] as ReadonlyArray<{
             runId: RunId;
-            fact: FlowCanceledFact;
+            fact: FlowCanceledByConcurrencyFact;
           }>,
         };
       }
@@ -143,11 +143,15 @@ class PostgresStore<DB = unknown> implements Store {
         FOR UPDATE
       `.execute(trx);
 
-      const canceled: Array<{ runId: RunId; fact: FlowCanceledFact }> = [];
+      const canceled: Array<{
+        runId: RunId;
+        fact: FlowCanceledByConcurrencyFact;
+      }> = [];
       for (const row of others.rows) {
         const priorRunId = row.run_id as RunId;
-        const cancelFact: FlowCanceledFact = {
+        const cancelFact: FlowCanceledByConcurrencyFact = {
           kind: "flow.canceled",
+          cause: "concurrency",
           runId: priorRunId,
           at: fact.at,
           canceledByRunId: runId,
@@ -387,15 +391,18 @@ class PostgresStore<DB = unknown> implements Store {
            WHERE run_id = ${runId}
         `.execute(trx);
         return;
-      case "flow.canceled":
+      case "flow.canceled": {
+        const canceledByRunId =
+          fact.cause === "concurrency" ? fact.canceledByRunId : null;
         await sql`
           UPDATE ${sql.raw(this.t("workflow_run"))}
              SET status = 'canceled',
-                 canceled_by_run_id = ${fact.canceledByRunId},
+                 canceled_by_run_id = ${canceledByRunId},
                  completed_at = ${fact.at}
            WHERE run_id = ${runId}
         `.execute(trx);
         return;
+      }
       case "step.started":
         await sql`
           INSERT INTO ${sql.raw(this.t("step_run"))} (run_id, step_id, attempt, status, started_at)

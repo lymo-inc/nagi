@@ -10,11 +10,13 @@ import {
   dispatchMessage,
   fireHook as fireRuntimeHook,
   propagateToParent,
+  serializeError,
 } from "./dispatch";
 import { attachDef, getDef, type SignalDef, type StepDef } from "./internal";
 import { InMemoryClock } from "./memory";
 import { descendantsOf } from "./scheduler";
 import type {
+  AttemptNumber,
   Clock,
   Fact,
   Flow,
@@ -73,6 +75,20 @@ export interface Wf {
     opts?: StartOpts,
   ): Promise<RunId>;
 
+  /**
+   * Start a flow by id with a runtime-typed input. Intended for callers
+   * holding a serialized payload (transactional-outbox reconcilers, queue
+   * consumers replaying DLQs, admin CLIs replaying a runId): the input
+   * is validated against the registered flow's schema before the run is
+   * created, mirroring `start`'s runtime contract without requiring a
+   * compile-time-typed input.
+   *
+   * Throws `NagiRuntimeError` when `flowId` is not registered with
+   * `nagi()`, and `NagiValidationError` when the input fails the flow's
+   * schema or when `opts.runId` is invalid.
+   */
+  startById(flowId: string, input: unknown, opts?: StartOpts): Promise<RunId>;
+
   signal(runId: RunId, stepName: string, payload: unknown): Promise<void>;
 
   cancel(runId: RunId, opts?: CancelOpts): Promise<void>;
@@ -126,6 +142,19 @@ export class NagiCanceledError extends Error {
     };
   }
 }
+
+type CancelArgs =
+  | {
+      readonly cause: "explicit";
+      readonly reason: string;
+      readonly note?: string;
+    }
+  | {
+      readonly cause: "operator";
+      readonly reason: string;
+      readonly actor: string;
+      readonly note?: string;
+    };
 
 export class NagiSnapshotDriftError extends Error {
   readonly runId: RunId;
@@ -206,8 +235,16 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
     readonly runId: RunId;
     readonly parentRunId?: RunId;
     readonly parentStepId?: StepId;
+    readonly parentStepAttempt?: AttemptNumber;
   }): Promise<{ readonly started: boolean }> {
-    const { flow, validatedInput, runId, parentRunId, parentStepId } = args;
+    const {
+      flow,
+      validatedInput,
+      runId,
+      parentRunId,
+      parentStepId,
+      parentStepAttempt,
+    } = args;
     const startedAt = clock.now();
     const flowHash = flowHashById.get(flow.id);
     const fact: FlowStartedFact = {
@@ -252,11 +289,7 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
         concurrencyKey: c.fact.concurrencyKey,
       });
       const serialized: SerializedError = {
-        name: cancelError.name,
-        message: cancelError.message,
-        ...(cancelError.stack !== undefined
-          ? { stack: cancelError.stack }
-          : {}),
+        ...serializeError(cancelError),
         cause: {
           canceledByRunId: runId,
           concurrencyKey: c.fact.concurrencyKey,
@@ -286,12 +319,27 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       });
     }
 
-    const startEvent = {
-      runId,
-      flowId: flow.id,
-      input: validatedInput,
-      at: startedAt,
-    };
+    const startEvent =
+      parentRunId !== undefined &&
+      parentStepId !== undefined &&
+      parentStepAttempt !== undefined
+        ? {
+            runId,
+            flowId: flow.id,
+            input: validatedInput,
+            at: startedAt,
+            parent: {
+              runId: parentRunId,
+              stepId: parentStepId,
+              attempt: parentStepAttempt,
+            },
+          }
+        : {
+            runId,
+            flowId: flow.id,
+            input: validatedInput,
+            at: startedAt,
+          };
     await fireRuntimeHook(
       flow.onStart,
       startEvent,
@@ -314,8 +362,10 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
     readonly childInput: unknown;
     readonly parentRunId: RunId;
     readonly parentStepId: StepId;
+    readonly parentStepAttempt: AttemptNumber;
   }): Promise<RunId> {
-    const { child, childInput, parentRunId, parentStepId } = args;
+    const { child, childInput, parentRunId, parentStepId, parentStepAttempt } =
+      args;
     if (!flowsById.has(child.id)) {
       throw new NagiRuntimeError(
         `Subflow child "${child.id}" not registered with nagi(). Pass it to flows[].`,
@@ -329,6 +379,7 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       runId: childRunId,
       parentRunId,
       parentStepId,
+      parentStepAttempt,
     });
     if (!started) {
       throw new NagiRuntimeError(
@@ -340,12 +391,7 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
 
   async function cancelRunRecursive(
     runId: RunId,
-    args: {
-      readonly cause: "explicit" | "operator";
-      readonly reason: string;
-      readonly actor?: string;
-      readonly note?: string;
-    },
+    args: CancelArgs,
   ): Promise<void> {
     const state = await config.store.loadRunState(runId);
     if (
@@ -360,22 +406,31 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       return;
     }
     const flow = flowsById.get(state.flowId);
-    const canceledFact: FlowCanceledFact = {
-      kind: "flow.canceled",
-      cause: args.cause,
-      runId,
-      at: clock.now(),
-      canceledByRunId: runId,
-      concurrencyKey: args.cause === "explicit" ? args.reason : "",
-      ...(args.actor !== undefined ? { actor: args.actor } : {}),
-      ...(args.note !== undefined ? { note: args.note } : {}),
-    };
+    const canceledFact: FlowCanceledFact =
+      args.cause === "operator"
+        ? {
+            kind: "flow.canceled",
+            cause: "operator",
+            runId,
+            at: clock.now(),
+            actor: args.actor,
+            reason: args.reason,
+            ...(args.note !== undefined ? { note: args.note } : {}),
+          }
+        : {
+            kind: "flow.canceled",
+            cause: "explicit",
+            runId,
+            at: clock.now(),
+            reason: args.reason,
+            ...(args.note !== undefined ? { note: args.note } : {}),
+          };
     await config.store.appendFact(runId, canceledFact);
+    const cancelError: SerializedError = {
+      name: "NagiCanceledError",
+      message: `Run ${runId} was canceled: ${args.reason}`,
+    };
     if (flow !== undefined) {
-      const cancelError: SerializedError = {
-        name: "NagiCanceledError",
-        message: `Run ${runId} was canceled: ${args.reason}`,
-      };
       const event = {
         runId,
         flowId: flow.id,
@@ -397,16 +452,12 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
         cause: "explicit",
         reason: `parent ${runId} canceled: ${args.reason}`,
         note:
-          args.cause === "operator" && args.actor !== undefined
+          args.cause === "operator"
             ? `cascade from operator ${args.actor} aborting parent ${runId}`
             : `cascade from parent ${runId}`,
       });
     }
 
-    const cancelError: SerializedError = {
-      name: "NagiCanceledError",
-      message: `Run ${runId} was canceled: ${args.reason}`,
-    };
     await propagateToParent(dispatchDeps, runId, {
       kind: "canceled",
       error: cancelError,
@@ -433,9 +484,18 @@ export async function nagi(config: NagiConfig): Promise<Wf> {
       input: FlowInput<F>,
       opts?: StartOpts,
     ): Promise<RunId> {
-      if (!flowsById.has(flow.id)) {
+      return wf.startById(flow.id, input, opts);
+    },
+
+    async startById(
+      flowId: string,
+      input: unknown,
+      opts?: StartOpts,
+    ): Promise<RunId> {
+      const flow = flowsById.get(flowId);
+      if (!flow) {
         throw new NagiRuntimeError(
-          `Flow "${flow.id}" not registered with nagi(). Pass it to flows[].`,
+          `Flow "${flowId}" not registered with nagi(). Pass it to flows[].`,
         );
       }
 
@@ -753,12 +813,7 @@ interface OperatorDeps {
   readonly flowsById: ReadonlyMap<string, Flow>;
   readonly cancelRunRecursive: (
     runId: RunId,
-    args: {
-      readonly cause: "explicit" | "operator";
-      readonly reason: string;
-      readonly actor?: string;
-      readonly note?: string;
-    },
+    args: CancelArgs,
   ) => Promise<void>;
   readonly logger?: Logger;
 }

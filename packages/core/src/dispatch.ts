@@ -8,12 +8,14 @@ import {
   selectArm,
 } from "./internal";
 import {
-  aggregateMatch,
   extractInput,
-  flowTermination,
-  nextRunnable,
+  isFlowTerminal,
+  type MatchPromotion,
+  nextTransition,
+  type SkipDecision,
 } from "./scheduler";
 import type {
+  AttemptNumber,
   Clock,
   Fact,
   Flow,
@@ -36,12 +38,13 @@ import type {
 
 export interface DispatchDeps {
   readonly flowFor: (runId: RunId) => Promise<Flow>;
-  readonly lookupFlow?: (flowId: string) => Flow | undefined;
-  readonly startChildRun?: (args: {
+  readonly lookupFlow: (flowId: string) => Flow | undefined;
+  readonly startChildRun: (args: {
     readonly child: Flow;
     readonly childInput: unknown;
     readonly parentRunId: RunId;
     readonly parentStepId: StepId;
+    readonly parentStepAttempt: AttemptNumber;
   }) => Promise<RunId>;
   readonly store: Store;
   readonly queue: Queue;
@@ -377,13 +380,8 @@ async function executeSubflow(args: {
   runId: RunId;
   stepId: string;
 }): Promise<void> {
-  const { deps, def, runId, stepId } = args;
+  const { deps, message, def, runId, stepId } = args;
   const { store } = deps;
-  if (deps.lookupFlow === undefined || deps.startChildRun === undefined) {
-    throw new Error(
-      `subflow dispatch requires DispatchDeps.lookupFlow + .startChildRun (step "${stepId}" referenced child "${def.childFlowId}")`,
-    );
-  }
   const child = deps.lookupFlow(def.childFlowId);
   if (child === undefined) {
     throw new Error(
@@ -399,6 +397,7 @@ async function executeSubflow(args: {
     childInput,
     parentRunId: runId,
     parentStepId: stepId,
+    parentStepAttempt: message.attempt,
   });
 }
 
@@ -448,8 +447,8 @@ async function handleStepError(args: {
   const stepAborted = hasAbortRequest(postState.facts, stepId, attempt);
   if (runIsCanceled || stepAborted) {
     const isAbort =
-      err instanceof Error &&
-      (err.name === "AbortError" || err.name === "NagiAbortError");
+      err instanceof NagiAbortError ||
+      (err instanceof Error && err.name === "AbortError");
     const canceledFact: Fact = {
       kind: "step.canceled",
       runId,
@@ -526,54 +525,34 @@ async function handleStepError(args: {
 const MAX_ADVANCE_ITERS = 1024;
 
 export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
-  const { store, queue, clock } = deps;
+  const { store, queue } = deps;
   const flow = await deps.flowFor(runId);
 
   for (let iter = 0; iter < MAX_ADVANCE_ITERS; iter++) {
     const runState = await store.loadRunState(runId);
+    const t = nextTransition(flow, runState);
 
-    const promoted = await promoteMatches({ deps, flow, runState });
-    if (promoted) continue;
-
-    const termination = flowTermination(flow, runState);
-
-    if (termination.done) {
-      if (isFlowTerminal(runState.facts)) return;
-      if (termination.failed) {
-        const failedStep = Object.values(runState.steps).find(
-          (s) => s.status === "failed",
-        );
-        const flowError = failedStep?.error ?? {
-          name: "Error",
-          message: "step failed",
-        };
-        await finalizeFlowFailure({ deps, flow, runId, error: flowError });
-      } else {
-        await finalizeFlowCompletion({ deps, flow, runId, runState });
-      }
-      return;
+    switch (t.kind) {
+      case "settled":
+      case "waiting":
+        return;
+      case "complete":
+        await finalizeFlowCompletion({ deps, flow, runId, output: t.output });
+        return;
+      case "fail":
+        await finalizeFlowFailure({ deps, flow, runId, error: t.error });
+        return;
+      case "dispatch":
+        await recordSkips(deps, runId, t.skip);
+        for (const stepId of t.runnable) await queue.enqueue(runId, stepId);
+        return;
+      case "skip":
+        await recordSkips(deps, runId, t.skip);
+        continue;
+      case "promote-match":
+        await applyPromotions(deps, flow, runState, t.promotions);
+        continue;
     }
-
-    const input = extractInput(runState);
-    const decision = nextRunnable({ flow, runState, input });
-
-    if (decision.skip.length === 0 && decision.runnable.length === 0) return;
-
-    for (const { stepId, reason } of decision.skip) {
-      await store.appendFact(runId, {
-        kind: "step.skipped",
-        runId,
-        stepId,
-        reason,
-        at: clock.now(),
-      });
-    }
-
-    for (const stepId of decision.runnable) {
-      await queue.enqueue(runId, stepId);
-    }
-
-    if (decision.runnable.length > 0) return;
   }
 
   const cycleError: SerializedError = {
@@ -586,87 +565,116 @@ export async function advance(deps: DispatchDeps, runId: RunId): Promise<void> {
   }
 }
 
-async function promoteMatches(args: {
-  deps: DispatchDeps;
-  flow: Flow;
-  runState: RunState;
-}): Promise<boolean> {
-  const { deps, flow, runState } = args;
+async function recordSkips(
+  deps: DispatchDeps,
+  runId: RunId,
+  skip: readonly SkipDecision[],
+): Promise<void> {
   const { store, clock } = deps;
-  let promoted = false;
-
-  for (const [matchId, step] of Object.entries(flow.steps)) {
-    const def = getDef(step);
-    if (def.kind !== "match") continue;
-    const state = runState.steps[matchId];
-    if (state?.status !== "running") continue;
-
-    const agg = aggregateMatch(matchId, flow, runState);
-    if (agg.kind === "pending") continue;
-
-    const attempt = state.attempts > 0 ? state.attempts : 1;
-
-    if (agg.kind === "fail-fast") {
-      const failedNested = runState.steps[agg.failedStepId];
-      const error: SerializedError = failedNested?.error ?? {
-        name: "Error",
-        message: `match "${matchId}": chosen-arm step "${agg.failedStepId}" failed`,
-      };
-      const fact: Fact = {
-        kind: "step.failed",
-        runId: runState.runId,
-        stepId: matchId,
-        attempt,
-        error,
-        at: clock.now(),
-      };
-      await store.failStep(runState.runId, matchId, error, fact);
-      await fireHook(
-        deps.hooks?.onStepError,
-        {
-          runId: runState.runId,
-          flowId: flow.id,
-          stepId: matchId,
-          attempt,
-          kind: "match",
-          error,
-          at: clock.now(),
-        },
-        "onStepError",
-        deps,
-      );
-      promoted = true;
-      continue;
-    }
-
-    const fact: Fact = {
-      kind: "step.completed",
-      runId: runState.runId,
-      stepId: matchId,
-      attempt,
-      output: agg.output,
+  for (const { stepId, reason } of skip) {
+    await store.appendFact(runId, {
+      kind: "step.skipped",
+      runId,
+      stepId,
+      reason,
       at: clock.now(),
-    };
-    await store.completeStep(runState.runId, matchId, agg.output, fact);
-    await fireHook(
-      deps.hooks?.onStepComplete,
-      {
+    });
+  }
+}
+
+/**
+ * Mark a match/subflow step terminal: append the fact, persist, and fire the
+ * runtime-level hook. Shared by match promotion and subflow wake. The task
+ * path differs (the fact is written inside the runStep transaction) and does
+ * not route through here.
+ */
+async function markStepComplete(args: {
+  readonly deps: DispatchDeps;
+  readonly flow: Flow;
+  readonly runId: RunId;
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly kind: "match" | "subflow";
+  readonly output: Json;
+}): Promise<void> {
+  const { deps, flow, runId, stepId, attempt, kind, output } = args;
+  const at = deps.clock.now();
+  const fact: Fact = {
+    kind: "step.completed",
+    runId,
+    stepId,
+    attempt,
+    output,
+    at,
+  };
+  await deps.store.completeStep(runId, stepId, output, fact);
+  await fireHook(
+    deps.hooks?.onStepComplete,
+    {
+      runId,
+      flowId: flow.id,
+      stepId,
+      attempt,
+      kind,
+      output,
+      durationMs: 0,
+      at,
+    },
+    "onStepComplete",
+    deps,
+  );
+}
+
+async function markStepFail(args: {
+  readonly deps: DispatchDeps;
+  readonly flow: Flow;
+  readonly runId: RunId;
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly kind: "match" | "subflow";
+  readonly error: SerializedError;
+}): Promise<void> {
+  const { deps, flow, runId, stepId, attempt, kind, error } = args;
+  const at = deps.clock.now();
+  const fact: Fact = { kind: "step.failed", runId, stepId, attempt, error, at };
+  await deps.store.failStep(runId, stepId, error, fact);
+  await fireHook(
+    deps.hooks?.onStepError,
+    { runId, flowId: flow.id, stepId, attempt, kind, error, at },
+    "onStepError",
+    deps,
+  );
+}
+
+async function applyPromotions(
+  deps: DispatchDeps,
+  flow: Flow,
+  runState: RunState,
+  promotions: readonly MatchPromotion[],
+): Promise<void> {
+  for (const { matchId, attempt, result } of promotions) {
+    if (result.kind === "fail") {
+      await markStepFail({
+        deps,
+        flow,
         runId: runState.runId,
-        flowId: flow.id,
         stepId: matchId,
         attempt,
         kind: "match",
-        output: agg.output,
-        durationMs: 0,
-        at: clock.now(),
-      },
-      "onStepComplete",
-      deps,
-    );
-    promoted = true;
+        error: result.error,
+      });
+    } else {
+      await markStepComplete({
+        deps,
+        flow,
+        runId: runState.runId,
+        stepId: matchId,
+        attempt,
+        kind: "match",
+        output: result.output,
+      });
+    }
   }
-
-  return promoted;
 }
 
 function makeStepCtx(args: {
@@ -723,21 +731,6 @@ function retryAllows(policy: RetryPolicy, err: unknown): boolean {
   return policy.retryOn(err);
 }
 
-function isFlowTerminal(facts: readonly Fact[]): boolean {
-  for (let i = facts.length - 1; i >= 0; i--) {
-    const f = facts[i];
-    if (
-      f !== undefined &&
-      (f.kind === "flow.completed" ||
-        f.kind === "flow.failed" ||
-        f.kind === "flow.canceled")
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 async function finalizeFlowFailure(args: {
   readonly deps: DispatchDeps;
   readonly flow: Flow;
@@ -762,11 +755,10 @@ async function finalizeFlowCompletion(args: {
   readonly deps: DispatchDeps;
   readonly flow: Flow;
   readonly runId: RunId;
-  readonly runState: RunState;
+  readonly output: Json;
 }): Promise<void> {
-  const { deps, flow, runId, runState } = args;
+  const { deps, flow, runId, output } = args;
   const { store, clock } = deps;
-  const output = computeFlowOutput(flow, runState);
   await store.appendFact(runId, {
     kind: "flow.completed",
     runId,
@@ -789,7 +781,7 @@ export async function propagateToParent(
   childRunId: RunId,
   outcome: SubflowChildOutcome,
 ): Promise<void> {
-  const { store, clock } = deps;
+  const { store } = deps;
   const childState = await store.loadRunState(childRunId);
   const startedFact = childState.facts.find((f) => f.kind === "flow.started") as
     | FlowStartedFact
@@ -839,74 +831,31 @@ export async function propagateToParent(
       childRunId,
       output: outcome.output,
     };
-    const completedFact: Fact = {
-      kind: "step.completed",
+    await markStepComplete({
+      deps,
+      flow: parentFlow,
       runId: parentRunId,
       stepId: parentStepId,
       attempt,
+      kind: "subflow",
       output: subflowOutput,
-      at: clock.now(),
-    };
-    await store.completeStep(
-      parentRunId,
-      parentStepId,
-      subflowOutput,
-      completedFact,
-    );
-    await fireHook(
-      deps.hooks?.onStepComplete,
-      {
-        runId: parentRunId,
-        flowId: parentFlow.id,
-        stepId: parentStepId,
-        attempt,
-        kind: "subflow" as const,
-        output: subflowOutput,
-        durationMs: 0,
-        at: clock.now(),
-      },
-      "onStepComplete",
-      deps,
-    );
+    });
   } else {
-    const failedFact: Fact = {
-      kind: "step.failed",
+    await markStepFail({
+      deps,
+      flow: parentFlow,
       runId: parentRunId,
       stepId: parentStepId,
       attempt,
+      kind: "subflow",
       error: outcome.error,
-      at: clock.now(),
-    };
-    await store.failStep(parentRunId, parentStepId, outcome.error, failedFact);
-    await fireHook(
-      deps.hooks?.onStepError,
-      {
-        runId: parentRunId,
-        flowId: parentFlow.id,
-        stepId: parentStepId,
-        attempt,
-        kind: "subflow" as const,
-        error: outcome.error,
-        at: clock.now(),
-      },
-      "onStepError",
-      deps,
-    );
+    });
   }
 
   await advance(deps, parentRunId);
 }
 
-function computeFlowOutput(flow: Flow, runState: RunState): Json {
-  if (flow.output === undefined) return null;
-  const stepOutputs: Record<string, Json> = {};
-  for (const [sid, sstate] of Object.entries(runState.steps)) {
-    if (sstate.output !== undefined) stepOutputs[sid] = sstate.output;
-  }
-  return flow.output(stepOutputs as never) as Json;
-}
-
-function serializeError(err: unknown): SerializedError {
+export function serializeError(err: unknown): SerializedError {
   if (err instanceof Error) {
     return {
       name: err.name,

@@ -6,6 +6,7 @@ import {
   extractInput,
   flowTermination,
   nextRunnable,
+  nextTransition,
 } from "./scheduler";
 import { passthroughSchema } from "./test-helpers";
 import type { Fact, Flow, RunId, RunState } from "./types";
@@ -287,17 +288,22 @@ describe("descendantsOf", () => {
       build: (b) =>
         ({
           m: b.match({
-            on: ({ input }) => input.kind,
-            cases: {
-              a: (b1) => ({ x: b1.task({ run: async () => null }) }),
-              b: (b1) => ({ y: b1.task({ run: async () => null }) }),
-            },
+            arms: [
+              {
+                when: ({ input }) => input.kind === "a",
+                build: (b1) => ({ x: b1.task({ run: async () => null }) }),
+              },
+              {
+                otherwise: true,
+                build: (b1) => ({ y: b1.task({ run: async () => null }) }),
+              },
+            ],
           }),
         }) as never,
     });
     const desc = descendantsOf(f, "m");
     expect(desc[0]).toBe("m");
-    expect([...desc].slice(1).sort()).toEqual(["m.a.x", "m.b.y"]);
+    expect([...desc].slice(1).sort()).toEqual(["m.arm0.x", "m.otherwise.y"]);
   });
 
   it("arm step — resetting an arm step does NOT cascade to siblings or parent", () => {
@@ -307,16 +313,198 @@ describe("descendantsOf", () => {
       build: (b) =>
         ({
           m: b.match({
-            on: ({ input }) => input.kind,
-            cases: {
-              a: (b1) => ({
-                x: b1.task({ run: async () => null }),
-                y: b1.task({ run: async () => null }),
-              }),
-            },
+            arms: [
+              {
+                otherwise: true,
+                build: (b1) => ({
+                  x: b1.task({ run: async () => null }),
+                  y: b1.task({ run: async () => null }),
+                }),
+              },
+            ],
           }),
         }) as never,
     });
-    expect(descendantsOf(f, "m.a.x")).toEqual(["m.a.x"]);
+    expect(descendantsOf(f, "m.otherwise.x")).toEqual(["m.otherwise.x"]);
+  });
+});
+
+function startedStepFact(stepId: string): Fact {
+  return {
+    kind: "step.started",
+    runId: RUN,
+    stepId,
+    attempt: 1,
+    at: new Date(),
+  };
+}
+
+function armSelectedFact(stepId: string, arm: string): Fact {
+  return {
+    kind: "match.arm-selected",
+    runId: RUN,
+    stepId,
+    arm,
+    at: new Date(),
+  };
+}
+
+function singleArmMatchFlow(): Flow {
+  return flow({
+    id: "match-promote",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) =>
+      ({
+        m: b.match({
+          arms: [
+            {
+              otherwise: true,
+              build: (b1) => ({
+                x: b1.task({ run: async () => ({ ok: true }) }),
+              }),
+            },
+          ],
+        }),
+      }) as never,
+  });
+}
+
+describe("nextTransition", () => {
+  it("dispatch: initial steps on a fresh run", async () => {
+    const f = linearFlow();
+    const state = await projectFacts([startedFact(f.id, { n: 1 })]);
+    expect(nextTransition(f, state)).toEqual({
+      kind: "dispatch",
+      runnable: ["a"],
+      skip: [],
+    });
+  });
+
+  it("dispatch: downstream once upstream completes", async () => {
+    const f = linearFlow();
+    const state = await projectFacts([
+      startedFact(f.id, { n: 1 }),
+      completedStepFact("a", { doubled: 2 }),
+    ]);
+    expect(nextTransition(f, state)).toEqual({
+      kind: "dispatch",
+      runnable: ["c"],
+      skip: [],
+    });
+  });
+
+  it("complete: all steps terminal, none failed — carries computed output", async () => {
+    const f = flow({
+      id: "with-output",
+      input: passthroughSchema<{ n: number }>(),
+      build: (b) => {
+        const a = b.task({
+          run: async ({ input }) => ({ doubled: input.n * 2 }),
+        });
+        return { a };
+      },
+      output: ({ a }) => ({ result: a.doubled }),
+    });
+    const state = await projectFacts([
+      startedFact(f.id, { n: 2 }),
+      completedStepFact("a", { doubled: 4 }),
+    ]);
+    expect(nextTransition(f, state)).toEqual({
+      kind: "complete",
+      output: { result: 4 },
+    });
+  });
+
+  it("fail: a step failed terminally — carries that step's error", async () => {
+    const f = linearFlow();
+    const state = await projectFacts([
+      startedFact(f.id, { n: 1 }),
+      failedStepFact("a"),
+      skippedStepFact("c", "transitive"),
+    ]);
+    const t = nextTransition(f, state);
+    expect(t.kind).toBe("fail");
+    if (t.kind === "fail") expect(t.error.message).toBe("boom");
+  });
+
+  it("settled: flow already carries a terminal fact", async () => {
+    const f = linearFlow();
+    const state = await projectFacts([
+      startedFact(f.id, { n: 1 }),
+      completedStepFact("a", {}),
+      completedStepFact("c", {}),
+      { kind: "flow.completed", runId: RUN, output: null, at: new Date() },
+    ]);
+    expect(nextTransition(f, state)).toEqual({ kind: "settled" });
+  });
+
+  it("waiting: a step is running and nothing else is runnable", async () => {
+    const f = linearFlow();
+    const state = await projectFacts([
+      startedFact(f.id, { n: 1 }),
+      startedStepFact("a"),
+    ]);
+    expect(nextTransition(f, state)).toEqual({ kind: "waiting" });
+  });
+
+  it("skip: only transitive/when-false skips remain", async () => {
+    const f = gatedFlow();
+    const state = await projectFacts([
+      startedFact(f.id, { enable: false }),
+      completedStepFact("gate", { enabled: false }),
+    ]);
+    expect(nextTransition(f, state)).toEqual({
+      kind: "skip",
+      skip: [{ stepId: "branch", reason: "when-false" }],
+    });
+  });
+
+  it("promote-match: a running match whose arm steps are all terminal", async () => {
+    const f = singleArmMatchFlow();
+    const state = await projectFacts([
+      startedFact(f.id, {}),
+      armSelectedFact("m", "otherwise"),
+      startedStepFact("m"),
+      completedStepFact("m.otherwise.x", { ok: true }),
+    ]);
+    expect(nextTransition(f, state)).toEqual({
+      kind: "promote-match",
+      promotions: [
+        {
+          matchId: "m",
+          attempt: 1,
+          result: { kind: "complete", output: { x: { ok: true } } },
+        },
+      ],
+    });
+  });
+
+  it("priority: promote-match wins over an otherwise-runnable step", async () => {
+    const f = flow({
+      id: "match-priority",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) =>
+        ({
+          m: b.match({
+            arms: [
+              {
+                otherwise: true,
+                build: (b1) => ({
+                  x: b1.task({ run: async () => ({ ok: true }) }),
+                }),
+              },
+            ],
+          }),
+          indep: b.task({ run: async () => null }),
+        }) as never,
+    });
+    const state = await projectFacts([
+      startedFact(f.id, {}),
+      armSelectedFact("m", "otherwise"),
+      startedStepFact("m"),
+      completedStepFact("m.otherwise.x", { ok: true }),
+    ]);
+    // `indep` is runnable, but a promotable match takes priority this tick.
+    expect(nextTransition(f, state).kind).toBe("promote-match");
   });
 });

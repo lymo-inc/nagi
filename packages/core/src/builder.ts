@@ -1,18 +1,16 @@
 import {
   attachDef,
-  attachDefMut,
-  type DiscriminatorMatchDef,
-  type GuardMatchDef,
   type MatchArmDef,
   type MatchDef,
   type ParentMatchRef,
+  type PendingMatchArm,
+  type PendingMatchDef,
   type SignalDef,
   type StepDef,
   type SubflowDef,
   type TaskDef,
 } from "./internal";
 import type {
-  AsStepMap,
   Builder,
   Flow,
   FlowCompleteEvent,
@@ -22,56 +20,19 @@ import type {
   InferSchemaOutput,
   Json,
   MatchArm,
-  MatchDiscriminatorConfig,
   MatchGuardConfig,
   NeedsMap,
   SignalConfig,
   StandardSchemaV1,
   Step,
   StepCompleteEvent,
-  StepEntryConfig,
   StepMap,
   SubflowConfig,
   SubflowStepOutput,
   TaskConfig,
 } from "./types";
 
-const BUILDER_BRAND = Symbol.for("nagi.builder");
-
-interface BuilderInternal {
-  readonly [BUILDER_BRAND]: true;
-  readonly __steps: Map<string, Step<unknown>>;
-}
-
-function isBuilder(value: unknown): value is BuilderInternal {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    (value as { [BUILDER_BRAND]?: unknown })[BUILDER_BRAND] === true
-  );
-}
-
-function resolveBuildResult(value: unknown): StepMap {
-  if (isBuilder(value)) {
-    return Object.fromEntries(value.__steps) as StepMap;
-  }
-  return value as StepMap;
-}
-
-function isDiscriminator(
-  config: object,
-): config is MatchDiscriminatorConfig<
-  unknown,
-  NeedsMap,
-  string,
-  Record<string, StepMap>
-> {
-  return "cases" in config && "on" in config;
-}
-
 function makeBuilder<Input>(): Builder<Input> {
-  const chainSteps = new Map<string, Step<unknown>>();
-
   function task<N extends NeedsMap, O>(
     config: TaskConfig<Input, N, O>,
   ): Step<O> {
@@ -155,35 +116,14 @@ function makeBuilder<Input>(): Builder<Input> {
     );
   }
 
-  function match(config: object): Step<unknown> {
-    const needs =
-      "needs" in config && config.needs
-        ? (config.needs as NeedsMap)
-        : ({} as NeedsMap);
-
-    if (isDiscriminator(config)) {
-      const arms: Record<string, MatchArmDef> = {};
-      for (const [caseKey, build] of Object.entries(config.cases)) {
-        const nested = resolveBuildResult(
-          (build as (b: Builder<Input>) => unknown)(makeBuilder<Input>()),
-        );
-        arms[caseKey] = { id: caseKey, stepIds: [], _nested: nested };
-      }
-      const def: DiscriminatorMatchDef = {
-        kind: "match",
-        mode: "discriminator",
-        needs,
-        on: config.on as DiscriminatorMatchDef["on"],
-        arms,
-      };
-      return attachDef<unknown>({ kind: "match", id: "" }, def);
-    }
-
-    const guardConfig = config as MatchGuardConfig<Input, NeedsMap, StepMap>;
-    const arms: MatchArmDef[] = [];
-    for (let i = 0; i < guardConfig.arms.length; i++) {
-      const arm = guardConfig.arms[i] as MatchArm<Input, NeedsMap, StepMap>;
-      const nested = resolveBuildResult(arm.build(makeBuilder<Input>()));
+  function match(
+    config: MatchGuardConfig<Input, NeedsMap, StepMap>,
+  ): Step<unknown> {
+    const needs = (config.needs ?? {}) as NeedsMap;
+    const arms: PendingMatchArm[] = [];
+    for (let i = 0; i < config.arms.length; i++) {
+      const arm = config.arms[i] as MatchArm<Input, NeedsMap, StepMap>;
+      const nested = arm.build(makeBuilder<Input>()) as StepMap;
       const armId = arm.otherwise ? "otherwise" : `arm${i}`;
       arms.push({
         id: armId,
@@ -196,116 +136,34 @@ function makeBuilder<Input>(): Builder<Input> {
             }
           : {}),
         ...(arm.otherwise ? { otherwise: true as const } : {}),
-        stepIds: [],
-        _nested: nested,
+        nested,
       });
     }
-    const def: GuardMatchDef = {
-      kind: "match",
-      mode: "guard",
-      needs,
-      arms,
-    };
-    return attachDef<unknown>({ kind: "match", id: "" }, def);
+    const def: PendingMatchDef = { kind: "match", needs, arms };
+    return attachDef<unknown>(
+      { kind: "match", id: "" },
+      def as unknown as StepDef,
+    );
   }
 
-  function step(
-    key: string,
-    config: StepEntryConfig<
-      Input,
-      Record<string, unknown>,
-      ReadonlyArray<string>,
-      unknown
-    >,
-  ): Builder<Input, Record<string, unknown>> {
-    if (chainSteps.has(key)) {
-      throw new Error(
-        `b.step: duplicate key "${key}" — each chain entry must have a unique key.`,
-      );
-    }
-    const shell: Step<unknown> = { kind: "task", id: "" };
-    const needs: Record<string, Step<unknown>> = {};
-    if (config.needs) {
-      for (const sibKey of config.needs) {
-        const sibling = chainSteps.get(sibKey);
-        if (sibling === undefined) {
-          throw new Error(
-            `b.step("${key}"): unknown sibling "${sibKey}". ` +
-              `Available keys so far: ${[...chainSteps.keys()].join(", ") || "<none>"}.`,
-          );
-        }
-        needs[sibKey] = sibling;
-      }
-    }
-    const def: TaskDef = {
-      kind: "task",
-      needs,
-      ...(config.retry !== undefined ? { retry: config.retry } : {}),
-      ...(config.timeoutMs !== undefined
-        ? { timeoutMs: config.timeoutMs }
-        : {}),
-      ...(config.when !== undefined
-        ? {
-            when: config.when as (args: {
-              input: unknown;
-              needs: Record<string, unknown>;
-            }) => boolean,
-          }
-        : {}),
-      run: config.run as TaskDef["run"],
-      ...(config.onStart !== undefined ? { onStart: config.onStart } : {}),
-      ...(config.onComplete !== undefined
-        ? {
-            onComplete: config.onComplete as (
-              event: StepCompleteEvent,
-            ) => void | Promise<void>,
-          }
-        : {}),
-      ...(config.onError !== undefined ? { onError: config.onError } : {}),
-      ...(config.onRetry !== undefined ? { onRetry: config.onRetry } : {}),
-    };
-    attachDefMut(shell, def);
-    chainSteps.set(key, shell);
-    return builder as Builder<Input, Record<string, unknown>>;
-  }
-
-  function include(
-    key: string,
-    s: Step<unknown>,
-  ): Builder<Input, Record<string, unknown>> {
-    if (chainSteps.has(key)) {
-      throw new Error(
-        `b.include: duplicate key "${key}" — each chain entry must have a unique key.`,
-      );
-    }
-    chainSteps.set(key, s);
-    return builder as Builder<Input, Record<string, unknown>>;
-  }
-
-  const builder = {
+  return {
     task,
     signal,
     subflow,
     match: match as Builder<Input>["match"],
-    step: step as Builder<Input>["step"],
-    include: include as Builder<Input>["include"],
-    [BUILDER_BRAND]: true as const,
-    __steps: chainSteps,
-  } as Builder<Input> & BuilderInternal;
-
-  return builder;
+  };
 }
 
 export function flow<
   const Id extends string,
   InputSchema extends StandardSchemaV1,
-  R,
+  R extends StepMap,
   Output = unknown,
 >(
   config: FlowConfig<Id, InputSchema, R, Output>,
-): Flow<Id, InputSchema, AsStepMap<R>, Output> {
+): Flow<Id, InputSchema, R, Output> {
   const builder = makeBuilder<InferSchemaOutput<InputSchema>>();
-  const built = resolveBuildResult(config.build(builder));
+  const built = config.build(builder);
 
   const idByIdentity = new Map<Step<unknown>, string>();
   collectIds(built, "", idByIdentity);
@@ -325,7 +183,7 @@ export function flow<
   return {
     id: config.id,
     input: config.input,
-    steps: finalSteps as AsStepMap<R>,
+    steps: finalSteps as R,
     ...(config.output !== undefined ? { output: config.output } : {}),
     ...(config.onStart !== undefined ? { onStart: config.onStart } : {}),
     ...(config.onComplete !== undefined
@@ -352,11 +210,9 @@ function collectIds(
     idByIdentity.set(step, id);
     const def = (step as { __def?: StepDef }).__def;
     if (def?.kind === "match") {
-      const arms: readonly MatchArmDef[] =
-        def.mode === "discriminator" ? Object.values(def.arms) : def.arms;
-      for (const arm of arms) {
-        if (arm._nested)
-          collectIds(arm._nested, `${id}.${arm.id}`, idByIdentity);
+      const pending = def as unknown as PendingMatchDef;
+      for (const arm of pending.arms) {
+        collectIds(arm.nested, `${id}.${arm.id}`, idByIdentity);
       }
     }
   }
@@ -409,26 +265,23 @@ function walkAndRewrite(args: WalkArgs): void {
     }
 
     if (def.kind === "match") {
-      const armList: readonly MatchArmDef[] =
-        def.mode === "discriminator" ? Object.values(def.arms) : def.arms;
+      const pending = def as unknown as PendingMatchDef;
       const finalizedArms: MatchArmDef[] = [];
 
-      for (const arm of armList) {
+      for (const arm of pending.arms) {
         const armPrefix = `${id}.${arm.id}`;
         const nestedStepIds: string[] = [];
-        if (arm._nested) {
-          for (const nestedKey of Object.keys(arm._nested)) {
-            nestedStepIds.push(`${armPrefix}.${nestedKey}`);
-          }
-          walkAndRewrite({
-            flowId,
-            map: arm._nested,
-            prefix: armPrefix,
-            parentMatch: { matchId: id, armId: arm.id },
-            idByIdentity,
-            out,
-          });
+        for (const nestedKey of Object.keys(arm.nested)) {
+          nestedStepIds.push(`${armPrefix}.${nestedKey}`);
         }
+        walkAndRewrite({
+          flowId,
+          map: arm.nested,
+          prefix: armPrefix,
+          parentMatch: { matchId: id, armId: arm.id },
+          idByIdentity,
+          out,
+        });
         finalizedArms.push({
           id: arm.id,
           ...(arm.when !== undefined ? { when: arm.when } : {}),
@@ -437,23 +290,12 @@ function walkAndRewrite(args: WalkArgs): void {
         });
       }
 
-      const finalizedDef: MatchDef =
-        def.mode === "discriminator"
-          ? {
-              kind: "match",
-              mode: "discriminator",
-              needs: rewrittenNeeds,
-              on: def.on,
-              arms: Object.fromEntries(finalizedArms.map((a) => [a.id, a])),
-              ...(parentMatch ? { parentMatch } : {}),
-            }
-          : {
-              kind: "match",
-              mode: "guard",
-              needs: rewrittenNeeds,
-              arms: finalizedArms,
-              ...(parentMatch ? { parentMatch } : {}),
-            };
+      const finalizedDef: MatchDef = {
+        kind: "match",
+        needs: rewrittenNeeds,
+        arms: finalizedArms,
+        ...(parentMatch ? { parentMatch } : {}),
+      };
 
       out[id] = attachDef({ kind: "match", id }, finalizedDef);
       continue;

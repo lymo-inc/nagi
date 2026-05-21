@@ -331,11 +331,16 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
       build: (b) =>
         ({
           m: b.match({
-            on: ({ input }) => input.kind,
-            cases: {
-              a: (b1) => ({ x: b1.task({ run: async () => null }) }),
-              b: (b1) => ({ y: b1.task({ run: async () => null }) }),
-            },
+            arms: [
+              {
+                when: ({ input }) => input.kind === "a",
+                build: (b1) => ({ x: b1.task({ run: async () => null }) }),
+              },
+              {
+                otherwise: true,
+                build: (b1) => ({ y: b1.task({ run: async () => null }) }),
+              },
+            ],
           }),
         }) as never,
     });
@@ -345,14 +350,19 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
       build: (b) =>
         ({
           m: b.match({
-            on: ({ input }) => input.kind,
-            cases: {
-              a: (b1) => ({
-                x: b1.task({ run: async () => null }),
-                z: b1.task({ run: async () => null }),
-              }),
-              b: (b1) => ({ y: b1.task({ run: async () => null }) }),
-            },
+            arms: [
+              {
+                when: ({ input }) => input.kind === "a",
+                build: (b1) => ({
+                  x: b1.task({ run: async () => null }),
+                  z: b1.task({ run: async () => null }),
+                }),
+              },
+              {
+                otherwise: true,
+                build: (b1) => ({ y: b1.task({ run: async () => null }) }),
+              },
+            ],
           }),
         }) as never,
     });

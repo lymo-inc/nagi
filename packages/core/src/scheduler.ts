@@ -1,21 +1,31 @@
 import {
   getDef,
-  matchArms,
   needsStepIds,
   readSelectedArm,
   resolveNeeds,
   type StepDef,
 } from "./internal";
-import type { Flow, Json, RunState, StepId, StepState } from "./types";
+import type {
+  AttemptNumber,
+  Fact,
+  Flow,
+  Json,
+  RunState,
+  SerializedError,
+  StepId,
+  StepState,
+} from "./types";
 
 export type SkipReason = "when-false" | "transitive";
 
+export interface SkipDecision {
+  readonly stepId: string;
+  readonly reason: SkipReason;
+}
+
 export interface ScheduleDecision {
   readonly runnable: readonly string[];
-  readonly skip: ReadonlyArray<{
-    readonly stepId: string;
-    readonly reason: SkipReason;
-  }>;
+  readonly skip: readonly SkipDecision[];
 }
 
 export interface ScheduleArgs {
@@ -72,14 +82,6 @@ type UpstreamStatus = "ready" | "blocked" | "transitive-skip";
 
 function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
   for (const upstream of Object.values(def.needs)) {
-    if (
-      !upstream ||
-      typeof upstream !== "object" ||
-      !("id" in upstream) ||
-      typeof upstream.id !== "string"
-    ) {
-      continue;
-    }
     const upstreamState = runState.steps[upstream.id];
     if (upstreamState === undefined) return "blocked";
     if (upstreamState.status === "completed") continue;
@@ -145,10 +147,7 @@ export function aggregateMatch(
   const selected = readSelectedArm(matchId, runState);
   if (selected === null) return { kind: "pending" };
 
-  const arm =
-    def.mode === "discriminator"
-      ? def.arms[selected]
-      : def.arms.find((a) => a.id === selected);
+  const arm = def.arms.find((a) => a.id === selected);
   if (!arm) return { kind: "pending" };
 
   const output: Record<string, Json> = {};
@@ -205,6 +204,118 @@ export function flowTermination(
   return { done, failed };
 }
 
+export interface MatchPromotion {
+  readonly matchId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly result:
+    | { readonly kind: "complete"; readonly output: Json }
+    | { readonly kind: "fail"; readonly error: SerializedError };
+}
+
+/**
+ * One tick of the engine state machine. `nextTransition` returns the single
+ * highest-priority action for the current run state; `advance` performs the
+ * side effects and loops to re-derive. See docs/rfcs/0011.
+ */
+export type Transition =
+  | {
+      readonly kind: "promote-match";
+      readonly promotions: readonly MatchPromotion[];
+    }
+  | { readonly kind: "complete"; readonly output: Json }
+  | { readonly kind: "fail"; readonly error: SerializedError }
+  | {
+      readonly kind: "dispatch";
+      readonly runnable: readonly StepId[];
+      readonly skip: readonly SkipDecision[];
+    }
+  | { readonly kind: "skip"; readonly skip: readonly SkipDecision[] }
+  | { readonly kind: "settled" }
+  | { readonly kind: "waiting" };
+
+export function nextTransition(flow: Flow, runState: RunState): Transition {
+  const promotions = readyPromotions(flow, runState);
+  if (promotions.length > 0) return { kind: "promote-match", promotions };
+
+  const term = flowTermination(flow, runState);
+  if (term.done) {
+    if (isFlowTerminal(runState.facts)) return { kind: "settled" };
+    if (term.failed) return { kind: "fail", error: flowFailureError(runState) };
+    return { kind: "complete", output: computeFlowOutput(flow, runState) };
+  }
+
+  const input = extractInput(runState);
+  const { runnable, skip } = nextRunnable({ flow, runState, input });
+  if (runnable.length > 0) return { kind: "dispatch", runnable, skip };
+  if (skip.length > 0) return { kind: "skip", skip };
+  return { kind: "waiting" };
+}
+
+function readyPromotions(flow: Flow, runState: RunState): MatchPromotion[] {
+  const out: MatchPromotion[] = [];
+  for (const [matchId, step] of Object.entries(flow.steps)) {
+    const def = getDef(step);
+    if (def.kind !== "match") continue;
+    const state = runState.steps[matchId];
+    if (state?.status !== "running") continue;
+
+    const agg = aggregateMatch(matchId, flow, runState);
+    if (agg.kind === "pending") continue;
+
+    const attempt: AttemptNumber = state.attempts > 0 ? state.attempts : 1;
+    if (agg.kind === "fail-fast") {
+      const failedNested = runState.steps[agg.failedStepId];
+      const error: SerializedError = failedNested?.error ?? {
+        name: "Error",
+        message: `match "${matchId}": chosen-arm step "${agg.failedStepId}" failed`,
+      };
+      out.push({
+        matchId: matchId as StepId,
+        attempt,
+        result: { kind: "fail", error },
+      });
+    } else {
+      out.push({
+        matchId: matchId as StepId,
+        attempt,
+        result: { kind: "complete", output: agg.output },
+      });
+    }
+  }
+  return out;
+}
+
+function flowFailureError(runState: RunState): SerializedError {
+  const failedStep = Object.values(runState.steps).find(
+    (s) => s.status === "failed",
+  );
+  return failedStep?.error ?? { name: "Error", message: "step failed" };
+}
+
+export function isFlowTerminal(facts: readonly Fact[]): boolean {
+  for (let i = facts.length - 1; i >= 0; i--) {
+    const f = facts[i];
+    if (
+      f !== undefined &&
+      (f.kind === "flow.completed" ||
+        f.kind === "flow.failed" ||
+        f.kind === "flow.canceled")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function computeFlowOutput(flow: Flow, runState: RunState): Json {
+  if (flow.output === undefined) return null;
+  const stepOutputs: Record<string, Json> = {};
+  for (const [sid, sstate] of Object.entries(runState.steps)) {
+    if (sstate.output !== undefined) stepOutputs[sid] = sstate.output;
+  }
+  return flow.output(stepOutputs as never) as Json;
+}
+
 export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {
   const children = new Map<StepId, StepId[]>();
   const addEdge = (from: StepId, to: StepId) => {
@@ -218,7 +329,7 @@ export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {
     const def = getDef(step);
     for (const upstreamId of needsStepIds(def)) addEdge(upstreamId, id);
     if (def.kind === "match") {
-      for (const arm of matchArms(def)) {
+      for (const arm of def.arms) {
         for (const armStepId of arm.stepIds) addEdge(id, armStepId);
       }
     }

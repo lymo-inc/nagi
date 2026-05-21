@@ -2,7 +2,6 @@ import {
   getDef,
   type MatchArmDef,
   type MatchDef,
-  matchArms,
   needsStepIds,
   type SignalDef,
   type StepDef,
@@ -48,8 +47,6 @@ export interface CanonicalStep {
   readonly timeoutMs?: Millis;
   readonly signalSchema?: CanonicalSchema;
   readonly signalNames?: readonly string[];
-  readonly matchMode?: "discriminator" | "guard";
-  readonly matchOnHash?: string;
   readonly matchArms?: readonly CanonicalMatchArm[];
   readonly childFlowId?: string;
   readonly subflowInputHash?: string;
@@ -149,12 +146,8 @@ async function canonicalizeMatch(
   def: MatchDef,
 ): Promise<CanonicalStep> {
   const out: Mutable<CanonicalStep> = { ...base };
-  out.matchMode = def.mode;
-  if (def.mode === "discriminator") {
-    out.matchOnHash = await hashFnSource(def.on);
-  }
   const arms: CanonicalMatchArm[] = [];
-  for (const arm of matchArms(def)) {
+  for (const arm of def.arms) {
     arms.push(await canonicalizeArm(arm));
   }
   out.matchArms = arms;

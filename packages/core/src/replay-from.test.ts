@@ -142,28 +142,33 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
       build: (b) =>
         ({
           m: b.match({
-            on: () => {
-              pickerCalls += 1;
-              return picks[pickerCalls - 1] ?? "a";
-            },
-            cases: {
-              a: (b1) => ({
-                x: b1.task({
-                  run: async () => {
-                    armCalls += 1;
-                    return { arm: "a" };
-                  },
+            arms: [
+              {
+                when: () => {
+                  pickerCalls += 1;
+                  return (picks[pickerCalls - 1] ?? "a") === "a";
+                },
+                build: (b1) => ({
+                  x: b1.task({
+                    run: async () => {
+                      armCalls += 1;
+                      return { arm: "a" };
+                    },
+                  }),
                 }),
-              }),
-              b: (b1) => ({
-                x: b1.task({
-                  run: async () => {
-                    armCalls += 1;
-                    return { arm: "b" };
-                  },
+              },
+              {
+                otherwise: true,
+                build: (b1) => ({
+                  x: b1.task({
+                    run: async () => {
+                      armCalls += 1;
+                      return { arm: "b" };
+                    },
+                  }),
                 }),
-              }),
-            },
+              },
+            ],
           }),
         }) as never,
     });

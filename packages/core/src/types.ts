@@ -145,35 +145,19 @@ export interface SignalConfig<
   readonly names?: readonly [string, ...string[]];
 }
 
-export interface MatchDiscriminatorConfig<
-  Input,
-  N extends NeedsMap,
-  D extends string,
-  M extends Record<D, StepMap>,
-> {
-  readonly needs?: N;
-  readonly on: (args: {
-    readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<NeedsOutputs<N>>;
-  }) => D;
-  readonly cases: {
-    readonly [K in D]: (b: Builder<Input>) => BuildResult<Input, M[K]>;
-  };
-}
-
 export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {
   readonly when: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<NeedsOutputs<N>>;
   }) => boolean;
   readonly otherwise?: never;
-  readonly build: (b: Builder<Input>) => BuildResult<Input, M>;
+  readonly build: (b: Builder<Input>) => M;
 }
 
 export interface MatchArmOtherwise<Input, M extends StepMap> {
   readonly otherwise: true;
   readonly when?: never;
-  readonly build: (b: Builder<Input>) => BuildResult<Input, M>;
+  readonly build: (b: Builder<Input>) => M;
 }
 
 export type MatchArm<Input, N extends NeedsMap, M extends StepMap> =
@@ -187,12 +171,12 @@ export type MatchArmShape<Input, N extends NeedsMap> =
         readonly needs: NoInfer<NeedsOutputs<N>>;
       }) => boolean;
       readonly otherwise?: never;
-      readonly build: (b: Builder<Input>) => BuildResult<Input, StepMap>;
+      readonly build: (b: Builder<Input>) => StepMap;
     }
   | {
       readonly otherwise: true;
       readonly when?: never;
-      readonly build: (b: Builder<Input>) => BuildResult<Input, StepMap>;
+      readonly build: (b: Builder<Input>) => StepMap;
     };
 
 export interface MatchGuardConfig<
@@ -221,44 +205,7 @@ export interface SubflowStepOutput<ChildOutput> {
   readonly output: ChildOutput;
 }
 
-export type MatchDiscriminatorOutput<
-  D extends string,
-  M extends Record<D, StepMap>,
-> = {
-  [K in D]: MatchArmOutput<M[K]>;
-}[D];
-
-export interface StepEntryConfig<
-  Input,
-  A extends Record<string, unknown>,
-  Needs extends ReadonlyArray<keyof A & string>,
-  Output,
-> {
-  readonly needs?: Needs;
-  readonly retry?: RetryPolicy;
-  readonly timeoutMs?: Millis;
-  readonly when?: (args: {
-    readonly input: NoInfer<Input>;
-    readonly needs: { readonly [P in Needs[number]]: A[P] };
-  }) => boolean;
-  readonly run: (args: {
-    readonly input: NoInfer<Input>;
-    readonly needs: { readonly [P in Needs[number]]: A[P] };
-    readonly ctx: StepCtx<NoInfer<Input>>;
-  }) => Promise<Output>;
-
-  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
-  readonly onComplete?: (
-    event: StepCompleteEvent & { readonly output: NoInfer<Output> },
-  ) => void | Promise<void>;
-  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
-  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
-}
-
-export interface Builder<
-  Input = unknown,
-  A extends Record<string, unknown> = Record<never, never>,
-> {
+export interface Builder<Input = unknown> {
   task<N extends NeedsMap, Output>(
     config: TaskConfig<Input, N, Output>,
   ): Step<Output>;
@@ -274,67 +221,12 @@ export interface Builder<
 
   match<
     N extends NeedsMap,
-    D extends string,
-    Cases extends {
-      readonly [K in D]: (b: Builder<Input>) => BuildResult<Input, StepMap>;
-    },
-  >(config: {
-    readonly needs?: N;
-    readonly on: (args: {
-      readonly input: NoInfer<Input>;
-      readonly needs: NoInfer<NeedsOutputs<N>>;
-    }) => D;
-    readonly cases: Cases;
-  }): Step<
-    {
-      readonly [K in keyof Cases]: MatchArmOutput<
-        AsStepMap<ReturnType<Cases[K]>>
-      >;
-    }[keyof Cases]
-  >;
-
-  match<
-    N extends NeedsMap,
     Arms extends ReadonlyArray<MatchArmShape<Input, N>>,
   >(config: {
     readonly needs?: N;
     readonly arms: Arms;
-  }): Step<MatchArmOutput<AsStepMap<ReturnType<Arms[number]["build"]>>>>;
-
-  step<
-    const Key extends string,
-    const Needs extends ReadonlyArray<keyof A & string>,
-    Output,
-  >(
-    key: Exclude<Key, keyof A>,
-    config: StepEntryConfig<Input, A, Needs, Output>,
-  ): Builder<Input, A & { readonly [K in Key]: Output }>;
-
-  include<const Key extends string, S extends Step<unknown>>(
-    key: Exclude<Key, keyof A>,
-    step: S,
-  ): Builder<
-    Input,
-    A & {
-      readonly [K in Key]: S extends Step<infer O> ? O : never;
-    }
-  >;
+  }): Step<MatchArmOutput<ReturnType<Arms[number]["build"]>>>;
 }
-
-export type BuildResult<Input, M extends StepMap> =
-  | M
-  | Builder<Input, BuilderAccumulator<M>>;
-
-export type BuilderAccumulator<M extends StepMap> = {
-  readonly [K in keyof M]: M[K] extends Step<infer O> ? O : never;
-};
-
-export type AsStepMap<R> =
-  R extends Builder<unknown, infer A>
-    ? { readonly [K in keyof A]: Step<A[K]> }
-    : R extends StepMap
-      ? R
-      : never;
 
 export type ConcurrencyMode = "cancel-in-progress";
 
@@ -346,13 +238,13 @@ export interface FlowConcurrency<Input = Json> {
 export interface FlowConfig<
   Id extends string,
   InputSchema extends StandardSchemaV1,
-  R,
+  R extends StepMap,
   Output = unknown,
 > {
   readonly id: Id;
   readonly input: InputSchema;
   readonly build: (b: Builder<InferSchemaOutput<InputSchema>>) => R;
-  output?(steps: NeedsOutputs<AsStepMap<R>>): Output;
+  output?(steps: NeedsOutputs<R>): Output;
 
   readonly concurrency?: FlowConcurrency<InferSchemaOutput<InputSchema>>;
 
@@ -396,6 +288,16 @@ export interface FlowEvent {
 
 export interface FlowStartEvent extends FlowEvent {
   readonly input: Json;
+  /**
+   * Set when this run was started as a subflow child. Undefined for
+   * top-level runs (start / startById). Carried in-process only — for
+   * durable linkage see FlowStartedFact.parentRunId / parentStepId.
+   */
+  readonly parent?: {
+    readonly runId: RunId;
+    readonly stepId: StepId;
+    readonly attempt: AttemptNumber;
+  };
 }
 
 export interface FlowCompleteEvent extends FlowEvent {
@@ -503,7 +405,7 @@ export interface Store {
     readonly started: boolean;
     readonly canceled: ReadonlyArray<{
       readonly runId: RunId;
-      readonly fact: FlowCanceledFact;
+      readonly fact: FlowCanceledByConcurrencyFact;
     }>;
   }>;
 
@@ -716,14 +618,32 @@ export interface FlowFailedFact extends FactBase {
   readonly error: SerializedError;
 }
 
-export interface FlowCanceledFact extends FactBase {
+export interface FlowCanceledByConcurrencyFact extends FactBase {
   readonly kind: "flow.canceled";
-  readonly cause?: "concurrency" | "explicit" | "operator";
+  readonly cause: "concurrency";
   readonly canceledByRunId: RunId;
   readonly concurrencyKey: string;
-  readonly actor?: string;
+}
+
+export interface FlowCanceledExplicitlyFact extends FactBase {
+  readonly kind: "flow.canceled";
+  readonly cause: "explicit";
+  readonly reason: string;
   readonly note?: string;
 }
+
+export interface FlowCanceledByOperatorFact extends FactBase {
+  readonly kind: "flow.canceled";
+  readonly cause: "operator";
+  readonly actor: string;
+  readonly reason: string;
+  readonly note?: string;
+}
+
+export type FlowCanceledFact =
+  | FlowCanceledByConcurrencyFact
+  | FlowCanceledExplicitlyFact
+  | FlowCanceledByOperatorFact;
 
 export interface StepStartedFact extends FactBase {
   readonly kind: "step.started";
