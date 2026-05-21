@@ -1,6 +1,6 @@
 {
   "name": "@nagi-js/otel",
-  "version": "0.1.1-rc.7",
+  "version": "0.1.1-rc.8",
   "description": "OpenTelemetry hooks adapter for nagi.",
   "license": "MIT",
   "type": "module",

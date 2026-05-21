@@ -1,6 +1,6 @@
 ---
-"@nagi-js/core": minor
-"@nagi-js/postgres": minor
+"@nagi-js/core": patch
+"@nagi-js/postgres": patch
 ---
 
 Simplify the core public surface — three breaking changes that collapse parallel APIs into a single canonical shape. Net: −250 production LOC, −3.5 KB bundle, −2.7 KB d.ts.

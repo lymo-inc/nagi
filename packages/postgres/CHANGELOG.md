@@ -1,5 +1,116 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.8
+
+### Patch Changes
+
+- b79ede2: `wf.operator()` — programmatic skip/retry/abort for oncall. The three
+  primitives an operator needs when a run is stuck no longer require
+  direct-editing `nagi.fact` / `nagi.step_run`:
+
+  - `operator.skip(runId, stepId, { actor, note?, cascade? })` — appends
+    `step.skipped` with `reason: "manual"`. `cascade: "skip"` (default)
+    keeps the locked transitive semantic. `cascade: "continue"` lets
+    downstream steps run with `needs.x === null` for the skipped need —
+    the handler is responsible for tolerating null; the type contract on
+    `needs.x` is unchanged.
+
+  - `operator.retry(runId, stepId, { actor, note? })` — re-runs `stepId`
+    and its descendants. For terminal steps, mirrors
+    `wf.replay({ from })` with `actor` / `note` stamped onto the named
+    `step.reset`. For a `running` step, appends
+    `step.abort-requested`; the dispatcher's cancel watcher fires
+    `ctx.signal.abort()` cross-process; the in-flight attempt
+    reclassifies as `step.canceled`; then the reset cascade lands and
+    re-dispatches.
+
+  - `operator.abort(runId, { actor, note? })` — cancels the run with
+    `cause: "operator"`, structured `actor` / `note`. Cascades to subflow
+    children. In-flight handlers see `ctx.signal.abort()` via the watcher.
+
+  Active cancel watcher landed alongside: `executeTask` now polls
+  `store.loadRunState` at `DispatchDeps.cancelPollIntervalMs` (default
+  250 ms) and aborts `ctx.signal` when the run reaches terminal status OR
+  a matching `step.abort-requested` fact appears. Handlers that pass
+  `ctx.signal` to `fetch` / `anthropic.messages.create({ signal })` now
+  interrupt mid-call, not just at the boundary.
+
+  Fact-log changes (additive, no migration):
+
+  - `StepSkippedFact.reason` widens to `"when-false" | "transitive" | "manual"`,
+    with optional `actor` / `note` / `cascade` populated on manual skips.
+  - `FlowCanceledFact` gains optional `cause: "concurrency" | "explicit" | "operator"`
+    and optional `actor` / `note`. `wf.cancel()` records `cause: "explicit"`,
+    keeping back-compat via the existing `concurrencyKey`-as-reason carrier.
+  - `StepResetFact` gains optional `actor` / `note` (populated by
+    `operator.retry`; `wf.replay({ from })` leaves them undefined).
+  - New `step.abort-requested` fact kind for the operator-issued
+    per-step abort signal. Audit-only; the cancel watcher reads it and
+    reclassifies the in-flight attempt.
+
+  `@nagi-js/postgres`: zero migration. All new fields ride through the
+  existing `payload jsonb` column; `fact.kind` has no CHECK constraint.
+
+- f926424: Simplify the core public surface — three breaking changes that collapse parallel APIs into a single canonical shape. Net: −250 production LOC, −3.5 KB bundle, −2.7 KB d.ts.
+
+  **`FlowCanceledFact` is now a discriminated union by `cause`.** The previous shape had an optional `cause` plus an always-required `concurrencyKey` that was abused to carry the `reason` string on explicit cancels. The new shape is three concrete arms:
+
+  - `{ cause: "concurrency", canceledByRunId, concurrencyKey }`
+  - `{ cause: "explicit", reason, note? }`
+  - `{ cause: "operator", actor, reason, note? }`
+
+  `Store.tryStartRun`'s returned `canceled[].fact` is now typed `FlowCanceledByConcurrencyFact` — adapters writing concurrency cancel facts must set `cause: "concurrency"` explicitly. Adapter persistence that previously stored `canceledByRunId` unconditionally should null it out on non-concurrency arms (see the postgres adapter for an example).
+
+  **`b.step` chain API and `b.include` are removed.** The single canonical way to declare a step is `b.task({ needs: { key: stepRef }, ... })`. Migration:
+
+  ```ts
+  // Before
+  build: (b) =>
+    b
+      .step("a", { run: async () => ({ v: 1 }) })
+      .step("b", { needs: ["a"], run: async ({ needs }) => needs.a.v + 1 });
+
+  // After
+  build: (b) => {
+    const a = b.task({ run: async () => ({ v: 1 }) });
+    const c = b.task({ needs: { a }, run: ({ needs }) => needs.a.v + 1 });
+    return { a, c };
+  };
+  ```
+
+  `StepEntryConfig`, `BuildResult`, `BuilderAccumulator`, `AsStepMap`, and the `Builder<Input, A>` second generic parameter are removed. `FlowConfig.build` is now typed `(b: Builder<Input>) => R extends StepMap`.
+
+  **`b.match({ on, cases })` discriminator form is removed.** Only `b.match({ arms: [...] })` remains. Migration:
+
+  ```ts
+  // Before
+  b.match({
+    on: ({ input }) => input.kind,
+    cases: {
+      a: (b1) => ({ x: b1.task({ run: ... }) }),
+      b: (b1) => ({ y: b1.task({ run: ... }) }),
+    },
+  })
+
+  // After
+  b.match({
+    arms: [
+      { when: ({ input }) => input.kind === "a", build: (b1) => ({ x: b1.task({ run: ... }) }) },
+      { when: ({ input }) => input.kind === "b", build: (b1) => ({ y: b1.task({ run: ... }) }) },
+      // ...or use { otherwise: true } for the fallback arm
+    ],
+  })
+  ```
+
+  `MatchDiscriminatorConfig` and `MatchDiscriminatorOutput` types are removed. The internal `MatchDef` no longer carries a `mode` field; `matchArms()` helper is dropped (just read `def.arms` directly). Match arms identified by case-key (e.g. `m.a.x`) are now positionally identified (`m.arm0.x`, `m.otherwise.y`); flow snapshots will rehash. The `CanonicalStep.matchMode` and `matchOnHash` fields are removed (no longer meaningful with single-arm semantics).
+
+- Updated dependencies [f926424]
+- Updated dependencies [b79ede2]
+- Updated dependencies [f926424]
+- Updated dependencies [f926424]
+- Updated dependencies [f926424]
+  - @nagi-js/core@0.1.1-rc.8
+
 ## 0.1.1-rc.7
 
 ### Patch Changes

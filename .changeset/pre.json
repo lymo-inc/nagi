@@ -15,9 +15,14 @@
     "hip-peaches-win",
     "itchy-peas-see",
     "multi-name-signal-waits",
+    "next-transition-internal-cleanup",
+    "operator-interface",
+    "otel-subflow-span-linkage",
     "prune-facts",
     "realign-core-0-1-x",
+    "simplify-core-surface",
     "step-scoped-replay-from",
-    "subflow-runtime"
+    "subflow-runtime",
+    "wf-start-by-id"
   ]
 }

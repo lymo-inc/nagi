@@ -1,5 +1,164 @@
 # @nagi-js/core
 
+## 0.1.1-rc.8
+
+### Patch Changes
+
+- f926424: Internal engine cleanup — no public API change, behavior preserved.
+
+  - **Extract `nextTransition(flow, runState)` from the `advance` loop** (RFC 0011). The engine's per-tick decision is now a pure, exhaustively-typed `Transition` union (`promote-match | complete | fail | dispatch | skip | settled | waiting`) in `scheduler.ts`, and `advance` is a thin executor switch in `dispatch.ts`. Double-finalize is now structurally prevented (`complete`/`fail` are only emitted when the flow is done and not already terminal). Adds 9 direct `nextTransition` unit tests.
+  - **Consolidate match/subflow step finalization** into shared `markStepComplete` / `markStepFail` helpers (was duplicated across match promotion and subflow wake).
+  - **Reuse `serializeError()` in runtime** instead of hand-building `SerializedError`; dedupe a repeated cancel-error literal.
+  - **`instanceof NagiAbortError`** for our own abort (keeps the foreign-`AbortError` name check for handler-thrown DOMExceptions).
+  - **Drop dead defensive guards** on `def.needs` (the type already guarantees `Step` refs).
+  - **Split pre-walk vs finalized match arms**: the `_nested` ghost field is gone from `MatchArmDef`; pre-walk concerns live on new builder-only `PendingMatchArm` / `PendingMatchDef`.
+  - **`DispatchDeps.lookupFlow` / `.startChildRun` are now required** (always wired by the runtime), removing a runtime "missing dep" guard from subflow dispatch.
+
+- b79ede2: `wf.operator()` — programmatic skip/retry/abort for oncall. The three
+  primitives an operator needs when a run is stuck no longer require
+  direct-editing `nagi.fact` / `nagi.step_run`:
+
+  - `operator.skip(runId, stepId, { actor, note?, cascade? })` — appends
+    `step.skipped` with `reason: "manual"`. `cascade: "skip"` (default)
+    keeps the locked transitive semantic. `cascade: "continue"` lets
+    downstream steps run with `needs.x === null` for the skipped need —
+    the handler is responsible for tolerating null; the type contract on
+    `needs.x` is unchanged.
+
+  - `operator.retry(runId, stepId, { actor, note? })` — re-runs `stepId`
+    and its descendants. For terminal steps, mirrors
+    `wf.replay({ from })` with `actor` / `note` stamped onto the named
+    `step.reset`. For a `running` step, appends
+    `step.abort-requested`; the dispatcher's cancel watcher fires
+    `ctx.signal.abort()` cross-process; the in-flight attempt
+    reclassifies as `step.canceled`; then the reset cascade lands and
+    re-dispatches.
+
+  - `operator.abort(runId, { actor, note? })` — cancels the run with
+    `cause: "operator"`, structured `actor` / `note`. Cascades to subflow
+    children. In-flight handlers see `ctx.signal.abort()` via the watcher.
+
+  Active cancel watcher landed alongside: `executeTask` now polls
+  `store.loadRunState` at `DispatchDeps.cancelPollIntervalMs` (default
+  250 ms) and aborts `ctx.signal` when the run reaches terminal status OR
+  a matching `step.abort-requested` fact appears. Handlers that pass
+  `ctx.signal` to `fetch` / `anthropic.messages.create({ signal })` now
+  interrupt mid-call, not just at the boundary.
+
+  Fact-log changes (additive, no migration):
+
+  - `StepSkippedFact.reason` widens to `"when-false" | "transitive" | "manual"`,
+    with optional `actor` / `note` / `cascade` populated on manual skips.
+  - `FlowCanceledFact` gains optional `cause: "concurrency" | "explicit" | "operator"`
+    and optional `actor` / `note`. `wf.cancel()` records `cause: "explicit"`,
+    keeping back-compat via the existing `concurrencyKey`-as-reason carrier.
+  - `StepResetFact` gains optional `actor` / `note` (populated by
+    `operator.retry`; `wf.replay({ from })` leaves them undefined).
+  - New `step.abort-requested` fact kind for the operator-issued
+    per-step abort signal. Audit-only; the cancel watcher reads it and
+    reclassifies the in-flight attempt.
+
+  `@nagi-js/postgres`: zero migration. All new fields ride through the
+  existing `payload jsonb` column; `fact.kind` has no CHECK constraint.
+
+- f926424: `@nagi-js/otel` now nests a subflow child flow's root span under its
+  parent's subflow-step span, producing a single contiguous trace tree from
+  the top-level run down through arbitrary subflow depth. Previously each
+  child run rooted its own trace, leaving operators to correlate parent and
+  child via `nagi.run.id` / `nagi.parent.run.id` attributes by hand.
+
+  `FlowStartEvent` gains an optional `parent: { runId, stepId, attempt }`
+  struct (single optional, not three — by construction either all three
+  parent fields are set or none are). `nagi()` populates it on every
+  subflow-spawned run; top-level runs leave it `undefined`. The struct is
+  in-process only; durable parent linkage continues to live on
+  `FlowStartedFact.parentRunId / parentStepId` unchanged.
+
+  `otelHooks.onFlowStart` resolves the child flow span's parent context via
+  a three-step fallback: parent step span in registry → local parent flow
+  context (`flowCtxs`) → OTel `context.active()`. Never throws. Records
+  `nagi.parent.run.id`, `nagi.parent.step.id`, `nagi.parent.step.attempt`
+  as attributes on the child flow span when `event.parent` is set so
+  cross-process linkage remains queryable even when the in-process anchor
+  is missing (process restart, replay).
+
+  Top-level run traces are byte-equivalent to prior behavior. See
+  `docs/rfcs/0010-otel-subflow-span-linkage.md`.
+
+- f926424: Simplify the core public surface — three breaking changes that collapse parallel APIs into a single canonical shape. Net: −250 production LOC, −3.5 KB bundle, −2.7 KB d.ts.
+
+  **`FlowCanceledFact` is now a discriminated union by `cause`.** The previous shape had an optional `cause` plus an always-required `concurrencyKey` that was abused to carry the `reason` string on explicit cancels. The new shape is three concrete arms:
+
+  - `{ cause: "concurrency", canceledByRunId, concurrencyKey }`
+  - `{ cause: "explicit", reason, note? }`
+  - `{ cause: "operator", actor, reason, note? }`
+
+  `Store.tryStartRun`'s returned `canceled[].fact` is now typed `FlowCanceledByConcurrencyFact` — adapters writing concurrency cancel facts must set `cause: "concurrency"` explicitly. Adapter persistence that previously stored `canceledByRunId` unconditionally should null it out on non-concurrency arms (see the postgres adapter for an example).
+
+  **`b.step` chain API and `b.include` are removed.** The single canonical way to declare a step is `b.task({ needs: { key: stepRef }, ... })`. Migration:
+
+  ```ts
+  // Before
+  build: (b) =>
+    b
+      .step("a", { run: async () => ({ v: 1 }) })
+      .step("b", { needs: ["a"], run: async ({ needs }) => needs.a.v + 1 });
+
+  // After
+  build: (b) => {
+    const a = b.task({ run: async () => ({ v: 1 }) });
+    const c = b.task({ needs: { a }, run: ({ needs }) => needs.a.v + 1 });
+    return { a, c };
+  };
+  ```
+
+  `StepEntryConfig`, `BuildResult`, `BuilderAccumulator`, `AsStepMap`, and the `Builder<Input, A>` second generic parameter are removed. `FlowConfig.build` is now typed `(b: Builder<Input>) => R extends StepMap`.
+
+  **`b.match({ on, cases })` discriminator form is removed.** Only `b.match({ arms: [...] })` remains. Migration:
+
+  ```ts
+  // Before
+  b.match({
+    on: ({ input }) => input.kind,
+    cases: {
+      a: (b1) => ({ x: b1.task({ run: ... }) }),
+      b: (b1) => ({ y: b1.task({ run: ... }) }),
+    },
+  })
+
+  // After
+  b.match({
+    arms: [
+      { when: ({ input }) => input.kind === "a", build: (b1) => ({ x: b1.task({ run: ... }) }) },
+      { when: ({ input }) => input.kind === "b", build: (b1) => ({ y: b1.task({ run: ... }) }) },
+      // ...or use { otherwise: true } for the fallback arm
+    ],
+  })
+  ```
+
+  `MatchDiscriminatorConfig` and `MatchDiscriminatorOutput` types are removed. The internal `MatchDef` no longer carries a `mode` field; `matchArms()` helper is dropped (just read `def.arms` directly). Match arms identified by case-key (e.g. `m.a.x`) are now positionally identified (`m.arm0.x`, `m.otherwise.y`); flow snapshots will rehash. The `CanonicalStep.matchMode` and `matchOnHash` fields are removed (no longer meaningful with single-arm semantics).
+
+- f926424: `wf.startById(flowId, input, opts?)` — registry-aware dispatch for callers
+  that hold a runtime-typed input rather than the original `Flow` object.
+  Intended for transactional-outbox reconcilers, queue consumers replaying a
+  DLQ, and admin CLIs that replay a `runId` from disk. Validates `input`
+  against the registered flow's schema before the run is created, mirroring
+  `start`'s runtime contract without requiring a compile-time-typed input.
+
+  Throws `NagiRuntimeError` when `flowId` is not registered with `nagi()`,
+  and `NagiValidationError` when the input fails the flow's schema or when
+  `opts.runId` is invalid.
+
+  Motivation: callers with a serialized payload (`pending_workflow_run`-style
+  outbox rows, pgmq DLQ entries) were forced to launder both arguments
+  through `as any` because `start<F extends Flow>(flow: F, input: FlowInput<F>)`
+  demands a statically-known input type — even though the runtime already
+  re-validates against `flow.input` unconditionally. `startById` exposes the
+  runtime contract directly.
+
+  `start(flow, input, opts)` now delegates to `startById(flow.id, input, opts)`
+  internally; behavior is observably unchanged.
+
 ## 0.1.1-rc.7
 
 ### Patch Changes

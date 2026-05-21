@@ -1,6 +1,6 @@
 {
   "name": "@nagi-js/core",
-  "version": "0.1.1-rc.7",
+  "version": "0.1.1-rc.8",
   "description": "Type-safe declarative workflow engine. Edge-compliant. Zero runtime deps.",
   "license": "MIT",
   "type": "module",
