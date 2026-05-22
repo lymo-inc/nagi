@@ -1,4 +1,4 @@
-import { type DispatchDeps, dispatchMessage } from "../dispatch";
+import { type DispatchDeps, makeDispatcher } from "../dispatch";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { type NagiConfig, nagi, type Wf } from "../runtime";
 import { errorOf, isTerminalRun, runStatusOf, stepStatusOf } from "../state";
@@ -94,11 +94,6 @@ export interface HarnessOpts {
   readonly hooks?: FlowHooks;
 }
 
-/**
- * Capture helper for the RFC 0020 `onLog` sink: returns an `onLog` callback and
- * the array it appends every {@link LogEntry} into, for assertions on
- * `{ level, msg, attrs }`.
- */
 export function spyOnLog(): {
   onLog: NonNullable<NagiConfig["onLog"]>;
   entries: LogEntry[];
@@ -159,11 +154,12 @@ export async function makeHarness(
 
   const deps = (wf as unknown as { __dispatchDeps: DispatchDeps })
     .__dispatchDeps;
+  const dispatcher = makeDispatcher(deps);
 
   async function drainOnce(count = 32): Promise<number> {
     const messages = await queue.dequeue({ count });
     for (const msg of messages) {
-      await dispatchMessage(deps, msg);
+      await dispatcher.dispatchMessage(msg);
     }
     return messages.length;
   }
@@ -211,8 +207,6 @@ export async function makeHarness(
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
         const state = await store.loadRunState(runId);
-        // Check via projected status so post-cancellation step facts (which
-        // may interleave after `flow.canceled`) don't trip the check.
         if (isTerminalRun(state)) {
           return makeResult(state);
         }

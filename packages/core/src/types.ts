@@ -58,7 +58,6 @@ export type InferSchemaInput<S> =
 export type InferSchemaOutput<S> =
   S extends StandardSchemaV1<unknown, infer O> ? O : never;
 
-// Declaration-merging augmentation slot: users declare `interface Register { tx: ... }`.
 // biome-ignore lint/suspicious/noEmptyInterface: intentional augmentation slot
 export interface Register {}
 
@@ -80,11 +79,6 @@ export type NeedsOutputs<N extends NeedsMap> = {
   readonly [K in keyof N]: StepOutput<N[K]>;
 };
 
-/**
- * Handler-facing view of `needs`: each upstream is a {@link Resolved} value, so
- * a `cascade: "continue"` skip (`{ tag: "skipped" }`) is distinct from an
- * upstream that genuinely produced `null` (`{ tag: "value", value: null }`).
- */
 export type ResolvedNeeds<N extends NeedsMap> = {
   readonly [K in keyof N]: Resolved<StepOutput<N[K]>>;
 };
@@ -119,15 +113,6 @@ export interface StepCtx<Input = unknown> {
   idempotencyKey(scope: string): string;
 }
 
-/**
- * The element delivered by {@link Store.subscribeStream} / `wf.subscribe`: a
- * discriminated control+data envelope. A real streamed value only ever arrives
- * as `{ kind: "chunk" }`; `dropped`/`retry`/`error` are framework markers, so a
- * consumer that switches on `kind` cannot confuse a marker with a data chunk.
- * Generated as: `chunk` from `ctx.emit`, `dropped` on per-subscriber buffer
- * overflow, `retry` when a streaming step is re-attempted, `error` on terminal
- * `step.failed` (retries exhausted).
- */
 export type StreamEvent<C = Json> =
   | { readonly kind: "chunk"; readonly chunk: C }
   | { readonly kind: "dropped"; readonly count: number }
@@ -354,20 +339,11 @@ export type FlowOutput<F> =
 export type FlowIdOf<T extends ReadonlyArray<Flow>> =
   T[number] extends Flow<infer Id> ? Id : never;
 
-/**
- * Durable parent linkage persisted on {@link FlowStartedFact}. Present when a
- * run was started as a subflow child; absent for top-level runs.
- */
 export interface ParentLink {
   readonly runId: RunId;
   readonly stepId: StepId;
 }
 
-/**
- * In-process parent reference: a {@link ParentLink} plus the parent step's
- * attempt, used to thread otel spans and registry lookups. Not persisted — the
- * attempt is re-derived from parent run state when a subflow wakes its parent.
- */
 export interface ParentRef extends ParentLink {
   readonly attempt: AttemptNumber;
 }
@@ -380,11 +356,6 @@ export interface FlowEvent {
 
 export interface FlowStartEvent extends FlowEvent {
   readonly input: Json;
-  /**
-   * Set when this run was started as a subflow child. Undefined for
-   * top-level runs (start / startById). Carried in-process only — for
-   * durable linkage see {@link FlowStartedFact.parent}.
-   */
   readonly parent?: ParentRef;
 }
 
@@ -565,27 +536,17 @@ export interface Store {
   // MUST never prune non-terminal runs; delete in batches of opts.batchSize.
   pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult>;
 
-  /**
-   * Optional streaming transport read-side. Present only on adapters that can
-   * fan out ephemeral chunks (e.g. the in-memory store). When any registered
-   * flow contains a `streaming` step and this is undefined, `nagi()` throws at
-   * registration (fail-fast), mirroring {@link Queue.ensureSchema}'s gating.
-   * Yields a {@link StreamEvent} envelope; the iterator closes when the step
-   * reaches a terminal fact. `replayBuffered` is best-effort against a bounded,
-   * terminal-dropped buffer.
-   */
+  // Optional streaming read-side. If a registered flow has a streaming step and
+  // this is undefined, nagi() throws at registration. The iterator MUST close
+  // when the step reaches a terminal fact.
   subscribeStream?(
     runId: RunId,
     stepId: StepId,
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<Json>>;
 
-  /**
-   * Optional streaming transport write-side. `ctx.emit` pushes a raw chunk; the
-   * transport wraps it as `{ kind: "chunk", chunk }` and fans out. The
-   * `dropped`/`retry`/`error` events are transport/dispatch-generated, not
-   * published here. Fire-and-forget and out-of-band — never routed through `tx`.
-   */
+  // Optional streaming write-side. Fire-and-forget and out-of-band — MUST NOT be
+  // routed through `tx`.
   publishChunk?(runId: RunId, stepId: StepId, chunk: Json): void;
 }
 
@@ -664,12 +625,8 @@ export interface Queue {
   ack(receipt: string): Promise<void>;
   nack(receipt: string, opts?: { delayMs?: Millis }): Promise<void>;
   extend(receipt: string, leaseMs: Millis): Promise<void>;
-  /**
-   * Optional one-shot, idempotent provisioning of the queue's backing schema.
-   * When present, `nagi()` awaits it once at construction (fail-fast), so a
-   * misconfigured queue surfaces at boot instead of on first enqueue. Adapters
-   * needing no provisioning (e.g. in-memory) omit it.
-   */
+  // Optional one-shot, idempotent schema provisioning. nagi() awaits it once at
+  // construction (fail-fast). Adapters needing none omit it.
   ensureSchema?(): Promise<void>;
 }
 
@@ -712,7 +669,6 @@ export interface FlowStartedFact extends FactBase {
   readonly input: Json;
   readonly flowHash?: string;
   readonly codeVersion?: string;
-  /** Present when this run was started as a subflow child; absent for roots. */
   readonly parent?: ParentLink;
 }
 
@@ -767,8 +723,7 @@ export interface StepStartedFact extends FactBase {
   readonly kind: "step.started";
   readonly stepId: StepId;
   readonly attempt: AttemptNumber;
-  /** The step's kind, so the projection can fold a started step into the right
-   * state (running vs awaitingSignal vs awaitingChild) without the flow def. */
+  // Lets the projection fold a started step without the flow def.
   readonly stepKind: StepKind;
 }
 
@@ -798,7 +753,6 @@ export interface StepRetriedFact extends FactBase {
   readonly stepId: StepId;
   readonly attempt: AttemptNumber;
   readonly nextAttemptAt: Date;
-  /** The failure that triggered this retry; surfaces on the `backoff` state. */
   readonly error: SerializedError;
 }
 
@@ -808,7 +762,6 @@ export interface StepSkippedFact extends FactBase {
   readonly reason: "when-false" | "transitive" | "manual";
   readonly actor?: string;
   readonly note?: string;
-  // "continue" lets downstream run with needs.x === null; handler must tolerate.
   readonly cascade?: "skip" | "continue";
 }
 
@@ -886,11 +839,6 @@ export type StepStatus =
   | "canceled"
   | "skipped";
 
-/**
- * The projected run/step state machines are tagged unions defined in `state.ts`
- * ({@link RunState} carries a `phase`; {@link StepState} a `tag`). Re-exported
- * here so existing `from "./types"` imports keep resolving.
- */
 export type { RunState, StepState };
 
 export type ReplayMode = "inspect" | "continue";

@@ -507,7 +507,6 @@ describe("nextTransition", () => {
       startedStepFact("m"),
       completedStepFact("m.otherwise.x", { ok: true }),
     ]);
-    // `indep` is runnable, but a promotable match takes priority this tick.
     expect(nextTransition(f, state).kind).toBe("promote-match");
   });
 });

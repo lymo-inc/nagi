@@ -80,7 +80,6 @@ describe("StreamingStepCtx.emit", () => {
   it("defaults the chunk type to Json when C is not supplied", () => {
     builderX.streamingTask({
       run: async ({ ctx }) => {
-        // a Json-compatible value is accepted under the default
         await ctx.emit({ partial: "ok" });
         return null;
       },
@@ -123,7 +122,6 @@ describe("StreamingStepCtx — inherited StepCtx surface", () => {
 
 describe("StepKind", () => {
   it('includes "streaming"', () => {
-    // "streaming" is a member: assignable into StepKind, and StepKind extends it.
     const k: StepKind = "streaming";
     void k;
     expectTypeOf<"streaming">().toMatchTypeOf<StepKind>();
@@ -187,7 +185,6 @@ describe("Wf.subscribe — typing (O6)", () => {
     expectTypeOf(
       wf.subscribe(runId, stepId, { replayBuffered: true }),
     ).toEqualTypeOf<AsyncIterable<StreamEvent<Json>>>();
-    // Omitting replayBuffered within the opts object is allowed (it is optional).
     void wf.subscribe(runId, stepId, {});
   });
 

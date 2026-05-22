@@ -6,7 +6,6 @@ import { unwrap } from "../state";
 import type { Json, RunId, StepId, StreamEvent } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
-/** Drain an async iterable of stream events to completion into an array. */
 async function collect<C = Json>(
   iter: AsyncIterable<StreamEvent<C>>,
 ): Promise<StreamEvent<C>[]> {
@@ -15,7 +14,6 @@ async function collect<C = Json>(
   return out;
 }
 
-/** Pull only the data chunks out of a collected event array. */
 function chunks<C>(events: readonly StreamEvent<C>[]): C[] {
   return events.flatMap((e) => (e.kind === "chunk" ? [e.chunk] : []));
 }
@@ -43,9 +41,6 @@ describe("streamingTask — emit → subscribe happy path", () => {
     });
 
     const h = await makeHarness(f);
-    // Deterministic: subscribe BEFORE any dispatch (no background worker), so the
-    // hub subscriber is attached, then drive dispatch inline with drain(). This
-    // removes the "worker completes the step before subscribe runs" race.
     const runId = await h.wf.start(f, { n: 3 });
     const sub = h.wf.subscribe<{ token: string }>(runId, "gen" as StepId);
     const collected = collect(sub);
@@ -57,12 +52,10 @@ describe("streamingTask — emit → subscribe happy path", () => {
       { token: "t1" },
       { token: "t2" },
     ]);
-    // No error/retry on a clean run.
     expect(events.every((e) => e.kind === "chunk")).toBe(true);
 
     const result = await h.waitForEnd(runId);
     expect(result.status).toBe("completed");
-    // The final return is the durable step.output (byte-identical to b.task).
     expect(result.output("gen")).toEqual({ final: "done:3" });
   });
 
@@ -131,15 +124,8 @@ describe("streamingTask — chunks are ephemeral, not in the fact log", () => {
       const runId = await h.wf.start(f, {});
       const result = await h.waitForEnd(runId);
 
-      // Exactly one step.completed for the single streaming step.
       expect(result.factCount("step.completed")).toBe(1);
-      // No fact carries a chunk value: scan every fact's serialized form for the
-      // emitted token values that are NOT the final output (1, 2 — the final is
-      // 99). The chunk payloads must be absent from the durable log entirely.
       const factBlob = JSON.stringify(result.raw.facts);
-      // The final output 99 IS in the log (step.completed.output); the mid
-      // chunks 1/2/3 are emitted but only 99 returned — assert no chunk envelope
-      // leaked.
       expect(factBlob).not.toContain('"kind":"chunk"');
       expect(result.output("gen")).toBe(99);
     } finally {
@@ -168,7 +154,6 @@ describe("streamingTask — fan-out (D6)", () => {
 
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
-    // Both subscribers attach before dispatch → each must see every chunk.
     const a = collect(h.wf.subscribe<string>(runId, "gen" as StepId));
     const b = collect(h.wf.subscribe<string>(runId, "gen" as StepId));
     await h.drain();
@@ -197,7 +182,6 @@ describe("streamingTask — termination signaling (D3/O4)", () => {
 
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
-    // If the loop hung, collect() would never resolve and the test times out.
     const collected = collect(h.wf.subscribe<string>(runId, "gen" as StepId));
     await h.drain();
     const events = await collected;
@@ -212,8 +196,6 @@ describe("streamingTask — termination signaling (D3/O4)", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => {
         const gen = b.streamingTask<Record<string, never>, never, string>({
-          // No retry → maxAttempts default still > 1, so pin maxAttempts:1 so the
-          // first failure is terminal.
           retry: { maxAttempts: 1, backoff: "fixed", initialDelayMs: 0 },
           run: async ({ ctx }) => {
             await ctx.emit("partial");
@@ -229,7 +211,6 @@ describe("streamingTask — termination signaling (D3/O4)", () => {
     const collected = collect(h.wf.subscribe<string>(runId, "gen" as StepId));
     await h.drain();
     const events = await collected;
-    // Saw the partial chunk, then a terminal error envelope (not a rejection).
     expect(chunks(events)).toEqual(["partial"]);
     const last = events[events.length - 1];
     expect(last?.kind).toBe("error");
@@ -274,13 +255,11 @@ describe("streamingTask — retry (O5)", () => {
     await h.drain();
     const events = await collected;
 
-    // Order: attempt-1 chunk, retry marker (next attempt = 2), attempt-2 chunk.
     const retryIdx = events.findIndex((e) => e.kind === "retry");
     expect(retryIdx).toBeGreaterThanOrEqual(0);
     const retryEv = events[retryIdx];
     if (retryEv?.kind === "retry") expect(retryEv.attempt).toBe(2);
     expect(chunks(events)).toEqual(["attempt1-chunk", "attempt2-chunk"]);
-    // A retried-but-eventually-successful step emits NO error envelope.
     expect(events.some((e) => e.kind === "error")).toBe(false);
 
     const result = await h.waitForEnd(runId);
@@ -309,7 +288,7 @@ describe("streamingTask — INVARIANT GUARDS", () => {
     const worker = h.startWorker();
     try {
       const runId = await h.wf.start(f, {});
-      await h.waitForEnd(runId); // step already completed
+      await h.waitForEnd(runId);
       const events = await collect(
         h.wf.subscribe<string>(runId, "gen" as StepId),
       );
@@ -358,11 +337,9 @@ describe("streamingTask — INVARIANT GUARDS", () => {
 
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
-    // Typo: "genn" is not a streaming step.
     expect(() => h.wf.subscribe(runId, "genn" as StepId)).toThrow(
       NagiRuntimeError,
     );
-    // A real, non-streaming step is also rejected by subscribe.
   });
 
   it("a non-streaming step is not subscribable (throws NagiRuntimeError)", async () => {
@@ -382,9 +359,6 @@ describe("streamingTask — INVARIANT GUARDS", () => {
   });
 
   it("a subscriber to a skipped streaming step (subscribed after run end) gets empty + ends", async () => {
-    // The streaming step is gated off by `when:false` so it is SKIPPED — it
-    // never runs/emits. A consumer subscribing after run-end gets an empty,
-    // ended stream via the durable-fact guard (the skipped step is terminal).
     const f = flow({
       id: "stream-skipped-step",
       input: passthroughSchema<{ go: boolean }>(),
@@ -416,10 +390,6 @@ describe("streamingTask — INVARIANT GUARDS", () => {
   });
 
   it("a LIVE subscriber to a step that never completes is ended by the run-terminal fact (closeRun)", async () => {
-    // The precise closeRun invariant, tested deterministically at the store
-    // layer: open a live channel for a PENDING step of a RUNNING run (so the
-    // fact guard delegates to the hub), then land a run-terminal fact. closeRun
-    // must end the subscriber's iterator — no hang past run end, no error event.
     const store = new InMemoryStore();
     const runId = "run-closerun" as RunId;
     const stepId = "gen" as StepId;
@@ -431,12 +401,9 @@ describe("streamingTask — INVARIANT GUARDS", () => {
       input: null,
       at: new Date(),
     });
-    // Step is pending (no step fact), run is running → a LIVE hub subscription.
     const collected = collect(store.subscribeStream(runId, stepId));
-    // A chunk fans out to the live subscriber (proves the channel is real/open).
     store.publishChunk(runId, stepId, "live-chunk");
 
-    // Run terminates without the step ever completing.
     await store.appendFact(runId, {
       kind: "flow.completed",
       runId,
@@ -444,9 +411,8 @@ describe("streamingTask — INVARIANT GUARDS", () => {
       at: new Date(),
     });
 
-    const events = await collected; // must resolve (no hang)
+    const events = await collected;
     expect(chunks(events)).toEqual(["live-chunk"]);
-    // Clean close — closeRun injects no error envelope.
     expect(events.some((e) => e.kind === "error")).toBe(false);
   });
 });
@@ -464,7 +430,6 @@ describe("streamingTask — capability gating (D4)", () => {
       },
     });
 
-    // A store missing the streaming capability: strip subscribeStream/publishChunk.
     const store = new InMemoryStore();
     const crippled = new Proxy(store, {
       get(target, prop, receiver) {
@@ -583,9 +548,6 @@ describe("streamingTask — emit ergonomics", () => {
       build: (b) => {
         const gen = b.streamingTask<Record<string, never>, string, number>({
           run: async ({ ctx }) => {
-            // No subscriber is attached; each emit must still resolve so the
-            // handler can make progress and complete (fan-out is at-most-once,
-            // non-blocking — the producer never waits on a consumer).
             for (let i = 0; i < 3; i++) {
               await ctx.emit(i);
               emitResolutions.push(i);
@@ -602,8 +564,6 @@ describe("streamingTask — emit ergonomics", () => {
     try {
       const runId = await h.wf.start(f, {});
       const result = await h.waitForEnd(runId);
-      // All three emits resolved (the loop ran to completion) and the step
-      // captured its durable output.
       expect(emitResolutions).toEqual([0, 1, 2]);
       expect(result.status).toBe("completed");
       expect(result.output("gen")).toBe("completed-without-consumer");
@@ -613,11 +573,6 @@ describe("streamingTask — emit ergonomics", () => {
   });
 
   it("a {replayBuffered:true} subscriber attached mid-run gets earlier chunks then live ones in order (end-to-end)", async () => {
-    // End-to-end version of the hub replayBuffered unit test: drive a real run
-    // via a worker, park the handler on a barrier after it has emitted the
-    // early chunks, attach a late `replayBuffered` subscriber while the step is
-    // still running (channel open, buffer populated), then release the barrier
-    // so the handler emits a live chunk and completes.
     let releaseProceed!: () => void;
     const proceed = new Promise<void>((r) => {
       releaseProceed = r;
@@ -636,8 +591,6 @@ describe("streamingTask — emit ergonomics", () => {
             await ctx.emit("early-1");
             await ctx.emit("early-2");
             signalEarlyEmitted();
-            // Park here so the test can attach the late subscriber while the
-            // step is still running (not yet terminal → channel still open).
             await proceed;
             await ctx.emit("live-1");
             return "fin";
@@ -651,17 +604,12 @@ describe("streamingTask — emit ergonomics", () => {
     const worker = h.startWorker();
     try {
       const runId = await h.wf.start(f, {});
-      // Wait until the early chunks are buffered in the channel.
       await earlyEmitted;
-      // Attach the late subscriber with replayBuffered → it must be seeded with
-      // the buffered early chunks, then receive the subsequent live chunk.
       const collected = collect(
         h.wf.subscribe<string>(runId, "gen" as StepId, {
           replayBuffered: true,
         }),
       );
-      // Release the handler so it emits the live chunk and completes (closing
-      // the channel, which ends the subscriber's loop).
       releaseProceed();
       const events = await collected;
 
@@ -669,14 +617,12 @@ describe("streamingTask — emit ergonomics", () => {
       const result = await h.waitForEnd(runId);
       expect(result.output("gen")).toBe("fin");
     } finally {
-      releaseProceed(); // ensure the handler is never left parked
+      releaseProceed();
       await worker.stop();
     }
   });
 
   it("a default (future-only) subscriber attached mid-run misses earlier chunks but gets live ones (end-to-end)", async () => {
-    // The contrast case to replayBuffered: a mid-run subscriber WITHOUT the opt
-    // sees only chunks emitted after it attached.
     let releaseProceed!: () => void;
     const proceed = new Promise<void>((r) => {
       releaseProceed = r;

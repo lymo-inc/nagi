@@ -1,4 +1,4 @@
-import { type DispatchDeps, dispatchMessage } from "./dispatch";
+import { type DispatchDeps, type Dispatcher, makeDispatcher } from "./dispatch";
 import type {
   Clock,
   Millis,
@@ -26,6 +26,7 @@ class WorkerImpl implements Worker {
   private readonly concurrency: number;
   private readonly pollIntervalMs: Millis;
   private readonly signal: AbortSignal | undefined;
+  private readonly dispatcher: Dispatcher;
 
   constructor(
     private readonly deps: WorkerDeps,
@@ -34,6 +35,7 @@ class WorkerImpl implements Worker {
     this.concurrency = Math.max(1, config?.concurrency ?? DEFAULT_CONCURRENCY);
     this.pollIntervalMs = config?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.signal = config?.signal;
+    this.dispatcher = makeDispatcher(deps);
   }
 
   async run(): Promise<void> {
@@ -57,30 +59,29 @@ class WorkerImpl implements Worker {
 
   async runOnce(opts?: WorkerRunOnceOpts): Promise<WorkerRunResult> {
     const limit = Math.max(1, opts?.maxSteps ?? this.concurrency);
-    let processed = 0;
-
-    while (processed < limit && !this.aborted()) {
-      const remaining = limit - processed;
-      const messages = await this.dequeue(
-        Math.min(remaining, this.concurrency),
-      );
-      if (messages.length === 0) break;
-
-      await Promise.all(messages.map((m) => this.dispatchSafely(m)));
-      processed += messages.length;
-    }
-    return { processed };
+    return this.pump({
+      shouldContinue: (processed) => processed < limit,
+      batchSize: (processed) => Math.min(limit - processed, this.concurrency),
+    });
   }
 
   async runUntilEmpty(
     opts?: WorkerRunUntilEmptyOpts,
   ): Promise<WorkerRunResult> {
     const deadline = opts?.deadline;
-    let processed = 0;
+    return this.pump({
+      shouldContinue: () => deadline === undefined || Date.now() < deadline,
+      batchSize: () => this.concurrency,
+    });
+  }
 
-    while (!this.aborted()) {
-      if (deadline !== undefined && Date.now() >= deadline) break;
-      const messages = await this.dequeue(this.concurrency);
+  private async pump(opts: {
+    shouldContinue: (processed: number) => boolean;
+    batchSize: (processed: number) => number;
+  }): Promise<WorkerRunResult> {
+    let processed = 0;
+    while (!this.aborted() && opts.shouldContinue(processed)) {
+      const messages = await this.dequeue(opts.batchSize(processed));
       if (messages.length === 0) break;
 
       await Promise.all(messages.map((m) => this.dispatchSafely(m)));
@@ -102,7 +103,7 @@ class WorkerImpl implements Worker {
 
   private async dispatchSafely(msg: QueueMessage): Promise<void> {
     try {
-      await dispatchMessage(this.deps, msg);
+      await this.dispatcher.dispatchMessage(msg);
     } catch (err) {
       this.deps.emitLog({
         level: "error",

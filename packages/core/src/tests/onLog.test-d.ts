@@ -10,7 +10,6 @@ import type {
   Store,
 } from "../types";
 
-// Stubs to construct `nagi(...)` in type-level tests — bodies never run.
 declare const store: Store;
 declare const queue: Queue;
 declare const methodLogger: Logger;
@@ -33,13 +32,11 @@ describe("NagiConfig.onLog — exact shape", () => {
   });
 
   it("onLog is an optional field (key may be omitted)", () => {
-    // The field is optional: a config object with no onLog is assignable.
     expectTypeOf<{
       flows: NagiConfig["flows"];
       store: Store;
       queue: Queue;
     }>().toMatchTypeOf<Omit<NagiConfig, "onLog"> & Partial<NagiConfig>>();
-    // `undefined` is assignable to the property type (optional).
     expectTypeOf<undefined>().toMatchTypeOf<NagiConfig["onLog"]>();
   });
 });
@@ -50,7 +47,6 @@ describe("LogEntry — field types", () => {
       "debug" | "info" | "warn" | "error"
     >();
     expectTypeOf<LogEntry["level"]>().toEqualTypeOf<LogLevel>();
-    // It is NOT widened to string.
     expectTypeOf<LogEntry["level"]>().not.toEqualTypeOf<string>();
   });
 
@@ -68,15 +64,12 @@ describe("LogEntry — field types", () => {
     expectTypeOf<LogEntry["attrs"]>().toEqualTypeOf<
       Record<string, unknown> | undefined
     >();
-    // Optional: a LogEntry without attrs is constructible.
     expectTypeOf<{ level: LogLevel; msg: string }>().toMatchTypeOf<LogEntry>();
   });
 
   it("attrs values are unknown, not any", () => {
     type V = NonNullable<LogEntry["attrs"]>[string];
     expectTypeOf<V>().toEqualTypeOf<unknown>();
-    // `any` would make `unknown extends V` collapse; assert V is not any by
-    // proving a value of V is not assignable to a concrete type.
     expectTypeOf<V>().not.toEqualTypeOf<string>();
   });
 });

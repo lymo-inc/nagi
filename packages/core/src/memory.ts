@@ -66,9 +66,6 @@ export class InMemoryStore implements Store {
   private readonly keyByActiveRun = new Map<RunId, string>();
   private readonly childrenByParent = new Map<RunId, Set<RunId>>();
   private readonly summaries = new Map<RunId, RunSummary>();
-  // Ephemeral streaming-chunk broadcast transport (RFC 0019). Phase C wires
-  // closeOk/closeError into completeStep/failStep; for now only the read/write
-  // capability methods delegate here.
   private readonly streamHub = new InMemoryStreamHub();
   private readonly leaseMs: Millis;
 
@@ -80,21 +77,20 @@ export class InMemoryStore implements Store {
     const list = this.facts.get(runId) ?? [];
     list.push(fact);
     this.facts.set(runId, list);
-    // RFC 0019 D3: drive the ephemeral stream hub off the durable fact log, so
-    // termination is derived from committed state — never an in-band end-marker.
-    // These fire for ALL steps; the hub's close*/closeRun are safe no-ops for
-    // non-streaming steps (no channel exists → nothing created, nothing leaks).
+    // Drive the stream hub off the durable fact log. These fire for ALL steps;
+    // the hub's close*/closeRun are safe no-ops for non-streaming steps (no
+    // channel exists, so nothing is created and nothing leaks).
     switch (fact.kind) {
       case "step.completed":
         this.streamHub.closeOk(runId, fact.stepId);
         break;
       case "step.failed":
-        // failStep (hence this fact) is only written on terminal failure; the
-        // retry path uses step.retried. So this is always retries-exhausted.
+        // Only written on terminal failure (retries use step.retried), so this
+        // is always retries-exhausted.
         this.streamHub.closeError(runId, fact.stepId, fact.error);
         break;
       case "step.retried":
-        // O5: the retry event carries the NEXT attempt number.
+        // The retry event carries the NEXT attempt number.
         this.streamHub.signalRetry(
           runId,
           fact.stepId,
@@ -104,8 +100,8 @@ export class InMemoryStore implements Store {
       case "flow.completed":
       case "flow.failed":
       case "flow.canceled":
-        // Run-terminal: close every still-open channel for this run so a
-        // subscriber to a skipped/typo'd/never-emitting step never hangs.
+        // Close every still-open channel for the run so a subscriber to a
+        // skipped/typo'd/never-emitting step never hangs.
         this.streamHub.closeRun(runId);
         break;
     }
@@ -412,11 +408,9 @@ export class InMemoryStore implements Store {
     stepId: StepId,
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<Json>> {
-    // D3 authoritative guard: durable facts decide whether the stream is over,
-    // not the ephemeral hub (the hub may never have held a channel for this
-    // step). If the step already reached a terminal fact, or the run is already
-    // terminal, the stream is over → hand back an immediately-closed, empty
-    // iterable rather than delegating (which would open a channel that hangs).
+    // Durable facts decide whether the stream is over, not the hub (which may
+    // never have held a channel for this step). Delegating to a terminal step
+    // would open a channel that hangs, so hand back an empty iterable instead.
     const state = foldRun(runId, this.facts.get(runId) ?? []);
     const stepStatus = stepStatusOf(stepStateOf(state, stepId));
     const runIsTerminal = isTerminalRun(state);
@@ -437,12 +431,6 @@ export class InMemoryStore implements Store {
   }
 }
 
-/**
- * A shared, immediately-ended async iterable for "the stream is already over"
- * (D3): subscribing to a step that has already reached a terminal fact, or whose
- * run is terminal. Yields nothing and ends on first `next()` — so a `for await`
- * loop completes at once and never hangs.
- */
 const EMPTY_CLOSED_STREAM: AsyncIterable<StreamEvent<Json>> = {
   [Symbol.asyncIterator](): AsyncIterator<StreamEvent<Json>> {
     return { next: async () => ({ value: undefined, done: true }) };

@@ -5,11 +5,9 @@ import {
   sha256Canonical,
 } from "./canonicalize";
 import {
-  advance,
   type DispatchDeps,
-  dispatchMessage,
-  fireHook as fireRuntimeHook,
-  propagateToParent,
+  type Dispatcher,
+  makeDispatcher,
   serializeError,
 } from "./dispatch";
 import {
@@ -96,18 +94,6 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
     opts?: StartOpts,
   ): Promise<RunId>;
 
-  /**
-   * Start a flow by id with a runtime-typed input. Intended for callers
-   * holding a serialized payload (transactional-outbox reconcilers, queue
-   * consumers replaying DLQs, admin CLIs replaying a runId): the input
-   * is validated against the registered flow's schema before the run is
-   * created, mirroring `start`'s runtime contract without requiring a
-   * compile-time-typed input.
-   *
-   * Throws `NagiRuntimeError` when `flowId` is not registered with
-   * `nagi()`, and `NagiValidationError` when the input fails the flow's
-   * schema or when `opts.runId` is invalid.
-   */
   startById(flowId: string, input: unknown, opts?: StartOpts): Promise<RunId>;
 
   signal(runId: RunId, stepName: string, payload: unknown): Promise<void>;
@@ -122,19 +108,6 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
     opts?: QueryRunsOpts<FlowIdOf<TFlows>>,
   ): Promise<QueryRunsResult<FlowIdOf<TFlows>>>;
 
-  /**
-   * Subscribe to the ephemeral chunk stream of a `b.streamingTask` step (RFC
-   * 0019). Returns a {@link StreamEvent} envelope iterable: `chunk` for each
-   * `ctx.emit`, `retry` between attempts, a final `error` on terminal failure,
-   * `dropped` on per-subscriber lag. The iterator ends when the step (or run)
-   * reaches a terminal fact — so a `for await` never hangs.
-   *
-   * Future-only by default; pass `{ replayBuffered: true }` for best-effort
-   * delivery of buffered chunks to a late subscriber (the buffer is dropped at
-   * terminal). `C` is caller-asserted (O6); the producer side infers its chunk
-   * type from the handler. Throws `NagiRuntimeError` if `stepId` is not a
-   * `streaming` step in any registered flow (fail-loud on typos).
-   */
   subscribe<C = Json>(
     runId: RunId,
     stepId: StepId,
@@ -194,9 +167,8 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
   : never;
 
-// The human-initiated cancel causes minus the persisted-fact envelope, derived
-// from the facts so cancel intent and the recorded fact can't drift.
-// Concurrency cancellation is system-internal and intentionally excluded.
+// Derived from the fact types so cancel intent can't drift from the recorded
+// fact. Concurrency cancellation is system-internal and intentionally excluded.
 type CancelArgs = DistributiveOmit<
   FlowCanceledExplicitlyFact | FlowCanceledByOperatorFact,
   "kind" | "runId" | "at"
@@ -231,18 +203,11 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   config: NagiConfig & { flows: TFlows },
 ): Promise<Wf<TFlows>> {
   const clock = config.clock ?? new InMemoryClock();
-  // Single diagnostic choke point (RFC 0020): built once from config.onLog and
-  // threaded everywhere a log is produced. A no-op when onLog is absent (silent
-  // by default), so call sites never branch on its presence.
   const emitLog = makeEmit(config.onLog);
-  // One-shot queue provisioning (RFC 0013): eager + fail-fast at construction,
-  // before any run can enqueue. A no-op for adapters without the hook.
   await config.queue.ensureSchema?.();
 
   const flowsById = new Map<string, Flow>();
   const flowHashById = new Map<string, string>();
-  // RFC 0019: the set of stepIds that name a `streaming` step in SOME registered
-  // flow. `wf.subscribe` validates against this to fail loud on typo'd stepIds.
   const streamingStepIds = new Set<string>();
   for (const f of config.flows) {
     if (flowsById.has(f.id)) {
@@ -252,11 +217,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     }
     flowsById.set(f.id, f);
 
-    // RFC 0019 D4: gate the streaming capability at registration (boot-time),
-    // mirroring Queue.ensureSchema. A flow with a `streaming` step against a
-    // store that can't fan out chunks (no subscribeStream) must fail here, never
-    // silently at first dispatch. Also record streaming stepIds for subscribe's
-    // static validation.
+    // Gate the streaming capability at registration (fail-fast), never silently
+    // at first dispatch.
     for (const [stepId, step] of Object.entries(asStepMapWithDefs(f.steps))) {
       if (getDef(step).kind !== "streaming") continue;
       streamingStepIds.add(stepId);
@@ -382,19 +344,13 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         error: serialized,
         at: c.fact.at,
       };
-      await fireRuntimeHook(
-        flow.onError,
-        errorEvent,
-        "flow.onError",
-        dispatchDeps,
-      );
-      await fireRuntimeHook(
+      await dispatcher.fireHook(flow.onError, errorEvent, "flow.onError");
+      await dispatcher.fireHook(
         config.hooks?.onFlowError,
         errorEvent,
         "onFlowError",
-        dispatchDeps,
       );
-      await propagateToParent(dispatchDeps, c.runId, {
+      await dispatcher.propagateToParent(c.runId, {
         kind: "canceled",
         error: serialized,
       });
@@ -415,20 +371,14 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
             input: validatedInput,
             at: startedAt,
           };
-    await fireRuntimeHook(
-      flow.onStart,
-      startEvent,
-      "flow.onStart",
-      dispatchDeps,
-    );
-    await fireRuntimeHook(
+    await dispatcher.fireHook(flow.onStart, startEvent, "flow.onStart");
+    await dispatcher.fireHook(
       config.hooks?.onFlowStart,
       startEvent,
       "onFlowStart",
-      dispatchDeps,
     );
 
-    await advance(dispatchDeps, runId);
+    await dispatcher.advance(runId);
     return { started: true };
   }
 
@@ -491,12 +441,11 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         error: cancelError,
         at: clock.now(),
       };
-      await fireRuntimeHook(flow.onError, event, "flow.onError", dispatchDeps);
-      await fireRuntimeHook(
+      await dispatcher.fireHook(flow.onError, event, "flow.onError");
+      await dispatcher.fireHook(
         config.hooks?.onFlowError,
         event,
         "onFlowError",
-        dispatchDeps,
       );
     }
 
@@ -512,7 +461,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       });
     }
 
-    await propagateToParent(dispatchDeps, runId, {
+    await dispatcher.propagateToParent(runId, {
       kind: "canceled",
       error: cancelError,
     });
@@ -531,6 +480,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       defaultRetry: config.defaultRetry,
     }),
   };
+  const dispatcher = makeDispatcher(dispatchDeps);
 
   const wf: Wf = {
     async start<F extends Flow>(
@@ -630,7 +580,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       };
       await config.store.completeStep(runId, stepId, validated, completedFact);
 
-      await fireRuntimeHook(
+      await dispatcher.fireHook(
         config.hooks?.onSignalReceived,
         {
           runId,
@@ -642,10 +592,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
           at: clock.now(),
         },
         "onSignalReceived",
-        dispatchDeps,
       );
 
-      await advance(dispatchDeps, runId);
+      await dispatcher.advance(runId);
     },
 
     async cancel(runId: RunId, opts?: CancelOpts): Promise<void> {
@@ -657,7 +606,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
     operator(): Operator {
       return makeOperator({
-        deps: dispatchDeps,
+        dispatcher,
+        store: config.store,
         clock,
         flowsById,
         cancelRunRecursive,
@@ -759,8 +709,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         }
       }
 
-      await advance(replayDeps, runId);
-      if (!fireHooks) await drainInline(replayDeps);
+      const replayDispatcher = makeDispatcher(replayDeps);
+      await replayDispatcher.advance(runId);
+      if (!fireHooks) await drainInline(replayDispatcher, config.queue);
     },
 
     async queryRuns(opts: QueryRunsOpts = {}): Promise<QueryRunsResult> {
@@ -783,9 +734,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       stepId: StepId,
       opts?: { readonly replayBuffered?: boolean },
     ): AsyncIterable<StreamEvent<C>> {
-      // Fail loud on a typo'd / non-streaming stepId (RFC 0019). The capability
-      // throw at registration guarantees subscribeStream is present whenever a
-      // streaming step exists, so the `!` is sound once this check passes.
+      // Registration guarantees subscribeStream exists when a streaming step
+      // does, so the `!` below is sound once this check passes.
       if (!streamingStepIds.has(stepId)) {
         throw new NagiRuntimeError(
           `wf.subscribe: step "${stepId}" is not a streaming step ` +
@@ -793,9 +743,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
             `Only streaming steps can be subscribed to.`,
         );
       }
-      // O6: C is caller-asserted; the store yields StreamEvent<Json>. This single
-      // cast bridges the Json→C assertion (the runtime can't cross-check a
-      // runtime stepId against the producer's inferred chunk type).
+      // C is caller-asserted; the store yields StreamEvent<Json>. This cast
+      // bridges the Json→C assertion.
       return config.store.subscribeStream!(
         runId,
         stepId,
@@ -853,29 +802,15 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     configurable: false,
   });
   // Trust boundary: persisted flow_id values were registered flow ids at write
-  // time. The text column erases the literal type, so queryRuns returns
-  // QueryRunsResult<string>; assert it back to the registered union here, the
-  // single read-side boundary (RFC 0012 D7). All other Wf<TFlows> members are
-  // structurally identical to the bare Wf, so this one cast covers the widening.
+  // time, so assert the erased string back to the registered union here.
   return wf as unknown as Wf<TFlows>;
 }
 
-/**
- * Config for {@link nagi.run}: a `NagiConfig` plus optional worker tuning and an
- * external shutdown signal. The signal is merged with an internal controller, so
- * aborting either source drains the worker.
- */
 export interface NagiRunConfig extends NagiConfig {
   readonly worker?: Omit<WorkerConfig, "signal">;
   readonly signal?: AbortSignal;
 }
 
-/**
- * Handle returned by {@link nagi.run}. `stop()` aborts the internal controller,
- * awaits the worker loop, and is idempotent (safe to call twice or concurrently).
- * It resolves cleanly even if the loop crashed — a true crash is logged once via
- * the configured `onLog`.
- */
 export interface RuntimeHandle<
   TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>,
 > {
@@ -893,9 +828,6 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
     : internal.signal;
   const worker = wf.worker({ ...config.worker, signal });
 
-  // The loop promise is held privately: it resolves on graceful drain and
-  // rejects only on a true loop crash (e.g. queue.dequeue throws while the
-  // runtime is not shutting down).
   const emitLog = makeEmit(config.onLog);
   const loop = worker.run();
   loop.catch((err: unknown) => {
@@ -923,10 +855,6 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
   return { wf, stop };
 }
 
-/**
- * The nagi runtime factory. Call `nagi(config)` for fine-grained control, or
- * `nagi.run(config)` for a turnkey worker lifecycle returning `{ wf, stop }`.
- */
 export const nagi: typeof nagiImpl & { run: typeof nagiRun } = Object.assign(
   nagiImpl,
   { run: nagiRun },
@@ -961,16 +889,20 @@ function resolveSignalStep(
 }
 
 const MAX_REPLAY_DISPATCHES = 4096;
-async function drainInline(deps: DispatchDeps): Promise<void> {
+async function drainInline(
+  dispatcher: Dispatcher,
+  queue: Queue,
+): Promise<void> {
   for (let i = 0; i < MAX_REPLAY_DISPATCHES; i++) {
-    const messages = await deps.queue.dequeue({ count: 1 });
+    const messages = await queue.dequeue({ count: 1 });
     if (messages.length === 0) return;
-    for (const msg of messages) await dispatchMessage(deps, msg);
+    for (const msg of messages) await dispatcher.dispatchMessage(msg);
   }
 }
 
 interface OperatorDeps {
-  readonly deps: DispatchDeps;
+  readonly dispatcher: Dispatcher;
+  readonly store: Store;
   readonly clock: Clock;
   readonly flowsById: ReadonlyMap<string, Flow>;
   readonly cancelRunRecursive: (
@@ -981,8 +913,8 @@ interface OperatorDeps {
 }
 
 function makeOperator(o: OperatorDeps): Operator {
-  const { deps, clock, flowsById, cancelRunRecursive, emitLog } = o;
-  const store = deps.store;
+  const { dispatcher, store, clock, flowsById, cancelRunRecursive, emitLog } =
+    o;
 
   function resolveFlow(flowId: string, runId: RunId): Flow {
     const flow = flowsById.get(flowId);
@@ -1043,7 +975,7 @@ function makeOperator(o: OperatorDeps): Operator {
       ...compact({ note: opts.note }),
     };
     await store.appendFact(runId, fact);
-    await advance(deps, runId);
+    await dispatcher.advance(runId);
   }
 
   async function waitForStepToSettle(
@@ -1134,7 +1066,7 @@ function makeOperator(o: OperatorDeps): Operator {
             };
       await store.appendFact(runId, fact);
     }
-    await advance(deps, runId);
+    await dispatcher.advance(runId);
   }
 
   async function abort(runId: RunId, opts: OperatorAuditOpts): Promise<void> {
@@ -1172,8 +1104,7 @@ function synthesizeReplayFlow(dag: CanonicalDag, liveFlow: Flow): Flow {
   const liveSteps = asStepMapWithDefs(liveFlow.steps);
   const synthesized: Record<string, ReturnType<typeof attachDef>> = {};
 
-  // Phase 1: a shell per canonical step, seeded with its live def. needs still
-  // point at the live upstream identities; phase 2 rewires them to the shells.
+  // Phase 1: a shell per canonical step; phase 2 rewires needs to the shells.
   for (const canonStep of dag.steps) {
     const liveStep = liveSteps[canonStep.id];
     if (liveStep === undefined) {

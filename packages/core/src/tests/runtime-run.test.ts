@@ -26,8 +26,6 @@ function captureOnLog(): {
   };
 }
 
-// A queue whose dequeue always throws — the one path that rejects worker.run()
-// (per-message errors are swallowed by the worker). Models a lost DB connection.
 class CrashingQueue extends InMemoryQueue {
   override async dequeue(
     _opts: QueueDequeueOpts,
@@ -102,12 +100,12 @@ describe("nagi.run — stop() lifecycle", () => {
       stopResolved = true;
     });
     await new Promise((r) => setTimeout(r, 30));
-    expect(stopResolved).toBe(false); // parked on the in-flight handler
+    expect(stopResolved).toBe(false);
     expect(finished).toBe(false);
 
     release();
     await stopP;
-    expect(finished).toBe(true); // handler ran to completion before stop resolved
+    expect(finished).toBe(true);
   });
 
   it("stop() is idempotent — twice and concurrently — and never throws", async () => {
@@ -119,7 +117,7 @@ describe("nagi.run — stop() lifecycle", () => {
     });
     const a = handle.stop();
     const b = handle.stop();
-    expect(a).toBe(b); // memoized: one shutdown, shared promise
+    expect(a).toBe(b);
     await expect(Promise.all([a, b, handle.stop()])).resolves.toBeDefined();
   });
 });

@@ -40,8 +40,7 @@ interface QueueConfig {
 }
 
 export function pgmqQueue<DB = unknown>(opts: PgmqQueueOpts<DB>): PgmqQueue {
-  // Single internal erasure: callers keep their concrete Kysely<DB> (no cast at
-  // the callsite); the queue body is schema-agnostic, so widen once here.
+  // Single internal erasure: the queue body is schema-agnostic, so widen once.
   const db = opts.db as unknown as Kysely<unknown>;
   const queueName = opts.queueName ?? DEFAULT_QUEUE_NAME;
   const vtSeconds = Math.max(

@@ -44,13 +44,11 @@ describe("pgmqQueue type surface", () => {
   });
 
   it("pgmqQueue<DB> accepts a typed Kysely<DB> with no cast and infers DB", () => {
-    // Before RFC 0013 this callsite required `db as unknown as Kysely<unknown>`.
     expectTypeOf(pgmqQueue({ db: typedDb })).toEqualTypeOf<PgmqQueue>();
     expectTypeOf(pgmqQueue({ db: typedDb })).toMatchTypeOf<Queue>();
     expectTypeOf<PgmqQueueOpts<SampleDb>["db"]>().toEqualTypeOf<
       Kysely<SampleDb>
     >();
-    // The default type parameter keeps the bare form resolving to Kysely<unknown>.
     expectTypeOf<PgmqQueueOpts["db"]>().toEqualTypeOf<Kysely<unknown>>();
   });
 });

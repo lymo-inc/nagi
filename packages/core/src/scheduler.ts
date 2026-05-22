@@ -197,11 +197,6 @@ export interface MatchPromotion {
     | { readonly kind: "fail"; readonly error: SerializedError };
 }
 
-/**
- * One tick of the engine state machine. `nextTransition` returns the single
- * highest-priority action for the current run state; `advance` performs the
- * side effects and loops to re-derive. See docs/rfcs/0011.
- */
 export type Transition =
   | {
       readonly kind: "promote-match";

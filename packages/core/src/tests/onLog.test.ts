@@ -6,9 +6,6 @@ import { stepStateOf, stepStatusOf } from "../state";
 import type { LogEntry, QueueDequeueOpts, QueueMessage, RunId } from "../types";
 import { makeHarness, passthroughSchema, spyOnLog } from "./test-helpers";
 
-// A queue whose dequeue always throws — the one path that rejects worker.run()
-// (per-message errors are swallowed). Ported from runtime-run.test.ts; models a
-// lost DB connection so we can exercise the "worker exited unexpectedly" site.
 class CrashingQueue extends InMemoryQueue {
   override async dequeue(
     _opts: QueueDequeueOpts,
@@ -25,17 +22,12 @@ const echo = flow({
   }),
 });
 
-// ---------------------------------------------------------------------------
-// Record shape & level routing (anchored to the real diagnostic sites)
-// ---------------------------------------------------------------------------
-
 describe("onLog — record shape & level routing", () => {
   it("cancel-skipped: one info entry with the exact msg and attrs", async () => {
     const { onLog, entries } = spyOnLog();
     const h = await makeHarness(echo, { onLog });
     const runId = await h.wf.start(echo, { x: 1 });
     await h.drain();
-    // Run is completed (terminal); cancelling now hits the skip path.
     await h.wf.cancel(runId, { reason: "after-terminal" });
 
     const skipped = entries.filter(
@@ -99,7 +91,6 @@ describe("onLog — record shape & level routing", () => {
     const { onLog, entries } = spyOnLog();
     const h = await makeHarness(echo, { onLog });
     const runId = await h.wf.start(echo, { x: 1 });
-    // Enqueue a message for a step id that does not exist in the flow.
     await h.queue.enqueue(runId, "ghost-step");
     await h.drain();
 
@@ -126,7 +117,6 @@ describe("onLog — record shape & level routing", () => {
       await h.waitForStep(runId, "wait", "running");
       await h.wf.signal(runId, "wait", { ok: true });
       await h.waitForEnd(runId);
-      // Second signal arrives after the step has resolved → the noop diagnostic.
       await h.wf.signal(runId, "wait", { ok: false });
 
       const late = entries.filter(
@@ -157,7 +147,6 @@ describe("onLog — record shape & level routing", () => {
     const h = await makeHarness(f, { onLog });
     const runId = await h.wf.start(f, {});
     await h.drain();
-    // Step "a" is already completed; skipping it is a noop.
     await h.wf.operator().skip(runId, "a", { actor: "tester" });
 
     const noop = entries.filter(
@@ -193,16 +182,13 @@ describe("onLog — record shape & level routing", () => {
     const h = await makeHarness([parent, child], { onLog });
     const parentRunId = await h.wf.start(parent, {});
     await h.drain();
-    // The subflow step is now running and the child is waiting on its signal.
     const childRunId = (await h.store.listChildren(parentRunId))[0] as RunId;
     expect(childRunId).toBeDefined();
     expect(
       stepStatusOf(stepStateOf(await h.store.loadRunState(parentRunId), "sub")),
     ).toBe("running");
 
-    // Cancel the PARENT while the child is still in flight.
     await h.wf.cancel(parentRunId, { reason: "kill-parent" });
-    // Now resolve the child's signal so it completes and tries to wake the parent.
     await h.wf.signal(childRunId, "gate", { ok: true });
     await h.drain();
 
@@ -231,9 +217,6 @@ describe("onLog — record shape & level routing", () => {
       }),
       output: (steps) => steps.gate,
     });
-    // Two independent steps: skipping `sub` leaves the run alive because the
-    // `keepalive` signal step is still running — so the child wake sees the run
-    // live but the parent step no longer "running".
     const parent = flow({
       id: "wake2-parent",
       input: passthroughSchema<Record<string, never>>(),
@@ -247,15 +230,11 @@ describe("onLog — record shape & level routing", () => {
     await h.drain();
     const childRunId = (await h.store.listChildren(parentRunId))[0] as RunId;
 
-    // Skip the subflow step: it becomes "skipped" (not running), but the run
-    // stays live because `keepalive` is still waiting on its signal.
     await h.wf.operator().skip(parentRunId, "sub", { actor: "tester" });
     const parentState = await h.store.loadRunState(parentRunId);
     expect(parentState.phase.tag).toBe("running");
     expect(stepStatusOf(stepStateOf(parentState, "sub"))).toBe("skipped");
 
-    // Drive the child to completion via its own signal, then let it try to wake
-    // the parent — whose `sub` step is no longer running.
     await h.wf.signal(childRunId, "gate", { ok: true });
     await h.drain();
 
@@ -274,15 +253,9 @@ describe("onLog — record shape & level routing", () => {
     });
   });
 
-  // worker.dispatch threw uncaught (site #9): driven via a run that references an
-  // unregistered flow id, so dispatchMessage's flowFor() throws *before* the
-  // internal try/catch — surfacing through the worker's dispatchSafely catch as
-  // the worker-level "threw uncaught" error.
   it("worker.dispatch threw uncaught: error entry when dispatch throws before its catch", async () => {
     const { onLog, entries } = spyOnLog();
     const h = await makeHarness(echo, { onLog });
-    // Seed a flow.started fact for an unregistered flow on a fresh run id, then
-    // enqueue a step against it. flowFor() will fail to resolve "not-registered".
     const ghostRunId = "run-ghost-unregistered" as RunId;
     await h.store.appendFact(ghostRunId, {
       kind: "flow.started",
@@ -293,9 +266,6 @@ describe("onLog — record shape & level routing", () => {
     });
     await h.queue.enqueue(ghostRunId, "whatever");
 
-    // runOnce({ maxSteps: 1 }) routes a single message through dispatchSafely
-    // (the worker-level catch) and returns — so the throw surfaces exactly once
-    // without the polling loop re-nacking and re-dispatching it forever.
     const result = await h.wf.worker().runOnce({ maxSteps: 1 });
     expect(result.processed).toBe(1);
 
@@ -310,10 +280,6 @@ describe("onLog — record shape & level routing", () => {
     });
   });
 });
-
-// ---------------------------------------------------------------------------
-// attrs contract (passthrough / D4 undefined / conditional stack)
-// ---------------------------------------------------------------------------
 
 describe("onLog — attrs contract", () => {
   it("passthrough: a diagnostic that carries attrs delivers them", async () => {
@@ -376,7 +342,6 @@ describe("onLog — attrs contract", () => {
         only: b.task({
           run: async () => ({ ok: true }),
           onComplete: () => {
-            // Throw a non-Error value: serializeError yields no `stack` key.
             throw "just a string";
           },
         }),
@@ -394,10 +359,6 @@ describe("onLog — attrs contract", () => {
     expect("stack" in (entry.attrs as object)).toBe(false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Silent by default (D3) — the consoleLogger-removal regression suite
-// ---------------------------------------------------------------------------
 
 describe("onLog — silent by default (D3)", () => {
   function spyConsole() {
@@ -422,26 +383,25 @@ describe("onLog — silent by default (D3)", () => {
   });
 
   it("a diagnostic path with no onLog does not throw", async () => {
-    const h = await makeHarness(echo); // no onLog
+    const h = await makeHarness(echo);
     const runId = await h.wf.start(echo, { x: 1 });
     await h.drain();
-    // cancel-skipped diagnostic path — must be a silent no-op, never throwing.
     await expect(h.wf.cancel(runId, { reason: "x" })).resolves.toBeUndefined();
   });
 
   it("no onLog: a diagnostic never touches console.*", async () => {
     const console = spyConsole();
-    const h = await makeHarness(echo); // no onLog
+    const h = await makeHarness(echo);
     const runId = await h.wf.start(echo, { x: 1 });
     await h.drain();
-    await h.wf.cancel(runId, { reason: "x" }); // cancel-skipped path
-    await h.queue.enqueue(runId, "ghost"); // not-in-flow warn path
+    await h.wf.cancel(runId, { reason: "x" });
+    await h.queue.enqueue(runId, "ghost");
     await h.drain();
     console.assertSilent();
   });
 
   it("no onLog: a normal run still completes", async () => {
-    const h = await makeHarness(echo); // no onLog
+    const h = await makeHarness(echo);
     const runId = await h.wf.start(echo, { x: 42 });
     await h.drain();
     const result = await h.result(runId);
@@ -457,8 +417,6 @@ describe("onLog — silent by default (D3)", () => {
       build: (b) => ({
         a: b.task({
           run: async ({ ctx }) => {
-            // This is the regression the consoleLogger removal fixes: with no
-            // onLog this used to write to console.* — it must now be silent.
             ctx.logger.info("inside handler", { detail: 1 });
             ctx.logger.error("also error", { detail: 2 });
             return { ok: true };
@@ -466,17 +424,13 @@ describe("onLog — silent by default (D3)", () => {
         }),
       }),
     });
-    const h = await makeHarness(f); // no onLog
+    const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
     await h.drain();
     expect((await h.result(runId)).status).toBe("completed");
     console.assertSilent();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Single channel — onLog is the only sink (no hidden console writes)
-// ---------------------------------------------------------------------------
 
 describe("onLog — single channel", () => {
   afterEach(() => {
@@ -498,7 +452,7 @@ describe("onLog — single channel", () => {
     await h.queue.enqueue(runId, "ghost");
     await h.drain();
 
-    expect(entries.length).toBeGreaterThan(0); // sink received them
+    expect(entries.length).toBeGreaterThan(0);
     expect(debug).not.toHaveBeenCalled();
     expect(info).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
@@ -532,10 +486,6 @@ describe("onLog — single channel", () => {
     expect(error).not.toHaveBeenCalled();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Exactly-once / ordering
-// ---------------------------------------------------------------------------
 
 describe("onLog — exactly-once & ordering", () => {
   it("one diagnostic ⇒ onLog called exactly once", async () => {
@@ -575,7 +525,6 @@ describe("onLog — exactly-once & ordering", () => {
     await vi.waitFor(() =>
       expect(entries.filter((e) => e.level === "error")).toHaveLength(1),
     );
-    // Give the loop a couple more poll cycles to prove it stays at exactly one.
     await new Promise((r) => setTimeout(r, 30));
     expect(entries.filter((e) => e.level === "error")).toHaveLength(1);
     await handle.stop();
@@ -586,7 +535,6 @@ describe("onLog — exactly-once & ordering", () => {
     const h = await makeHarness(echo, { onLog });
     const runId = await h.wf.start(echo, { x: 1 });
     await h.drain();
-    // 1) not-in-flow warn, then 2) cancel-skipped info.
     await h.queue.enqueue(runId, "ghost");
     await h.drain();
     await h.wf.cancel(runId, { reason: "x" });
@@ -597,10 +545,6 @@ describe("onLog — exactly-once & ordering", () => {
     expect(ordered.map((e) => e.level)).toEqual(["warn", "info"]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Throw isolation (O4) — a throwing sink cannot corrupt the engine
-// ---------------------------------------------------------------------------
 
 describe("onLog — throw isolation (O4)", () => {
   it("an always-throwing onLog still lets the run reach completion", async () => {
@@ -613,7 +557,7 @@ describe("onLog — throw isolation (O4)", () => {
       build: (b) => ({
         a: b.task({
           run: async ({ ctx }) => {
-            ctx.logger.info("emit one"); // forces the sink to throw mid-step
+            ctx.logger.info("emit one");
             return { ok: true };
           },
         }),
@@ -654,7 +598,6 @@ describe("onLog — throw isolation (O4)", () => {
   it("a throw on one emission does not stop a later emission from being attempted", async () => {
     let calls = 0;
     const seen: string[] = [];
-    // Throws on the first emission, records every subsequent one.
     const onLog = (entry: LogEntry) => {
       calls++;
       if (calls === 1) throw new Error("first emission boom");
@@ -680,15 +623,10 @@ describe("onLog — throw isolation (O4)", () => {
 
     expect((await h.result(runId)).status).toBe("completed");
     expect(calls).toBeGreaterThanOrEqual(3);
-    // The throw on call #1 did not suppress later emissions.
     expect(seen).toContain("second");
     expect(seen).toContain("third");
   });
 });
-
-// ---------------------------------------------------------------------------
-// In-step ctx.logger (O1 method shape + O2 enrichment)
-// ---------------------------------------------------------------------------
 
 describe("ctx.logger — in-step surface (O1 + O2)", () => {
   it("merges caller attrs AND runId/stepId/attempt into one info entry", async () => {
@@ -828,7 +766,7 @@ describe("ctx.logger — in-step surface (O1 + O2)", () => {
           }),
         }),
       });
-      const h = await makeHarness(f); // no onLog
+      const h = await makeHarness(f);
       const runId = await h.wf.start(f, {});
       await h.drain();
       expect((await h.result(runId)).status).toBe("completed");

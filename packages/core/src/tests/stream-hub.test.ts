@@ -5,7 +5,6 @@ import type { AttemptNumber, Json, RunId, StepId, StreamEvent } from "../types";
 const RUN = "run-1" as RunId;
 const STEP = "gen" as StepId;
 
-/** Drain an async iterable to completion into an array. */
 async function collect(
   iter: AsyncIterable<StreamEvent<Json>>,
 ): Promise<StreamEvent<Json>[]> {
@@ -14,7 +13,6 @@ async function collect(
   return out;
 }
 
-/** Yield to the microtask queue so fan-out push/close propagates. */
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
 describe("InMemoryStreamHub — happy path & ordering", () => {
@@ -94,8 +92,6 @@ describe("InMemoryStreamHub — backpressure / overflow (O3)", () => {
     const hub = new InMemoryStreamHub();
     const iter = hub.subscribeStream(RUN, STEP)[Symbol.asyncIterator]();
 
-    // Fill exactly to cap (no drops yet), then overflow by N — each overflow
-    // drops the oldest chunk and increments the dropped counter.
     const overflow = 3;
     const total = STREAM_SUBSCRIBER_BUFFER_CAP + overflow;
     for (let i = 0; i < total; i++) hub.publishChunk(RUN, STEP, i);
@@ -108,12 +104,9 @@ describe("InMemoryStreamHub — backpressure / overflow (O3)", () => {
       events.push(r.value);
     }
 
-    // The dropped marker is delivered first (before the surviving chunks).
     const first = events[0];
     expect(first).toEqual({ kind: "dropped", count: overflow });
 
-    // Remaining are exactly the surviving chunks (oldest `overflow` dropped),
-    // in FIFO order: indices [overflow .. total-1].
     const chunks = events.slice(1);
     expect(chunks).toHaveLength(STREAM_SUBSCRIBER_BUFFER_CAP);
     expect(chunks[0]).toEqual({ kind: "chunk", chunk: overflow });
@@ -130,7 +123,6 @@ describe("InMemoryStreamHub — termination & control events (D3/O4/O5)", () => 
     const got = collect(hub.subscribeStream(RUN, STEP));
     hub.publishChunk(RUN, STEP, "x");
     hub.closeOk(RUN, STEP);
-    // No `error` event on a clean close.
     expect(await got).toEqual([{ kind: "chunk", chunk: "x" }]);
   });
 
@@ -170,7 +162,6 @@ describe("InMemoryStreamHub — subscribe after close (D3)", () => {
     hub.closeOk(RUN, STEP);
 
     expect(await collect(hub.subscribeStream(RUN, STEP))).toEqual([]);
-    // replayBuffered after close is also empty (buffer dropped on close).
     expect(
       await collect(hub.subscribeStream(RUN, STEP, { replayBuffered: true })),
     ).toEqual([]);
@@ -191,7 +182,6 @@ describe("InMemoryStreamHub — early break cleanup", () => {
     const iter = hub.subscribeStream(RUN, STEP);
     const collected: Json[] = [];
 
-    // Consume exactly one event then break — this triggers iterator.return().
     const loop = (async () => {
       for await (const ev of iter) {
         if (ev.kind === "chunk") collected.push(ev.chunk);
@@ -202,7 +192,6 @@ describe("InMemoryStreamHub — early break cleanup", () => {
     await loop;
     expect(collected).toEqual(["first"]);
 
-    // The subscriber was removed on break: further activity is a safe no-op.
     expect(() => hub.publishChunk(RUN, STEP, "second")).not.toThrow();
     expect(() => hub.signalRetry(RUN, STEP, 2 as AttemptNumber)).not.toThrow();
     expect(() => hub.closeOk(RUN, STEP)).not.toThrow();
@@ -210,18 +199,10 @@ describe("InMemoryStreamHub — early break cleanup", () => {
 });
 
 describe("InMemoryStreamHub — close*/closeRun never create a channel (leak-free)", () => {
-  // RFC 0019 Phase C: appendFact fires closeOk/closeError/closeRun for EVERY
-  // step/run, streaming or not. If those created a channel per non-streaming
-  // step, the hub would leak one channel per step in the system. They must be
-  // pure no-ops when no channel exists; closed-ness is authoritative in the
-  // durable facts (asserted at the store level), not the hub.
   it("closeOk on a never-published channel does not create one (subscribe stays live)", async () => {
     const hub = new InMemoryStreamHub();
-    hub.closeOk(RUN, STEP); // no channel exists → no-op, nothing created
+    hub.closeOk(RUN, STEP);
 
-    // Because no channel was created+closed, a subsequent subscribe is a fresh,
-    // OPEN channel that delivers live chunks (the store's fact guard, not the
-    // hub, is what makes subscribe-after-terminal empty).
     const got = collect(hub.subscribeStream(RUN, STEP));
     await tick();
     hub.publishChunk(RUN, STEP, "live");
@@ -248,7 +229,6 @@ describe("InMemoryStreamHub — close*/closeRun never create a channel (leak-fre
 
     hub.closeRun(RUN);
 
-    // Both channels drained and ended; no error event injected by closeRun.
     expect(await onA).toEqual([{ kind: "chunk", chunk: "a1" }]);
     expect(await onB).toEqual([{ kind: "chunk", chunk: "b1" }]);
   });
@@ -260,7 +240,7 @@ describe("InMemoryStreamHub — close*/closeRun never create a channel (leak-fre
     const onY = collect(hub.subscribeStream(runY, STEP));
 
     hub.publishChunk(runY, STEP, "y1");
-    hub.closeRun(runX); // unrelated run — must not close runY's channel
+    hub.closeRun(runX);
     hub.publishChunk(runY, STEP, "y2");
     hub.closeOk(runY, STEP);
 

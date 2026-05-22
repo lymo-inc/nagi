@@ -467,7 +467,6 @@ describe("@nagi-js/core — flow concurrency shorthands", () => {
   });
 
   it("bare-string shorthand defaults mode to cancel-in-progress", async () => {
-    // No `mode` is specified anywhere — cancellation must still occur.
     const f = makeBareStringVideoFlow();
     const h = await makeHarness(f);
 
@@ -554,7 +553,6 @@ describe("@nagi-js/core — flow concurrency shorthands", () => {
   });
 
   it("existing keyFn+mode object form is unchanged", async () => {
-    // Regression guard: mode explicitly present, behaves as before.
     const f = makeVideoFlow();
     const h = await makeHarness(f);
 

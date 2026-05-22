@@ -34,7 +34,6 @@ declare const builderU: Builder<unknown>;
 declare const factEx: Fact;
 declare const wfEx: Wf;
 
-// Stubs to construct `nagi(...)` in type-level tests — bodies never run.
 declare const store: Store;
 declare const queue: Queue;
 

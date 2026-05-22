@@ -237,9 +237,6 @@ describe("start: caller-supplied runId", () => {
 });
 
 describe("startById: registry-aware dispatch", () => {
-  // Schema that actually rejects bad input — passthroughSchema accepts
-  // anything, which would let an invalid payload sneak through and mask
-  // the validation behavior we want to assert on.
   const strictNumberXSchema: StandardSchemaV1<{ x: number }, { x: number }> = {
     "~standard": {
       version: 1,

@@ -313,8 +313,6 @@ describe("wf.queryRuns — no runtime delta after RFC 0018 typing", () => {
     expect(Object.keys(r).sort()).toEqual(["cursor", "runs"]);
     expect(Array.isArray(r.runs)).toBe(true);
     expect(r.runs).toHaveLength(2);
-    // The literal type narrows at compile time; the runtime value is the
-    // plain registered id string — unchanged from before.
     expect(r.runs.map((x) => x.flowId).sort()).toEqual(["a", "b"]);
     expect(r.cursor === null || typeof r.cursor === "string").toBe(true);
   });

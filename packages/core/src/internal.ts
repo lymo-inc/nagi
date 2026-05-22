@@ -17,20 +17,8 @@ import type {
   StreamingStepCtx,
 } from "./types";
 
-/**
- * Internal emit choke point. Built once from {@link NagiConfig.onLog} and
- * threaded everywhere a diagnostic is produced. Always a callable (a no-op when
- * `onLog` is absent), so call sites never branch on its presence. Kept out of
- * the public API surface (not re-exported from `index.ts`).
- */
 export type EmitLog = (entry: LogEntry) => void;
 
-/**
- * Wrap the host's `onLog` into the {@link EmitLog} choke point. When `onLog` is
- * absent the result is a no-op and no {@link LogEntry} is constructed upstream
- * (D3: silent by default). A throwing sink is swallowed so logging can never
- * fail a workflow step (D5).
- */
 export function makeEmit(onLog?: (entry: LogEntry) => void): EmitLog {
   if (!onLog) return () => {};
   return (entry) => {
@@ -42,12 +30,6 @@ export function makeEmit(onLog?: (entry: LogEntry) => void): EmitLog {
   };
 }
 
-/**
- * Drop keys whose value is `undefined`, turning a `{ x: T | undefined }` bag
- * into `{ x?: T }`. The single home for the `exactOptionalPropertyTypes`
- * bridge, replacing per-field `...(x !== undefined ? { x } : {})` spreads. Pass
- * only optional fields; keep required fields as explicit literal properties.
- */
 export type Compacted<T> = { [K in keyof T]?: Exclude<T[K], undefined> };
 
 export function compact<T extends object>(obj: T): Compacted<T> {
@@ -137,12 +119,6 @@ export interface MatchDef {
   readonly parentMatch?: ParentMatchRef;
 }
 
-/**
- * Builder-only, pre-walk shape of a match. `match()` produces this with each
- * arm's un-walked nested step map; `walkAndRewrite` collapses it into the
- * finalized {@link MatchDef} (arms gain `stepIds`, lose `nested`). The runtime
- * never sees this type.
- */
 export interface PendingMatchArm {
   readonly id: string;
   readonly when?: (args: {
@@ -183,6 +159,8 @@ export type StepDef =
   | MatchDef
   | SubflowDef;
 
+export type HandlerDef = TaskDef | StreamingTaskDef;
+
 export const DEF = Symbol("nagi.def");
 
 export type StepWithDef<Output = unknown> = Step<Output> & {
@@ -200,21 +178,13 @@ export function setDef(step: StepWithDef, def: StepDef): void {
   (step as { [DEF]: StepDef })[DEF] = def;
 }
 
-/**
- * Read a step's def in the runtime/projection phase, where {@link walkAndRewrite}
- * has already finalized every match into a {@link MatchDef}. The stored slot is
- * widened to admit the builder-only {@link PendingMatchDef}; narrowing it back to
- * {@link StepDef} here is the single phase boundary, so runtime callers never
- * have to consider the pending shape.
- */
+// Runtime/projection-phase read: walkAndRewrite has finalized every match into a
+// MatchDef, so narrowing the widened slot back to StepDef here is sound.
 export function getDef(step: StepWithDef): StepDef {
   return step[DEF] as StepDef;
 }
 
-/**
- * Read a step's def during the builder phase, where a match still carries its
- * pre-walk {@link PendingMatchDef}. Runtime code should use {@link getDef}.
- */
+// Builder-phase read: a match may still carry its pre-walk PendingMatchDef.
 export function peekDef(
   step: Step<unknown>,
 ): StepDef | PendingMatchDef | undefined {
@@ -223,6 +193,10 @@ export function peekDef(
 
 export function isStepKind(def: StepDef, kind: StepDef["kind"]): boolean {
   return def.kind === kind;
+}
+
+export function handlerDef(def: StepDef): HandlerDef | undefined {
+  return def.kind === "task" || def.kind === "streaming" ? def : undefined;
 }
 
 export function needsKeys(def: StepDef): readonly string[] {

@@ -19,22 +19,14 @@ import type {
   StepStatus,
 } from "./types";
 
-/* ───────────────────────── shared sums ───────────────────────── */
-
-/** Why a step ended up `skipped`. `manual` is operator-driven; the other two
- * are scheduler decisions (a false `when`, or an upstream that didn't run). */
 export type SkipReason = "when-false" | "transitive" | "manual";
 
-/** How a skip propagates: `skip` blocks downstream too; `continue` lets it run
- * with the upstream resolved as {@link Resolved} `skipped`. */
 export type Cascade = "skip" | "continue";
 
-/** Why a single step is `canceled`. */
 export type StepCancelCause =
   | { readonly kind: "run-canceled" }
   | { readonly kind: "aborted"; readonly error?: SerializedError };
 
-/** Why a whole run is `canceled` — mirrors the three `flow.canceled` facts. */
 export type RunCancelCause =
   | {
       readonly kind: "concurrency";
@@ -53,16 +45,6 @@ export type RunCancelCause =
       readonly note?: string;
     };
 
-/* ─────────────────────── step state machine ─────────────────────── */
-
-/**
- * The per-step state machine. Each tag carries exactly — and only — the data
- * valid in that state, so `output` is unreachable unless `completed`, `error`
- * unreachable unless `failed`/`backoff`, and an `attempt` exists only once a
- * step has actually started. The five "active" tags split what the old flat
- * `status: "running"` overloaded into one string (executing vs parked-on-signal
- * vs awaiting-child vs retry-backoff vs settling-an-abort).
- */
 export type StepState =
   | { readonly tag: "pending" }
   | { readonly tag: "running"; readonly attempt: AttemptNumber }
@@ -92,21 +74,10 @@ export type StepState =
     }
   | { readonly tag: "canceled"; readonly cause: StepCancelCause };
 
-/* ─────────────────────── needs resolution ─────────────────────── */
-
-/**
- * The value a downstream step sees for one upstream dependency. `skipped` is now
- * structurally distinct from a genuine `null` output (`{ tag: "value", value:
- * null }`), removing the old `Json | null` sentinel ambiguity.
- */
 export type Resolved<T = Json> =
   | { readonly tag: "value"; readonly value: T }
   | { readonly tag: "skipped" };
 
-/* ─────────────────────── run state machine ─────────────────────── */
-
-/** The run-level machine. Terminal data (output/error/cancel-cause) lives here
- * instead of being re-scanned out of the fact log. */
 export type RunPhase =
   | { readonly tag: "pending" }
   | { readonly tag: "running" }
@@ -114,9 +85,6 @@ export type RunPhase =
   | { readonly tag: "failed"; readonly error: SerializedError }
   | { readonly tag: "canceled"; readonly cause: RunCancelCause };
 
-/** Recorded when a fact arrives that cannot apply to the current state (e.g. a
- * `step.skipped` on a `running` step). The fold never throws — it keeps the
- * prior state and appends one of these so drift is observable. */
 export interface Anomaly {
   readonly at: Date;
   readonly stepId?: StepId;
@@ -129,32 +97,24 @@ export interface RunState {
   readonly flowId: string;
   readonly phase: RunPhase;
   readonly steps: Readonly<Record<StepId, StepState>>;
-  /** Arm chosen per `match` step. Replaces scanning facts for `match.arm-selected`. */
   readonly selectedArms: Readonly<Record<StepId, string>>;
   readonly anomalies: readonly Anomaly[];
   readonly facts: readonly Fact[];
-  /** Set when this run is a subflow child; carried from `flow.started`. */
   readonly parent?: ParentLink;
   readonly flowHash?: string;
   readonly codeVersion?: string;
 }
 
-/* ─────────────────────── projections / bridges ─────────────────────── */
-
 const PENDING: StepState = { tag: "pending" };
 
-/** Total read of a step's state: an untouched step reads as `pending`. */
 export function stepStateOf(runState: RunState, stepId: StepId): StepState {
   return runState.steps[stepId] ?? PENDING;
 }
 
-/** Flat status string for boundary DTOs (RunSummary, query filters). */
 export function runStatusOf(state: RunState): RunStatus {
   return state.phase.tag;
 }
 
-/** Flat status string for boundary DTOs. The five active tags collapse to
- * `"running"`, matching the legacy six-value `StepStatus`. */
 export function stepStatusOf(s: StepState): StepStatus {
   switch (s.tag) {
     case "pending":
@@ -176,20 +136,16 @@ export function stepStatusOf(s: StepState): StepStatus {
   }
 }
 
-/** The step's output if it completed, else `null`. */
 export function outputOf(s: StepState): Json | null {
   return s.tag === "completed" ? s.output : null;
 }
 
-/** The error associated with a step, if any: a `failed`/`backoff` error, or an
- * aborted `canceled` step's error. `undefined` for every other state. */
 export function errorOf(s: StepState): SerializedError | undefined {
   if (s.tag === "failed" || s.tag === "backoff") return s.error;
   if (s.tag === "canceled" && s.cause.kind === "aborted") return s.cause.error;
   return undefined;
 }
 
-/** The current/last attempt number, or `0` for states that never started. */
 export function attemptOf(s: StepState): AttemptNumber {
   switch (s.tag) {
     case "running":
@@ -208,17 +164,14 @@ export function attemptOf(s: StepState): AttemptNumber {
   }
 }
 
-/** Resolve a step as an upstream dependency value. Only meaningful for terminal
- * upstreams (the scheduler resolves needs only once they are settled). */
+// Only meaningful for terminal upstreams; a non-terminal step resolves to a
+// null value (the scheduler resolves needs only once they are settled).
 export function resolvedOf(s: StepState): Resolved {
   if (s.tag === "completed") return { tag: "value", value: s.output };
   if (s.tag === "skipped") return { tag: "skipped" };
   return { tag: "value", value: null };
 }
 
-/** Extract a resolved upstream's value, throwing if it was skipped. Use when a
- * handler requires the upstream to have produced a value; guard on
- * `r.tag === "skipped"` directly when a `cascade: "continue"` skip is expected. */
 export function unwrap<T>(r: Resolved<T>): T {
   if (r.tag === "skipped") {
     throw new Error("nagi: upstream was skipped — its value is unavailable");
@@ -230,8 +183,6 @@ export function isTerminalRun(state: RunState): boolean {
   return state.phase.tag !== "pending" && state.phase.tag !== "running";
 }
 
-/** A step that will never transition again on its own: completed/failed/
- * skipped/canceled. `pending` and the five active tags are NOT terminal. */
 export function isStepTerminal(s: StepState): boolean {
   return (
     s.tag === "completed" ||
@@ -240,8 +191,6 @@ export function isStepTerminal(s: StepState): boolean {
     s.tag === "canceled"
   );
 }
-
-/* ─────────────────────────── the fold ─────────────────────────── */
 
 type StepScopedFact =
   | StepStartedFact
@@ -274,10 +223,8 @@ function startTarget(stepKind: StepKind, attempt: AttemptNumber): StepState {
   }
 }
 
-/**
- * The single (state × fact) → state transition for one step. Total: any pair
- * that isn't a real transition keeps the prior state and is flagged anomalous.
- */
+// Total: any pair that isn't a real transition keeps the prior state and is
+// flagged anomalous, so the fold never throws.
 function stepTransition(prev: StepState, fact: StepScopedFact): StepTransition {
   switch (fact.kind) {
     case "step.started":
@@ -289,9 +236,7 @@ function stepTransition(prev: StepState, fact: StepScopedFact): StepTransition {
       return keep(prev);
 
     // Terminal facts carry authoritative outcomes, so they settle a step from
-    // ANY non-terminal state (a `completed`/`failed`/`canceled` arriving without
-    // a recorded start still happened). Only a terminal→terminal contradiction
-    // is rejected and flagged.
+    // any non-terminal state; only a terminal→terminal contradiction is flagged.
     case "step.completed":
       if (isStepTerminal(prev)) return keep(prev);
       return {
@@ -332,9 +277,8 @@ function stepTransition(prev: StepState, fact: StepScopedFact): StepTransition {
       return keep(prev);
 
     case "step.skipped":
-      // Scheduler skips only pending steps, but an operator may skip an
-      // in-flight step (running/awaiting/backoff/aborting). Only a skip of an
-      // already-terminal step is anomalous.
+      // An operator may skip an in-flight step, not just a pending one; only a
+      // skip of an already-terminal step is anomalous.
       if (!isStepTerminal(prev))
         return {
           next: {
@@ -384,11 +328,6 @@ function runCancelCause(fact: FlowCanceledFact): RunCancelCause {
   }
 }
 
-/**
- * Fold the append-only fact log into the projected {@link RunState}. Pure in the
- * facts alone — `step.started` carries its `stepKind`, so the projection needs
- * no flow definition to tell a parked signal from a running task.
- */
 export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
   let flowId = "";
   let phase: RunPhase = { tag: "pending" };

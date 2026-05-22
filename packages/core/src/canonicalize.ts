@@ -102,9 +102,8 @@ async function canonicalizeStep(
 ): Promise<CanonicalStep> {
   const needs = [...needsStepIds(def)].sort();
   const base: CanonicalStep = { id, kind: def.kind, needs };
-  // A streaming step is a task for hashing/replay purposes (RFC 0019 D8): chunks
-  // are ephemeral and never affect the flow hash, so only its task-shaped fields
-  // (when/retry/timeoutMs) are canonicalized.
+  // A streaming step hashes as a task: chunks are ephemeral and never affect the
+  // flow hash, so only its task-shaped fields are canonicalized.
   if (def.kind === "task" || def.kind === "streaming")
     return canonicalizeTask(base, def);
   if (def.kind === "signal") return canonicalizeSignal(base, def);
