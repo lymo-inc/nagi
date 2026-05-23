@@ -98,6 +98,9 @@ export interface RunState {
   readonly phase: RunPhase;
   readonly steps: Readonly<Record<StepId, StepState>>;
   readonly selectedArms: Readonly<Record<StepId, string>>;
+  readonly bufferedSignals: Readonly<
+    Record<StepId, { readonly payload: Json; readonly signalName?: string }>
+  >;
   readonly anomalies: readonly Anomaly[];
   readonly facts: readonly Fact[];
   readonly parent?: ParentLink;
@@ -181,6 +184,15 @@ export function unwrap<T>(r: Resolved<T>): T {
 
 export function isTerminalRun(state: RunState): boolean {
   return state.phase.tag !== "pending" && state.phase.tag !== "running";
+}
+
+export function extractInput(runState: RunState): Json {
+  for (const fact of runState.facts) {
+    if (fact.kind === "flow.started") return fact.input;
+  }
+  throw new Error(
+    "No flow.started fact in run — was the run initialized via wf.start?",
+  );
 }
 
 export function isStepTerminal(s: StepState): boolean {
@@ -336,6 +348,10 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
   let codeVersion: string | undefined;
   const steps: Record<StepId, StepState> = {};
   const selectedArms: Record<StepId, string> = {};
+  const bufferedSignals: Record<
+    StepId,
+    { readonly payload: Json; readonly signalName?: string }
+  > = {};
   const anomalies: Anomaly[] = [];
 
   for (const fact of facts) {
@@ -383,6 +399,18 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
         steps[fact.stepId] = t.next;
         break;
       }
+      case "signal.buffered":
+        // First buffered signal per step wins, mirroring the happy path where
+        // the first delivered signal completes the step and later ones no-op.
+        if (!(fact.stepId in bufferedSignals)) {
+          bufferedSignals[fact.stepId] = {
+            payload: fact.payload,
+            ...(fact.signalName !== undefined
+              ? { signalName: fact.signalName }
+              : {}),
+          };
+        }
+        break;
       case "signal.sent":
       case "signal.received":
       case "once.recorded":
@@ -396,6 +424,7 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
     phase,
     steps,
     selectedArms,
+    bufferedSignals,
     anomalies,
     facts,
     ...(parent !== undefined ? { parent } : {}),

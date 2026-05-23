@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
+import { NagiValidationError } from "../errors";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
-import { NagiValidationError, nagi } from "../runtime";
+import { nagi } from "../runtime";
 import type { Fact, FlowStartedFact, PrunableStatus, RunId } from "../types";
 import { passthroughSchema } from "./test-helpers";
 

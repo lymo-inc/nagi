@@ -16,6 +16,12 @@ export {
   type SnapshotDiff,
 } from "./diff";
 export {
+  NagiCanceledError,
+  NagiRuntimeError,
+  NagiSnapshotDriftError,
+  NagiValidationError,
+} from "./errors";
+export {
   InMemoryClock,
   InMemoryQueue,
   InMemoryStore,
@@ -23,12 +29,8 @@ export {
   projectRunState,
 } from "./memory";
 export {
-  NagiCanceledError,
   type NagiConfig,
   type NagiRunConfig,
-  NagiRuntimeError,
-  NagiSnapshotDriftError,
-  NagiValidationError,
   nagi,
   type RuntimeHandle,
   type StartOpts,

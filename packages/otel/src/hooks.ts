@@ -108,11 +108,14 @@ export function otelHooks(opts: OtelHooksOpts = {}): FlowHooks {
   function endStepSpanOk(event: StepCompleteEvent, span: Span): void {
     const k = stepKey(event.runId, event.stepId, event.attempt);
     const startedAt = stepStartTimes.get(k);
+    // match/subflow completions carry no durationMs; recompute from the span's
+    // start, and omit the attribute entirely if even that is unavailable.
     const durationMs =
-      event.kind === "match" && startedAt
-        ? event.at.getTime() - startedAt.getTime()
-        : event.durationMs;
-    span.setAttribute("nagi.step.duration_ms", durationMs);
+      event.durationMs ??
+      (startedAt ? event.at.getTime() - startedAt.getTime() : undefined);
+    if (durationMs !== undefined) {
+      span.setAttribute("nagi.step.duration_ms", durationMs);
+    }
     span.end(event.at);
   }
 

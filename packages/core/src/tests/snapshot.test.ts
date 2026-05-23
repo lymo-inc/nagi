@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { canonicalize, sha256Canonical } from "../canonicalize";
+import { NagiSnapshotDriftError } from "../errors";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
-import { NagiSnapshotDriftError, nagi } from "../runtime";
+import { nagi } from "../runtime";
 import type { RunId } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 

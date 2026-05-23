@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { canonicalize, sha256Canonical } from "../canonicalize";
-import { NagiRuntimeError } from "../runtime";
+import { NagiRuntimeError } from "../errors";
 import type { SignalReceivedFact } from "../types";
 import { makeHarness, passthroughSchema, spyOnLog } from "./test-helpers";
 

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
+import { NagiRuntimeError, NagiValidationError } from "../errors";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
-import { NagiRuntimeError, NagiValidationError, nagi } from "../runtime";
+import { nagi } from "../runtime";
 import type {
   FlowErrorEvent,
   FlowStartEvent,

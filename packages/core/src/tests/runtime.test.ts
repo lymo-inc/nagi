@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { NagiRuntimeError, NagiValidationError } from "../runtime";
+import { NagiRuntimeError, NagiValidationError } from "../errors";
 import { unwrap } from "../state";
 import type { RunId, StandardSchemaV1 } from "../types";
 import {

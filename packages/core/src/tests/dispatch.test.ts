@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { computeBackoff } from "../dispatch";
 import { unwrap } from "../state";
+import { computeBackoff } from "../step-exec";
 import type {
   FlowCompleteEvent,
   FlowErrorEvent,

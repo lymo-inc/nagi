@@ -1,0 +1,236 @@
+import { makeIdempotencyKey, makeOnce } from "./idempotency";
+import type { EmitLog } from "./internal";
+import { isTerminalRun } from "./state";
+import type {
+  Clock,
+  Fact,
+  Json,
+  Logger,
+  LogLevel,
+  Millis,
+  RetryPolicy,
+  RunId,
+  RunState,
+  StepCanceledFact,
+  StepCompletedFact,
+  StepCtx,
+  Store,
+  Tx,
+} from "./types";
+
+export const DEFAULT_RETRY: RetryPolicy = {
+  maxAttempts: 3,
+  backoff: "exponential",
+  initialDelayMs: 1_000,
+  maxDelayMs: 60_000,
+};
+
+export const CANCEL_POLL_INTERVAL_MS = 250;
+
+export type StepOutcome =
+  | {
+      readonly tag: "canceled";
+      readonly advanceAfter: boolean;
+      readonly includeError: boolean;
+    }
+  | { readonly tag: "retry"; readonly delayMs: Millis }
+  | { readonly tag: "failed" };
+
+class NagiAbortError extends Error {
+  readonly runId: RunId;
+  readonly scope: "run" | "step";
+  constructor(runId: RunId, scope: "run" | "step") {
+    super(
+      scope === "run"
+        ? `Run ${runId} was canceled — ctx.signal aborted.`
+        : `Step in run ${runId} was aborted by operator.retry() — ctx.signal aborted.`,
+    );
+    this.name = "NagiAbortError";
+    this.runId = runId;
+    this.scope = scope;
+  }
+}
+
+export function hasAbortRequest(
+  facts: ReadonlyArray<Fact>,
+  stepId: string,
+  attempt: number,
+): boolean {
+  for (let i = facts.length - 1; i >= 0; i--) {
+    const f = facts[i];
+    if (f === undefined) continue;
+    if (f.kind === "step.reset" && f.stepId === stepId) return false;
+    if (
+      f.kind === "step.abort-requested" &&
+      f.stepId === stepId &&
+      f.attempt === attempt
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Computed inside the runStep tx so the fact commits atomically with the step's
+// writes. An operator abort reports abortedHere so the caller skips advancing —
+// the abort re-enqueues the step elsewhere.
+export function resolveExecutionFact(args: {
+  readonly postState: RunState;
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly attempt: number;
+  readonly output: Json;
+  readonly at: Date;
+}): {
+  readonly fact: StepCompletedFact | StepCanceledFact;
+  readonly abortedHere: boolean;
+} {
+  const { postState, runId, stepId, attempt, output, at } = args;
+  const canceled: StepCanceledFact = {
+    kind: "step.canceled",
+    runId,
+    stepId,
+    attempt,
+    at,
+  };
+  if (postState.phase.tag === "canceled") {
+    return { fact: canceled, abortedHere: false };
+  }
+  if (hasAbortRequest(postState.facts, stepId, attempt)) {
+    return { fact: canceled, abortedHere: true };
+  }
+  const completed: StepCompletedFact = {
+    kind: "step.completed",
+    runId,
+    stepId,
+    attempt,
+    output,
+    at,
+  };
+  return { fact: completed, abortedHere: false };
+}
+
+export function startCancelWatcher(args: {
+  readonly store: Store;
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly attempt: number;
+  readonly ac: AbortController;
+  readonly intervalMs: Millis;
+}): { readonly stop: () => void } {
+  const { store, runId, stepId, attempt, ac, intervalMs } = args;
+  let stopped = false;
+  void (async () => {
+    while (!stopped) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      if (stopped) return;
+      try {
+        const s = await store.loadRunState(runId);
+        if (isTerminalRun(s)) {
+          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
+          return;
+        }
+        if (hasAbortRequest(s.facts, stepId, attempt)) {
+          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "step"));
+          return;
+        }
+      } catch {
+        // Transient store read error: skip this tick and re-check on the next
+        // interval rather than tearing down the watcher (which would strand the
+        // abort and let a canceled handler run to completion).
+      }
+    }
+  })();
+  return {
+    stop: () => {
+      stopped = true;
+    },
+  };
+}
+
+// Cancellation/abort wins over retry. An operator-aborted step is re-enqueued
+// elsewhere so it must not advance, whereas a run-cancellation must advance so
+// the run can finalize; only an abort/cancel error is recorded on the fact.
+export function classifyFailure(args: {
+  readonly attempt: number;
+  readonly policy: RetryPolicy;
+  readonly err: unknown;
+  readonly runIsCanceled: boolean;
+  readonly stepAborted: boolean;
+}): StepOutcome {
+  const { attempt, policy, err, runIsCanceled, stepAborted } = args;
+  if (runIsCanceled || stepAborted) {
+    const isAbort =
+      err instanceof NagiAbortError ||
+      (err instanceof Error && err.name === "AbortError");
+    return {
+      tag: "canceled",
+      advanceAfter: !stepAborted,
+      includeError: isAbort,
+    };
+  }
+  if (attempt < policy.maxAttempts && retryAllows(policy, err)) {
+    return { tag: "retry", delayMs: computeBackoff(policy, attempt) };
+  }
+  return { tag: "failed" };
+}
+
+export function computeBackoff(policy: RetryPolicy, attempt: number): Millis {
+  const initial = policy.initialDelayMs ?? 1_000;
+  const max = policy.maxDelayMs ?? 60_000;
+  switch (policy.backoff) {
+    case "exponential":
+      return Math.min(initial * 2 ** Math.max(0, attempt - 1), max);
+    case "linear":
+      return Math.min(initial * Math.max(1, attempt), max);
+    case "fixed":
+      return Math.min(initial, max);
+  }
+}
+
+function retryAllows(policy: RetryPolicy, err: unknown): boolean {
+  if (!policy.retryOn) return true;
+  return policy.retryOn(err);
+}
+
+export function makeStepCtx(args: {
+  runId: RunId;
+  stepId: string;
+  attempt: number;
+  input: unknown;
+  store: Store;
+  clock: Clock;
+  tx: Tx;
+  signal: AbortSignal;
+  emitLog: EmitLog;
+}): StepCtx<unknown> {
+  const { runId, stepId, attempt, input, store, clock, tx, signal, emitLog } =
+    args;
+
+  // Spread caller attrs first, then the correlation keys, so the runtime wins on
+  // collision — a handler can't clobber the real runId/stepId/attempt.
+  const log =
+    (level: LogLevel) =>
+    (msg: string, attrs?: Record<string, unknown>): void =>
+      emitLog({ level, msg, attrs: { ...attrs, runId, stepId, attempt } });
+
+  const logger: Logger = {
+    debug: log("debug"),
+    info: log("info"),
+    warn: log("warn"),
+    error: log("error"),
+  };
+
+  return {
+    input,
+    runId,
+    stepId,
+    attempt,
+    signal,
+    now: () => clock.now(),
+    tx,
+    logger,
+    once: makeOnce({ runId, stepId, store }),
+    idempotencyKey: makeIdempotencyKey(runId, stepId),
+  };
+}

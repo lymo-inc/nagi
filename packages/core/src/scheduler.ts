@@ -7,14 +7,15 @@ import {
 } from "./internal";
 import {
   attemptOf,
+  extractInput,
   isStepTerminal,
+  isTerminalRun,
   outputOf,
   resolvedOf,
   stepStateOf,
 } from "./state";
 import type {
   AttemptNumber,
-  Fact,
   Flow,
   Json,
   RunState,
@@ -42,50 +43,67 @@ export interface ScheduleArgs {
   readonly input: unknown;
 }
 
+// Each pending step resolves to exactly one outcome. Computing it as data lets
+// nextRunnable be a flat partition instead of a continue-driven accumulator.
+type StepGate =
+  | { readonly kind: "run" }
+  | { readonly kind: "skip"; readonly reason: SkipReason }
+  | { readonly kind: "block" };
+
 export function nextRunnable({
   flow,
   runState,
   input,
 }: ScheduleArgs): ScheduleDecision {
   const runnable: string[] = [];
-  const skip: { stepId: string; reason: SkipReason }[] = [];
+  const skip: SkipDecision[] = [];
 
   for (const [stepId, step] of Object.entries(asStepMapWithDefs(flow.steps))) {
-    const state = stepStateOf(runState, stepId);
-    if (state.tag !== "pending") continue;
+    if (stepStateOf(runState, stepId).tag !== "pending") continue;
 
-    const def = getDef(step);
-
-    const parentGate = checkParentMatch(def, runState);
-    if (parentGate === "blocked") continue;
-    if (parentGate === "transitive-skip") {
-      skip.push({ stepId, reason: "transitive" });
-      continue;
+    const gate = gateStep(getDef(step), runState, input);
+    switch (gate.kind) {
+      case "run":
+        runnable.push(stepId);
+        break;
+      case "skip":
+        skip.push({ stepId, reason: gate.reason });
+        break;
+      case "block":
+        break;
     }
-
-    const upstreamCheck = checkUpstream(def, runState);
-    if (upstreamCheck === "blocked") continue;
-    if (upstreamCheck === "transitive-skip") {
-      skip.push({ stepId, reason: "transitive" });
-      continue;
-    }
-
-    const when = def.kind === "match" ? undefined : def.when;
-    if (when) {
-      const needs = resolveNeeds(def, (id) =>
-        resolvedOf(stepStateOf(runState, id)),
-      );
-      const shouldRun = when({ input, needs });
-      if (!shouldRun) {
-        skip.push({ stepId, reason: "when-false" });
-        continue;
-      }
-    }
-
-    runnable.push(stepId);
   }
 
   return { runnable, skip };
+}
+
+// Parent-match and upstream gates run before the step's own `when`. A blocked
+// upstream leaves the step pending; a skipped/failed one cascades a skip.
+function gateStep(def: StepDef, runState: RunState, input: unknown): StepGate {
+  const parent = checkParentMatch(def, runState);
+  if (parent !== "ready") return gateFor(parent);
+
+  const upstream = checkUpstream(def, runState);
+  if (upstream !== "ready") return gateFor(upstream);
+
+  const when = def.kind === "match" ? undefined : def.when;
+  if (when) {
+    const needs = resolveNeeds(def, (id) =>
+      resolvedOf(stepStateOf(runState, id)),
+    );
+    if (!when({ input, needs })) return { kind: "skip", reason: "when-false" };
+  }
+
+  return { kind: "run" };
+}
+
+function gateFor(status: "blocked" | "transitive-skip"): StepGate {
+  switch (status) {
+    case "blocked":
+      return { kind: "block" };
+    case "transitive-skip":
+      return { kind: "skip", reason: "transitive" };
+  }
 }
 
 type UpstreamStatus = "ready" | "blocked" | "transitive-skip";
@@ -126,7 +144,7 @@ export type MatchAggregation =
       readonly kind: "complete";
       readonly output: Readonly<Record<string, Json>>;
     }
-  | { readonly kind: "fail-fast"; readonly failedStepId: string };
+  | { readonly kind: "fail-fast"; readonly error: SerializedError };
 
 export function aggregateMatch(
   matchId: string,
@@ -144,49 +162,50 @@ export function aggregateMatch(
   const arm = def.arms.find((a) => a.id === selected);
   if (!arm) return { kind: "pending" };
 
-  const output: Record<string, Json> = {};
-  let allTerminal = true;
-  const stripPrefix = `${matchId}.${arm.id}.`;
-
+  // Fail-fast: any failed chosen-arm step fails the match, even while siblings
+  // are still running — so scan for failure before collecting outputs.
   for (const stepId of arm.stepIds) {
     const state = stepStateOf(runState, stepId);
-    if (!isStepTerminal(state)) {
-      allTerminal = false;
-      continue;
-    }
-    if (state.tag === "failed") {
-      return { kind: "fail-fast", failedStepId: stepId };
-    }
-    const localKey = stepId.startsWith(stripPrefix)
-      ? stepId.slice(stripPrefix.length)
-      : stepId;
-    output[localKey] = outputOf(state);
+    if (state.tag === "failed")
+      return { kind: "fail-fast", error: state.error };
   }
 
-  if (!allTerminal) return { kind: "pending" };
+  const output: Record<string, Json> = {};
+  for (const stepId of arm.stepIds) {
+    const state = stepStateOf(runState, stepId);
+    if (!isStepTerminal(state)) return { kind: "pending" };
+    output[stripArmPrefix(matchId, arm.id, stepId)] = outputOf(state);
+  }
   return { kind: "complete", output };
 }
 
-export interface FlowTermination {
-  readonly done: boolean;
-  readonly failed: boolean;
+function stripArmPrefix(
+  matchId: string,
+  armId: string,
+  stepId: string,
+): string {
+  const prefix = `${matchId}.${armId}.`;
+  if (stepId.startsWith(prefix)) return stepId.slice(prefix.length);
+  return stepId;
 }
+
+export type FlowTermination =
+  | { readonly kind: "running" }
+  | { readonly kind: "succeeded" }
+  | { readonly kind: "failed"; readonly error: SerializedError };
 
 export function flowTermination(
   flow: Flow,
   runState: RunState,
 ): FlowTermination {
-  let done = true;
-  let failed = false;
+  let failure: SerializedError | undefined;
   for (const stepId of Object.keys(flow.steps)) {
     const state = stepStateOf(runState, stepId);
-    if (!isStepTerminal(state)) {
-      done = false;
-      break;
-    }
-    if (state.tag === "failed") failed = true;
+    if (!isStepTerminal(state)) return { kind: "running" };
+    if (state.tag === "failed" && failure === undefined) failure = state.error;
   }
-  return { done, failed };
+  if (failure !== undefined) return { kind: "failed", error: failure };
+  return { kind: "succeeded" };
 }
 
 export interface MatchPromotion {
@@ -218,10 +237,15 @@ export function nextTransition(flow: Flow, runState: RunState): Transition {
   if (promotions.length > 0) return { kind: "promote-match", promotions };
 
   const term = flowTermination(flow, runState);
-  if (term.done) {
-    if (isFlowTerminal(runState.facts)) return { kind: "settled" };
-    if (term.failed) return { kind: "fail", error: flowFailureError(runState) };
-    return { kind: "complete", output: computeFlowOutput(flow, runState) };
+  switch (term.kind) {
+    case "succeeded":
+    case "failed": {
+      if (isTerminalRun(runState)) return { kind: "settled" };
+      if (term.kind === "failed") return { kind: "fail", error: term.error };
+      return { kind: "complete", output: computeFlowOutput(flow, runState) };
+    }
+    case "running":
+      break;
   }
 
   const input = extractInput(runState);
@@ -244,18 +268,10 @@ function readyPromotions(flow: Flow, runState: RunState): MatchPromotion[] {
 
     const attempt: AttemptNumber = attemptOf(state);
     if (agg.kind === "fail-fast") {
-      const failedNested = stepStateOf(runState, agg.failedStepId);
-      const error: SerializedError =
-        failedNested.tag === "failed"
-          ? failedNested.error
-          : {
-              name: "Error",
-              message: `match "${matchId}": chosen-arm step "${agg.failedStepId}" failed`,
-            };
       out.push({
         matchId: matchId as StepId,
         attempt,
-        result: { kind: "fail", error },
+        result: { kind: "fail", error: agg.error },
       });
     } else {
       out.push({
@@ -266,28 +282,6 @@ function readyPromotions(flow: Flow, runState: RunState): MatchPromotion[] {
     }
   }
   return out;
-}
-
-function flowFailureError(runState: RunState): SerializedError {
-  for (const s of Object.values(runState.steps)) {
-    if (s.tag === "failed") return s.error;
-  }
-  return { name: "Error", message: "step failed" };
-}
-
-export function isFlowTerminal(facts: readonly Fact[]): boolean {
-  for (let i = facts.length - 1; i >= 0; i--) {
-    const f = facts[i];
-    if (
-      f !== undefined &&
-      (f.kind === "flow.completed" ||
-        f.kind === "flow.failed" ||
-        f.kind === "flow.canceled")
-    ) {
-      return true;
-    }
-  }
-  return false;
 }
 
 export function computeFlowOutput(flow: Flow, runState: RunState): Json {
@@ -329,13 +323,4 @@ export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {
     }
   }
   return out;
-}
-
-export function extractInput(runState: RunState): Json {
-  for (const fact of runState.facts) {
-    if (fact.kind === "flow.started") return fact.input;
-  }
-  throw new Error(
-    "No flow.started fact in run — was the run initialized via wf.start?",
-  );
 }

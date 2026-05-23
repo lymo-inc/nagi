@@ -30,6 +30,7 @@ import type {
   RunState,
   RunSummary,
   SerializedError,
+  SettleSignalResult,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
@@ -221,6 +222,83 @@ export class InMemoryStore implements Store {
     fact: Fact,
   ): Promise<void> {
     await this.appendFact(runId, fact);
+  }
+
+  async settleSignal(args: {
+    readonly runId: RunId;
+    readonly stepId: StepId;
+    readonly at: Date;
+    readonly incoming?: {
+      readonly payload: Json;
+      readonly signalName?: string;
+    };
+  }): Promise<SettleSignalResult> {
+    const { runId, stepId, at, incoming } = args;
+    // Single process, single thread: foldRun → decide → append runs to
+    // completion with no interleaving await, giving the same atomicity the
+    // postgres store gets from a per-run advisory lock.
+    const runState = foldRun(runId, this.facts.get(runId) ?? []);
+    const step = stepStateOf(runState, stepId);
+
+    if (
+      step.tag === "completed" ||
+      step.tag === "failed" ||
+      step.tag === "skipped" ||
+      step.tag === "canceled"
+    ) {
+      return { tag: "noop" };
+    }
+
+    if (step.tag === "awaitingSignal") {
+      const source = incoming ?? runState.bufferedSignals[stepId];
+      if (source === undefined) return { tag: "noop" };
+      const { attempt } = step;
+      await this.appendFact(runId, {
+        kind: "signal.received",
+        runId,
+        stepId,
+        payload: source.payload,
+        at,
+        ...(source.signalName !== undefined
+          ? { signalName: source.signalName }
+          : {}),
+      });
+      const completedFact: StepCompletedFact = {
+        kind: "step.completed",
+        runId,
+        stepId,
+        attempt,
+        output: source.payload,
+        at,
+      };
+      await this.completeStep(runId, stepId, source.payload, completedFact);
+      return {
+        tag: "delivered",
+        attempt,
+        payload: source.payload,
+        ...(source.signalName !== undefined
+          ? { signalName: source.signalName }
+          : {}),
+      };
+    }
+
+    // Pre-awaiting (pending/running/backoff/aborting): park an incoming signal.
+    // A consume call (no incoming) here has nothing to apply.
+    if (incoming === undefined) return { tag: "noop" };
+    if (runState.bufferedSignals[stepId] !== undefined) {
+      return { tag: "buffered" };
+    }
+    await this.appendFact(runId, {
+      kind: "signal.buffered",
+      runId,
+      stepId,
+      payload: incoming.payload,
+      at,
+      ...(incoming.signalName !== undefined
+        ? { signalName: incoming.signalName }
+        : {}),
+    });
+    return { tag: "buffered" };
   }
 
   async getStepOutput(runId: RunId, stepId: StepId): Promise<Json | null> {

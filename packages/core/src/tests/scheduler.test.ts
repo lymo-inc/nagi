@@ -3,12 +3,11 @@ import { flow } from "../builder";
 import { InMemoryStore } from "../memory";
 import {
   descendantsOf,
-  extractInput,
   flowTermination,
   nextRunnable,
   nextTransition,
 } from "../scheduler";
-import { unwrap } from "../state";
+import { extractInput, unwrap } from "../state";
 import type { Fact, Flow, RunId, RunState } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
@@ -196,40 +195,43 @@ describe("nextRunnable", () => {
 });
 
 describe("flowTermination", () => {
-  it("done=false while any step is pending", async () => {
+  it("running while any step is pending", async () => {
     const f = linearFlow();
     const state = await projectFacts([startedFact(f.id, { n: 1 })]);
-    expect(flowTermination(f, state)).toEqual({ done: false, failed: false });
+    expect(flowTermination(f, state)).toEqual({ kind: "running" });
   });
 
-  it("done=true and failed=false when all completed", async () => {
+  it("succeeded when all completed", async () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
       completedStepFact("a", {}),
       completedStepFact("c", {}),
     ]);
-    expect(flowTermination(f, state)).toEqual({ done: true, failed: false });
+    expect(flowTermination(f, state)).toEqual({ kind: "succeeded" });
   });
 
-  it("done=true and failed=true when any step failed terminally", async () => {
+  it("failed when any step failed terminally", async () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
       failedStepFact("a"),
       skippedStepFact("c", "transitive"),
     ]);
-    expect(flowTermination(f, state)).toEqual({ done: true, failed: true });
+    expect(flowTermination(f, state)).toEqual({
+      kind: "failed",
+      error: { name: "Error", message: "boom" },
+    });
   });
 
-  it("done=true with mixed completed + skipped (none failed) is not failed", async () => {
+  it("succeeded with mixed completed + skipped (none failed)", async () => {
     const f = gatedFlow();
     const state = await projectFacts([
       startedFact(f.id, { enable: false }),
       completedStepFact("gate", { enabled: false }),
       skippedStepFact("branch", "when-false"),
     ]);
-    expect(flowTermination(f, state)).toEqual({ done: true, failed: false });
+    expect(flowTermination(f, state)).toEqual({ kind: "succeeded" });
   });
 });
 

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
+import { NagiRuntimeError } from "../errors";
 import { InMemoryStore } from "../memory";
-import { NagiRuntimeError, nagi } from "../runtime";
+import { nagi } from "../runtime";
 import { unwrap } from "../state";
 import type { Json, RunId, StepId, StreamEvent } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";

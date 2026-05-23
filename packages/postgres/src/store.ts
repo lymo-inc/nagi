@@ -18,6 +18,7 @@ import type {
   RunStatus,
   RunSummary,
   SerializedError,
+  SettleSignalResult,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
@@ -25,7 +26,7 @@ import type {
   Store,
   Tx,
 } from "@nagi-js/core";
-import { projectRunState } from "@nagi-js/core";
+import { projectRunState, stepStateOf } from "@nagi-js/core";
 import type { Kysely } from "kysely";
 import { sql } from "kysely";
 import { uuidv7 } from "./uuidv7";
@@ -189,6 +190,13 @@ class PostgresStore<DB = unknown> implements Store {
   }
 
   async loadRunState(runId: RunId): Promise<RunState> {
+    return this.loadRunStateWith(this.db, runId);
+  }
+
+  private async loadRunStateWith(
+    executor: Kysely<DB>,
+    runId: RunId,
+  ): Promise<RunState> {
     const rows = await sql<{
       kind: string;
       at: Date;
@@ -198,12 +206,103 @@ class PostgresStore<DB = unknown> implements Store {
         FROM ${sql.raw(this.t("fact"))}
        WHERE run_id = ${runId}
        ORDER BY fact_id ASC
-    `.execute(this.db);
+    `.execute(executor);
 
     const facts: Fact[] = rows.rows.map((r) =>
       reviveFact(r.kind, r.at, r.payload),
     );
     return projectRunState(runId, facts);
+  }
+
+  async settleSignal(args: {
+    readonly runId: RunId;
+    readonly stepId: StepId;
+    readonly at: Date;
+    readonly incoming?: {
+      readonly payload: Json;
+      readonly signalName?: string;
+    };
+  }): Promise<SettleSignalResult> {
+    const { runId, stepId, at, incoming } = args;
+    const result = await this.db
+      .transaction()
+      .execute(async (trx): Promise<SettleSignalResult> => {
+        // Serialize signal reconciliation per run so a wf.signal() call and the
+        // worker claiming the step can't interleave and drop an early signal.
+        const lockText = `nagi:signal:${runId}`;
+        await sql`SELECT pg_advisory_xact_lock(hashtext(${lockText}))`.execute(
+          trx,
+        );
+
+        const runState = await this.loadRunStateWith(trx, runId);
+        const step = stepStateOf(runState, stepId);
+
+        // Already resolved (or otherwise terminal): nothing to deliver.
+        if (
+          step.tag === "completed" ||
+          step.tag === "failed" ||
+          step.tag === "skipped" ||
+          step.tag === "canceled"
+        ) {
+          return { tag: "noop" };
+        }
+
+        if (step.tag === "awaitingSignal") {
+          const source = incoming ?? runState.bufferedSignals[stepId];
+          if (source === undefined) return { tag: "noop" };
+          const { attempt } = step;
+          const { signalName } = source;
+          await this.insertFact(trx, runId, {
+            kind: "signal.received",
+            runId,
+            stepId,
+            payload: source.payload,
+            at,
+            ...(signalName !== undefined ? { signalName } : {}),
+          });
+          await this.upsertStepCompleted(
+            trx,
+            runId,
+            stepId,
+            attempt,
+            source.payload,
+          );
+          await this.insertFact(trx, runId, {
+            kind: "step.completed",
+            runId,
+            stepId,
+            attempt,
+            output: source.payload,
+            at,
+          });
+          await this.deleteLease(trx, runId, stepId);
+          return {
+            tag: "delivered",
+            attempt,
+            payload: source.payload,
+            ...(signalName !== undefined ? { signalName } : {}),
+          };
+        }
+
+        // Pre-awaiting (pending/running/backoff/aborting): park an incoming
+        // signal. A consume call (no incoming) has nothing to apply yet.
+        if (incoming === undefined) return { tag: "noop" };
+        if (runState.bufferedSignals[stepId] !== undefined) {
+          return { tag: "buffered" };
+        }
+        const { signalName } = incoming;
+        await this.insertFact(trx, runId, {
+          kind: "signal.buffered",
+          runId,
+          stepId,
+          payload: incoming.payload,
+          at,
+          ...(signalName !== undefined ? { signalName } : {}),
+        });
+        return { tag: "buffered" };
+      });
+    await this.maybeNotify(runId);
+    return result;
   }
 
   async claimStep(
@@ -448,6 +547,7 @@ class PostgresStore<DB = unknown> implements Store {
       case "step.abort-requested":
       case "signal.sent":
       case "signal.received":
+      case "signal.buffered":
       case "match.arm-selected":
         return;
     }

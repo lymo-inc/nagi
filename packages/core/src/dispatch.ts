@@ -1,7 +1,6 @@
-import { makeIdempotencyKey, makeOnce } from "./idempotency";
+import { serializeError } from "./errors";
 import {
   asStepMapWithDefs,
-  compact,
   type EmitLog,
   getDef,
   type HandlerDef,
@@ -15,14 +14,27 @@ import {
   type TaskDef,
 } from "./internal";
 import {
-  extractInput,
-  isFlowTerminal,
   type MatchPromotion,
   nextTransition,
   type SkipDecision,
   stepStateOf,
 } from "./scheduler";
-import { isTerminalRun, resolvedOf, runStatusOf, stepStatusOf } from "./state";
+import {
+  extractInput,
+  isTerminalRun,
+  resolvedOf,
+  runStatusOf,
+  stepStatusOf,
+} from "./state";
+import {
+  CANCEL_POLL_INTERVAL_MS,
+  classifyFailure,
+  DEFAULT_RETRY,
+  hasAbortRequest,
+  makeStepCtx,
+  resolveExecutionFact,
+  startCancelWatcher,
+} from "./step-exec";
 import type {
   AttemptNumber,
   Clock,
@@ -31,7 +43,6 @@ import type {
   FlowHooks,
   FlowStartedFact,
   Json,
-  Logger,
   Millis,
   ParentRef,
   Queue,
@@ -40,13 +51,10 @@ import type {
   RunId,
   RunState,
   SerializedError,
-  StepCanceledFact,
-  StepCompletedFact,
   StepCtx,
   StepId,
   Store,
   StreamingStepCtx,
-  Tx,
 } from "./types";
 
 export interface DispatchDeps {
@@ -67,8 +75,6 @@ export interface DispatchDeps {
   readonly cancelPollIntervalMs?: Millis;
 }
 
-// The deep module's tight interface: every operation takes only domain values,
-// never `deps` — that is bound once by makeDispatcher and hidden inside.
 export interface Dispatcher {
   dispatchMessage(message: QueueMessage): Promise<void>;
   advance(runId: RunId): Promise<void>;
@@ -83,14 +89,6 @@ export interface Dispatcher {
   ): Promise<void>;
 }
 
-const DEFAULT_RETRY: RetryPolicy = {
-  maxAttempts: 3,
-  backoff: "exponential",
-  initialDelayMs: 1_000,
-  maxDelayMs: 60_000,
-};
-
-const CANCEL_POLL_INTERVAL_MS = 250;
 const MAX_ADVANCE_ITERS = 1024;
 
 type Dispatched =
@@ -102,15 +100,6 @@ type Admission =
   | { readonly tag: "skip" }
   | { readonly tag: "run"; readonly def: StepDef };
 
-type StepOutcome =
-  | {
-      readonly tag: "canceled";
-      readonly advanceAfter: boolean;
-      readonly includeError: boolean;
-    }
-  | { readonly tag: "retry"; readonly delayMs: Millis }
-  | { readonly tag: "failed" };
-
 interface ExecuteTaskResult {
   readonly output: Json;
   readonly skipAdvance: boolean;
@@ -120,231 +109,6 @@ export type SubflowChildOutcome =
   | { readonly kind: "completed"; readonly output: Json }
   | { readonly kind: "failed"; readonly error: SerializedError }
   | { readonly kind: "canceled"; readonly error: SerializedError };
-
-// Computed inside the runStep tx so the fact commits atomically with the step's
-// writes. An operator abort reports abortedHere so the caller skips advancing —
-// the abort re-enqueues the step elsewhere.
-function resolveExecutionFact(args: {
-  readonly postState: RunState;
-  readonly runId: RunId;
-  readonly stepId: string;
-  readonly attempt: number;
-  readonly output: Json;
-  readonly at: Date;
-}): {
-  readonly fact: StepCompletedFact | StepCanceledFact;
-  readonly abortedHere: boolean;
-} {
-  const { postState, runId, stepId, attempt, output, at } = args;
-  const canceled: StepCanceledFact = {
-    kind: "step.canceled",
-    runId,
-    stepId,
-    attempt,
-    at,
-  };
-  if (postState.phase.tag === "canceled") {
-    return { fact: canceled, abortedHere: false };
-  }
-  if (hasAbortRequest(postState.facts, stepId, attempt)) {
-    return { fact: canceled, abortedHere: true };
-  }
-  const completed: StepCompletedFact = {
-    kind: "step.completed",
-    runId,
-    stepId,
-    attempt,
-    output,
-    at,
-  };
-  return { fact: completed, abortedHere: false };
-}
-
-interface CancelWatcher {
-  stop(): void;
-}
-
-function startCancelWatcher(args: {
-  readonly store: Store;
-  readonly runId: RunId;
-  readonly stepId: string;
-  readonly attempt: number;
-  readonly ac: AbortController;
-  readonly intervalMs: Millis;
-}): CancelWatcher {
-  const { store, runId, stepId, attempt, ac, intervalMs } = args;
-  let stopped = false;
-  void (async () => {
-    while (!stopped) {
-      await new Promise((r) => setTimeout(r, intervalMs));
-      if (stopped) return;
-      try {
-        const s = await store.loadRunState(runId);
-        if (isTerminalRun(s)) {
-          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
-          return;
-        }
-        if (hasAbortRequest(s.facts, stepId, attempt)) {
-          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "step"));
-          return;
-        }
-      } catch {}
-    }
-  })();
-  return {
-    stop: () => {
-      stopped = true;
-    },
-  };
-}
-
-function hasAbortRequest(
-  facts: ReadonlyArray<Fact>,
-  stepId: string,
-  attempt: number,
-): boolean {
-  for (let i = facts.length - 1; i >= 0; i--) {
-    const f = facts[i];
-    if (f === undefined) continue;
-    if (f.kind === "step.reset" && f.stepId === stepId) return false;
-    if (
-      f.kind === "step.abort-requested" &&
-      f.stepId === stepId &&
-      f.attempt === attempt
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-export class NagiAbortError extends Error {
-  readonly runId: RunId;
-  readonly scope: "run" | "step";
-  constructor(runId: RunId, scope: "run" | "step") {
-    super(
-      scope === "run"
-        ? `Run ${runId} was canceled — ctx.signal aborted.`
-        : `Step in run ${runId} was aborted by operator.retry() — ctx.signal aborted.`,
-    );
-    this.name = "NagiAbortError";
-    this.runId = runId;
-    this.scope = scope;
-  }
-}
-
-// Cancellation/abort wins over retry. An operator-aborted step is re-enqueued
-// elsewhere so it must not advance, whereas a run-cancellation must advance so
-// the run can finalize; only an abort/cancel error is recorded on the fact.
-function classifyFailure(args: {
-  readonly attempt: number;
-  readonly policy: RetryPolicy;
-  readonly err: unknown;
-  readonly runIsCanceled: boolean;
-  readonly stepAborted: boolean;
-}): StepOutcome {
-  const { attempt, policy, err, runIsCanceled, stepAborted } = args;
-  if (runIsCanceled || stepAborted) {
-    const isAbort =
-      err instanceof NagiAbortError ||
-      (err instanceof Error && err.name === "AbortError");
-    return {
-      tag: "canceled",
-      advanceAfter: !stepAborted,
-      includeError: isAbort,
-    };
-  }
-  if (attempt < policy.maxAttempts && retryAllows(policy, err)) {
-    return { tag: "retry", delayMs: computeBackoff(policy, attempt) };
-  }
-  return { tag: "failed" };
-}
-
-export function computeBackoff(policy: RetryPolicy, attempt: number): Millis {
-  const initial = policy.initialDelayMs ?? 1_000;
-  const max = policy.maxDelayMs ?? 60_000;
-  switch (policy.backoff) {
-    case "exponential":
-      return Math.min(initial * 2 ** Math.max(0, attempt - 1), max);
-    case "linear":
-      return Math.min(initial * Math.max(1, attempt), max);
-    case "fixed":
-      return Math.min(initial, max);
-  }
-}
-
-function retryAllows(policy: RetryPolicy, err: unknown): boolean {
-  if (!policy.retryOn) return true;
-  return policy.retryOn(err);
-}
-
-function makeStepCtx(args: {
-  runId: RunId;
-  stepId: string;
-  attempt: number;
-  input: unknown;
-  store: Store;
-  clock: Clock;
-  tx: Tx;
-  signal: AbortSignal;
-  emitLog: EmitLog;
-}): StepCtx<unknown> {
-  const { runId, stepId, attempt, input, store, clock, tx, signal, emitLog } =
-    args;
-
-  // Spread caller `attrs` first, then the correlation keys, so the runtime wins
-  // on collision — a handler can't clobber the real runId/stepId/attempt.
-  const stepLogger: Logger = {
-    debug: (m, a) =>
-      emitLog({
-        level: "debug",
-        msg: m,
-        attrs: { ...a, runId, stepId, attempt },
-      }),
-    info: (m, a) =>
-      emitLog({
-        level: "info",
-        msg: m,
-        attrs: { ...a, runId, stepId, attempt },
-      }),
-    warn: (m, a) =>
-      emitLog({
-        level: "warn",
-        msg: m,
-        attrs: { ...a, runId, stepId, attempt },
-      }),
-    error: (m, a) =>
-      emitLog({
-        level: "error",
-        msg: m,
-        attrs: { ...a, runId, stepId, attempt },
-      }),
-  };
-
-  return {
-    input,
-    runId,
-    stepId,
-    attempt,
-    signal,
-    now: () => clock.now(),
-    tx,
-    logger: stepLogger,
-    once: makeOnce({ runId, stepId, store }),
-    idempotencyKey: makeIdempotencyKey(runId, stepId),
-  };
-}
-
-export function serializeError(err: unknown): SerializedError {
-  if (err instanceof Error) {
-    return {
-      name: err.name,
-      message: err.message,
-      ...compact({ stack: err.stack }),
-    };
-  }
-  return { name: "Error", message: String(err) };
-}
 
 export function makeDispatcher(deps: DispatchDeps): Dispatcher {
   async function fireHook<E>(
@@ -392,7 +156,7 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
     const startedAt = Date.now();
     let outcome: Dispatched;
     try {
-      outcome = await execute({ message, def });
+      outcome = await execute({ flow, message, def });
     } catch (err) {
       outcome = await handleStepError({ flow, message, def, err });
     }
@@ -475,10 +239,11 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
   }
 
   async function execute(args: {
+    flow: Flow;
     message: QueueMessage;
     def: StepDef;
   }): Promise<Dispatched> {
-    const { message, def } = args;
+    const { flow, message, def } = args;
     const { runId, stepId, attempt } = message;
 
     switch (def.kind) {
@@ -492,8 +257,35 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
         });
         return skipAdvance ? { tag: "parked" } : { tag: "completed", output };
       }
-      case "signal":
+      case "signal": {
+        // recordStarted just moved this signal step into awaitingSignal. If a
+        // signal arrived early (the start/await race) it was parked as a
+        // signal.buffered fact; apply it now, atomically under the store's
+        // per-run lock. With nothing buffered this no-ops and the step stays
+        // parked until wf.signal delivers.
+        const settled = await deps.store.settleSignal({
+          runId,
+          stepId,
+          at: deps.clock.now(),
+        });
+        if (settled.tag === "delivered") {
+          await fireHook(
+            deps.hooks?.onSignalReceived,
+            {
+              runId,
+              flowId: flow.id,
+              stepId,
+              attempt: settled.attempt,
+              kind: "signal",
+              payload: settled.payload,
+              at: deps.clock.now(),
+            },
+            "onSignalReceived",
+          );
+          return { tag: "advance" };
+        }
         return { tag: "parked" };
+      }
       case "match":
         await executeMatch({ def, runId, stepId });
         return { tag: "advance" };
@@ -540,6 +332,41 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
     }
   }
 
+  async function runHandler(
+    def: HandlerDef,
+    args: {
+      input: unknown;
+      needs: Record<string, unknown>;
+      ctx: StepCtx<unknown>;
+      runId: RunId;
+      stepId: string;
+    },
+  ): Promise<Json> {
+    const { input, needs, ctx, runId, stepId } = args;
+    if (def.kind !== "streaming") {
+      return (await (def.run as TaskDef["run"])({ input, needs, ctx })) as Json;
+    }
+    // emit publishes out-of-band via the store's write-side, never through `tx`:
+    // chunks must be visible before commit and never enter the fact log.
+    // emitActive makes any emit after the handler returns a no-op.
+    let emitActive = true;
+    const streamingCtx: StreamingStepCtx<unknown> = {
+      ...ctx,
+      emit: async (chunk: Json) => {
+        if (emitActive) deps.store.publishChunk?.(runId, stepId, chunk);
+      },
+    };
+    try {
+      return (await (def.run as StreamingTaskDef["run"])({
+        input,
+        needs,
+        ctx: streamingCtx,
+      })) as Json;
+    } finally {
+      emitActive = false;
+    }
+  }
+
   async function executeTask(args: {
     def: HandlerDef;
     runId: RunId;
@@ -582,29 +409,13 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
             signal: ac.signal,
             emitLog: deps.emitLog,
           });
-          let out: Json;
-          if (def.kind === "streaming") {
-            // emit publishes out-of-band via the store's write-side, never
-            // through `tx`: chunks must be visible before commit and never enter
-            // the fact log. emitActive makes any emit after the handler returns a
-            // no-op.
-            let emitActive = true;
-            const streamingCtx: StreamingStepCtx<unknown> = {
-              ...ctx,
-              emit: async (chunk: Json) => {
-                if (emitActive) store.publishChunk?.(runId, stepId, chunk);
-              },
-            };
-            const run = def.run as StreamingTaskDef["run"];
-            try {
-              out = (await run({ input, needs, ctx: streamingCtx })) as Json;
-            } finally {
-              emitActive = false;
-            }
-          } else {
-            const run = def.run as TaskDef["run"];
-            out = (await run({ input, needs, ctx })) as Json;
-          }
+          const out = await runHandler(def, {
+            input,
+            needs,
+            ctx,
+            runId,
+            stepId,
+          });
           const postState = await store.loadRunState(runId);
           const { fact, abortedHere } = resolveExecutionFact({
             postState,
@@ -714,7 +525,7 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
       }
       case "retry": {
         const at = clock.now();
-        const nextAttemptAt = new Date(Date.now() + outcome.delayMs);
+        const nextAttemptAt = new Date(at.getTime() + outcome.delayMs);
         await store.appendFact(runId, {
           kind: "step.retried",
           runId,
@@ -792,8 +603,8 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
       name: "NagiCycleError",
       message: `advance exceeded ${MAX_ADVANCE_ITERS} iterations — likely a cycle or infinite skip loop in flow "${flow.id}"`,
     };
-    const facts = (await store.loadRunState(runId)).facts;
-    if (!isFlowTerminal(facts)) {
+    const finalState = await store.loadRunState(runId);
+    if (!isTerminalRun(finalState)) {
       await finalizeFlowFailure({ flow, runId, error: cycleError });
     }
   }
@@ -814,8 +625,7 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
     }
   }
 
-  // Match/subflow terminal completion. The task path writes its fact inside the
-  // runStep tx and does not route through here.
+  // The task path writes its fact inside the runStep tx and does not route through here.
   async function markStepComplete(args: {
     readonly flow: Flow;
     readonly runId: RunId;
@@ -844,7 +654,6 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
         attempt,
         kind,
         output,
-        durationMs: 0,
         at,
       },
       "onStepComplete",

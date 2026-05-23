@@ -16,7 +16,7 @@ export interface SnapshotChangedEdge {
   readonly after: "needed" | "absent";
 }
 
-export interface SnapshotChangedField_ {
+export interface SnapshotChangedPredicate {
   readonly stepId: StepId;
   readonly field: SnapshotChangedField;
 }
@@ -25,7 +25,7 @@ export interface SnapshotDiff {
   readonly addedSteps: readonly StepId[];
   readonly removedSteps: readonly StepId[];
   readonly changedEdges: readonly SnapshotChangedEdge[];
-  readonly changedPredicates: readonly SnapshotChangedField_[];
+  readonly changedPredicates: readonly SnapshotChangedPredicate[];
 }
 
 export function diffSnapshots(
@@ -47,7 +47,7 @@ export function diffSnapshots(
   removedSteps.sort();
 
   const changedEdges: SnapshotChangedEdge[] = [];
-  const changedPredicates: SnapshotChangedField_[] = [];
+  const changedPredicates: SnapshotChangedPredicate[] = [];
 
   for (const id of afterStepsById.keys()) {
     const beforeStep = beforeStepsById.get(id);
@@ -101,7 +101,7 @@ function diffEdges(
 function diffFields(
   before: CanonicalStep,
   after: CanonicalStep,
-  out: SnapshotChangedField_[],
+  out: SnapshotChangedPredicate[],
 ): void {
   const id = after.id;
   if (before.kind !== after.kind) {

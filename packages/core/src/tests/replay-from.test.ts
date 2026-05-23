@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { NagiRuntimeError, NagiValidationError } from "../runtime";
+import { NagiRuntimeError, NagiValidationError } from "../errors";
 import type { StepResetFact } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 

@@ -5,7 +5,6 @@ import type {
   Millis,
   NeedsMap,
   RetryPolicy,
-  RunState,
   StandardSchemaV1,
   Step,
   StepCompleteEvent,
@@ -191,16 +190,8 @@ export function peekDef(
   return (step as Partial<StepWithDef>)[DEF];
 }
 
-export function isStepKind(def: StepDef, kind: StepDef["kind"]): boolean {
-  return def.kind === kind;
-}
-
 export function handlerDef(def: StepDef): HandlerDef | undefined {
   return def.kind === "task" || def.kind === "streaming" ? def : undefined;
-}
-
-export function needsKeys(def: StepDef): readonly string[] {
-  return Object.keys(def.needs);
 }
 
 export function needsStepIds(def: StepDef): readonly string[] {
@@ -222,25 +213,6 @@ export type StepMapWithDefs = Readonly<Record<string, StepWithDef<unknown>>>;
 
 export function asStepMapWithDefs(steps: StepMap): StepMapWithDefs {
   return steps as StepMapWithDefs;
-}
-
-export function findArm(def: MatchDef, armId: string): MatchArmDef | undefined {
-  return def.arms.find((a) => a.id === armId);
-}
-
-export function readSelectedArm(
-  matchId: string,
-  runState: RunState,
-): string | null {
-  let selected: string | null = null;
-  for (const fact of runState.facts) {
-    if (fact.kind === "match.arm-selected" && fact.stepId === matchId) {
-      selected = fact.arm;
-    } else if (fact.kind === "step.reset" && fact.stepId === matchId) {
-      selected = null;
-    }
-  }
-  return selected;
 }
 
 export function selectArm(

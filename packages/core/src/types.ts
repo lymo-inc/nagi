@@ -379,7 +379,9 @@ export interface StepStartEvent extends StepEvent {
 
 export interface StepCompleteEvent extends StepEvent {
   readonly output: Json;
-  readonly durationMs: Millis;
+  // Absent for match/subflow completions, which have no handler wall-time;
+  // consumers that need it recompute from the step's start.
+  readonly durationMs?: Millis;
 }
 
 export interface StepErrorEvent extends StepEvent {
@@ -446,9 +448,35 @@ export interface SerializedError {
   readonly cause?: Json;
 }
 
+export type SettleSignalResult =
+  | {
+      readonly tag: "delivered";
+      readonly attempt: AttemptNumber;
+      readonly payload: Json;
+      readonly signalName?: string;
+    }
+  | { readonly tag: "buffered" }
+  | { readonly tag: "noop" };
+
 export interface Store {
   appendFact(runId: RunId, fact: Fact): Promise<void>;
   loadRunState(runId: RunId): Promise<RunState>;
+
+  // Atomically reconcile a signal with its target step under a per-run lock.
+  // With `incoming` (a wf.signal call): deliver when the step is awaitingSignal,
+  // buffer when it has not started yet, no-op when it already resolved. Without
+  // `incoming` (the worker, right after the step entered awaitingSignal): deliver
+  // a previously buffered signal if one exists, else no-op. MUST be atomic so a
+  // signal is never lost to the start/await race.
+  settleSignal(args: {
+    readonly runId: RunId;
+    readonly stepId: StepId;
+    readonly at: Date;
+    readonly incoming?: {
+      readonly payload: Json;
+      readonly signalName?: string;
+    };
+  }): Promise<SettleSignalResult>;
 
   // MUST be atomic: concurrent calls with the same runId produce exactly one
   // flow.started fact. When concurrency is supplied, MUST atomically cancel
@@ -655,6 +683,7 @@ export type FactKind =
   | "step.abort-requested"
   | "signal.sent"
   | "signal.received"
+  | "signal.buffered"
   | "once.recorded"
   | "match.arm-selected";
 
@@ -719,6 +748,17 @@ export type FlowCanceledFact =
   | FlowCanceledExplicitlyFact
   | FlowCanceledByOperatorFact;
 
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
+  ? Omit<T, K>
+  : never;
+
+// Derived from the fact types so cancel intent can't drift from the recorded
+// fact. Concurrency cancellation is system-internal and intentionally excluded.
+export type CancelArgs = DistributiveOmit<
+  FlowCanceledExplicitlyFact | FlowCanceledByOperatorFact,
+  "kind" | "runId" | "at"
+>;
+
 export interface StepStartedFact extends FactBase {
   readonly kind: "step.started";
   readonly stepId: StepId;
@@ -778,6 +818,16 @@ export interface SignalReceivedFact extends FactBase {
   readonly signalName?: string;
 }
 
+// A signal that arrived before its target step entered awaitingSignal (the
+// start/await race). Parked in the fact log and applied the moment the worker
+// claims the step. See Store.settleSignal.
+export interface SignalBufferedFact extends FactBase {
+  readonly kind: "signal.buffered";
+  readonly stepId: StepId;
+  readonly payload: Json;
+  readonly signalName?: string;
+}
+
 export interface OnceRecordedFact extends FactBase {
   readonly kind: "once.recorded";
   readonly stepId: StepId;
@@ -822,6 +872,7 @@ export type Fact =
   | StepAbortRequestedFact
   | SignalSentFact
   | SignalReceivedFact
+  | SignalBufferedFact
   | OnceRecordedFact
   | MatchArmSelectedFact;
 

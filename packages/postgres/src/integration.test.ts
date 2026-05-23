@@ -632,6 +632,53 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     }, 30_000);
   });
 
+  describe("b.signal — early-signal buffering via PG", () => {
+    it("parks a signal that arrives before the step is claimed, then delivers it on dispatch", async () => {
+      const f = flow({
+        id: "pg-early-signal",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          transcript: b.signal({
+            names: ["audioReady", "recordingReady"],
+            schema: passthroughSchema<
+              { audioUrl: string } | { transcript: string }
+            >(),
+          }),
+        }),
+        output: (s) => s.transcript,
+      });
+
+      const wf = await makeNagi(f);
+      const runId = await wf.start(f, {});
+
+      // No worker yet: the signal step is enqueued but unclaimed, so the signal
+      // is parked (under the per-run advisory lock) rather than thrown.
+      await wf.signal(runId, "recordingReady", { transcript: "t" });
+
+      const store = postgresStore({ db, schema });
+      const parked = await store.loadRunState(runId);
+      expect(parked.bufferedSignals["transcript"]).toEqual({
+        payload: { transcript: "t" },
+        signalName: "recordingReady",
+      });
+      expect(
+        parked.facts.filter((x) => x.kind === "signal.buffered"),
+      ).toHaveLength(1);
+
+      // The worker claims the step and applies the buffered signal in the same
+      // dispatch.
+      await runToEnd(wf, runId);
+
+      const output = await loadOutput(db, schema, runId);
+      expect(output).toEqual({ transcript: "t" });
+
+      const settled = await store.loadRunState(runId);
+      expect(
+        settled.facts.filter((x) => x.kind === "signal.received"),
+      ).toHaveLength(1);
+    }, 15_000);
+  });
+
   describe("pruneFacts — retention", () => {
     beforeEach(async () => {
       await sql
