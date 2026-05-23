@@ -52,7 +52,7 @@
   "devDependencies": {
     "@types/pg": "^8.11.0",
     "kysely": "^0.28.0",
-    "pg": "^8.13.0"
+    "pg": "^8.21.0"
   },
   "repository": {
     "type": "git",
