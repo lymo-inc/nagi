@@ -1,5 +1,96 @@
 # @nagi-js/core
 
+## 0.2.0-rc.11
+
+### Minor Changes
+
+- c8041c5: Buffer signals that arrive before their target step is claimed, closing the
+  start/await race.
+
+  `wf.signal()` no longer throws `Step "<id>" is not waiting for signal (status:
+pending)` when a signal lands before the worker has claimed the signal step. The
+  payload is parked as a new `signal.buffered` fact and applied atomically the
+  moment the worker claims the step (it enters `awaitingSignal`), so an early
+  `audioReady` / `recordingReady`-style signal can no longer be lost to dispatch
+  timing.
+
+  Adds `Store.settleSignal(...)`, which reconciles a signal with its step under a
+  per-run lock (the Postgres store uses `pg_advisory_xact_lock`); a new
+  `SignalBufferedFact`; and `RunState.bufferedSignals`. Custom `Store`
+  implementations must add `settleSignal` — the in-memory and Postgres stores
+  already do.
+
+  Delivery stays exactly-once: a buffered signal and a late direct signal cannot
+  both apply, and a signal that arrives after the step has already resolved is
+  still a no-op.
+
+### Patch Changes
+
+- 5cbca32: Replace the four-method `Logger` interface in `NagiConfig` with a single
+  structured-record callback `onLog?: (entry: LogEntry) => void` (RFC 0020).
+
+  **Breaking:** `NagiConfig.logger` is removed. nagi now produces a structured
+  record per diagnostic and the host decides how to render it, so the
+  object-first/message-first adapter every pino/bunyan consumer wrote disappears:
+
+  ```ts
+  // before
+  nagi({ ..., logger: adaptLogger(pino) })
+  // after — one line, format-agnostic
+  nagi({ ..., onLog: ({ level, msg, attrs }) => pino[level](attrs ?? {}, msg) })
+  ```
+
+  `LogEntry` is `{ readonly level: "debug" | "info" | "warn" | "error"; readonly msg: string; readonly attrs?: Record<string, unknown> }`.
+
+  Other behavior changes:
+
+  - **Silent by default.** Omitting `onLog` makes nagi completely silent — the
+    in-step `consoleLogger` fallback is removed, so nagi never writes to
+    `console.*` behind the host's back, and no `LogEntry` is allocated when there
+    is no sink.
+  - **In-step `ctx.logger` stays method-shaped** (`ctx.logger.info(msg, attrs)`)
+    and now auto-enriches every entry with `runId` / `stepId` / `attempt`
+    (runtime-authoritative: a handler cannot clobber the real ids), funneling into
+    the same `onLog` sink.
+  - **A throwing `onLog` is swallowed** — a logging bug can never fail or retry a
+    workflow step.
+  - `attrs` is `undefined` (never `{}`) when a diagnostic carries none.
+
+- Stronger state and type representation
+- e451bfd: `StepState.output` is now always present (`Json`) instead of optional
+  (`Json | undefined`). Non-completed step states (running, failed, canceled,
+  skipped) carry `output: null`; completed steps carry their value. This removes
+  the ambiguity between "step produced no output" and "step produced `null`" —
+  both were already collapsed to `null` at every read via `?? null`, so observable
+  behavior is unchanged. `projectRunState` populates the field for every step
+  state it emits.
+
+  Reading `state.output` is now total (no `undefined` check needed). The only
+  affected callers are ones that hand-constructed `StepState` literals, which must
+  now supply `output`.
+
+- 5cbca32: Add `b.streamingTask` — a step primitive for LLM token streaming. Inside `run`,
+  the handler calls `ctx.emit(chunk)` to push ephemeral chunks to live subscribers
+  while still `return`ing a value captured as the durable `step.output` (identical
+  to `b.task` for downstream `needs`). Consumers read via
+  `wf.subscribe<C>(runId, stepId): AsyncIterable<StreamEvent<C>>`.
+
+  Chunks are deliberately ephemeral: they never enter the fact log, the canonical
+  flow hash, or replay — the final output is the only durable artifact. Delivery
+  is fan-out (every subscriber sees every chunk), future-only by default
+  (opt-in `{ replayBuffered: true }`), and non-blocking with bounded
+  per-subscriber buffers (drop-oldest, surfaced as a `{ kind: "dropped" }`
+  marker). The subscription element is a discriminated envelope
+  `StreamEvent<C>` (`chunk` / `dropped` / `retry` / `error`) so control markers
+  can never be confused with data. Stream termination is derived from the durable
+  terminal fact (`step.completed`/`step.failed`/run-terminal), so a consumer's
+  `for await` never hangs.
+
+  Streaming is an optional `Store` capability (`subscribeStream?`/`publishChunk?`):
+  the in-memory store implements it; a flow using `b.streamingTask` against a store
+  without the capability throws at registration. (`@nagi-js/postgres` streaming is
+  deferred to a follow-up RFC.)
+
 ## 0.1.1-rc.10
 
 ### Patch Changes

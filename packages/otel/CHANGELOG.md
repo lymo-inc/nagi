@@ -1,5 +1,17 @@
 # @nagi-js/otel
 
+## 0.1.1-rc.11
+
+### Patch Changes
+
+- Stronger state and type representation
+- Updated dependencies [c8041c5]
+- Updated dependencies [5cbca32]
+- Updated dependencies
+- Updated dependencies [e451bfd]
+- Updated dependencies [5cbca32]
+  - @nagi-js/core@0.2.0-rc.11
+
 ## 0.1.1-rc.10
 
 ### Patch Changes

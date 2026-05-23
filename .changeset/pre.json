@@ -10,6 +10,7 @@
   "changesets": [
     "auto-code-version",
     "ctx-abort-signal-step-canceled",
+    "early-signal-buffering",
     "eight-dolls-rescue",
     "fold-parent-link",
     "great-geese-look",
@@ -18,6 +19,7 @@
     "late-pandas-dance",
     "multi-name-signal-waits",
     "next-transition-internal-cleanup",
+    "onlog-callback",
     "operator-interface",
     "otel-subflow-span-linkage",
     "parameterize-wf-over-flows",
@@ -26,7 +28,10 @@
     "runtime-bootstrap-ergonomics",
     "shorthand-concurrency-config",
     "simplify-core-surface",
+    "sixty-dots-fly",
+    "step-output-always-present",
     "step-scoped-replay-from",
+    "streaming-task",
     "subflow-runtime",
     "wf-start-by-id"
   ]

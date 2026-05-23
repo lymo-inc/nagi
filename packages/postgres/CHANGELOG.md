@@ -1,5 +1,39 @@
 # @nagi-js/postgres
 
+## 0.2.0-rc.11
+
+### Minor Changes
+
+- c8041c5: Buffer signals that arrive before their target step is claimed, closing the
+  start/await race.
+
+  `wf.signal()` no longer throws `Step "<id>" is not waiting for signal (status:
+pending)` when a signal lands before the worker has claimed the signal step. The
+  payload is parked as a new `signal.buffered` fact and applied atomically the
+  moment the worker claims the step (it enters `awaitingSignal`), so an early
+  `audioReady` / `recordingReady`-style signal can no longer be lost to dispatch
+  timing.
+
+  Adds `Store.settleSignal(...)`, which reconciles a signal with its step under a
+  per-run lock (the Postgres store uses `pg_advisory_xact_lock`); a new
+  `SignalBufferedFact`; and `RunState.bufferedSignals`. Custom `Store`
+  implementations must add `settleSignal` — the in-memory and Postgres stores
+  already do.
+
+  Delivery stays exactly-once: a buffered signal and a late direct signal cannot
+  both apply, and a signal that arrives after the step has already resolved is
+  still a no-op.
+
+### Patch Changes
+
+- Stronger state and type representation
+- Updated dependencies [c8041c5]
+- Updated dependencies [5cbca32]
+- Updated dependencies
+- Updated dependencies [e451bfd]
+- Updated dependencies [5cbca32]
+  - @nagi-js/core@0.2.0-rc.11
+
 ## 0.1.1-rc.10
 
 ### Patch Changes
