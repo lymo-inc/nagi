@@ -1,5 +1,6 @@
 import {
   asStepMapWithDefs,
+  type Guard,
   getDef,
   type MatchArmDef,
   type MatchDef,
@@ -111,14 +112,23 @@ async function canonicalizeStep(
   return canonicalizeMatch(base, def);
 }
 
+// Shared by task/signal/subflow (not match — it has neither). Key insertion
+// order is irrelevant to the flow hash: stableStringify sorts keys.
+async function applyGuardAndTimeout(
+  out: Mutable<CanonicalStep>,
+  def: { readonly when?: Guard; readonly timeoutMs?: Millis },
+): Promise<void> {
+  if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);
+  if (def.timeoutMs !== undefined) out.timeoutMs = def.timeoutMs;
+}
+
 async function canonicalizeTask(
   base: CanonicalStep,
   def: TaskDef | StreamingTaskDef,
 ): Promise<CanonicalStep> {
   const out: Mutable<CanonicalStep> = { ...base };
-  if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);
+  await applyGuardAndTimeout(out, def);
   if (def.retry !== undefined) out.retry = normalizeRetry(def.retry);
-  if (def.timeoutMs !== undefined) out.timeoutMs = def.timeoutMs;
   return out;
 }
 
@@ -127,8 +137,7 @@ async function canonicalizeSignal(
   def: SignalDef,
 ): Promise<CanonicalStep> {
   const out: Mutable<CanonicalStep> = { ...base };
-  if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);
-  if (def.timeoutMs !== undefined) out.timeoutMs = def.timeoutMs;
+  await applyGuardAndTimeout(out, def);
   out.signalSchema = await canonicalizeSchema(def.schema);
   if (def.names !== undefined) {
     out.signalNames = [...def.names].sort();
@@ -141,8 +150,7 @@ async function canonicalizeSubflow(
   def: SubflowDef,
 ): Promise<CanonicalStep> {
   const out: Mutable<CanonicalStep> = { ...base };
-  if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);
-  if (def.timeoutMs !== undefined) out.timeoutMs = def.timeoutMs;
+  await applyGuardAndTimeout(out, def);
   out.childFlowId = def.childFlowId;
   out.subflowInputHash = await hashFnSource(def.buildInput);
   return out;

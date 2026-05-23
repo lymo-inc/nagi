@@ -155,15 +155,7 @@ interface StepConfigBase<Input, N extends NeedsMap> {
   readonly timeoutMs?: Millis;
 }
 
-export interface TaskConfig<Input, N extends NeedsMap, Output>
-  extends StepConfigBase<Input, N> {
-  readonly retry?: RetryPolicy;
-  readonly run: (args: {
-    readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<ResolvedNeeds<N>>;
-    readonly ctx: StepCtx<NoInfer<Input>>;
-  }) => Promise<Output>;
-
+export interface StepLifecycleHooks<Output> {
   readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
   readonly onComplete?: (
     event: StepCompleteEvent & { readonly output: NoInfer<Output> },
@@ -172,21 +164,26 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
   readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
+export interface TaskConfig<Input, N extends NeedsMap, Output>
+  extends StepConfigBase<Input, N>,
+    StepLifecycleHooks<Output> {
+  readonly retry?: RetryPolicy;
+  readonly run: (args: {
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<ResolvedNeeds<N>>;
+    readonly ctx: StepCtx<NoInfer<Input>>;
+  }) => Promise<Output>;
+}
+
 export interface StreamingTaskConfig<Input, N extends NeedsMap, Output, Chunk>
-  extends StepConfigBase<Input, N> {
+  extends StepConfigBase<Input, N>,
+    StepLifecycleHooks<Output> {
   readonly retry?: RetryPolicy;
   readonly run: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
     readonly ctx: StreamingStepCtx<NoInfer<Input>, Chunk>;
   }) => Promise<Output>;
-
-  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
-  readonly onComplete?: (
-    event: StepCompleteEvent & { readonly output: NoInfer<Output> },
-  ) => void | Promise<void>;
-  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
-  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
 export interface SignalConfig<

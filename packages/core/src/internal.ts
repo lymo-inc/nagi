@@ -9,12 +9,9 @@ import type {
   RetryPolicy,
   StandardSchemaV1,
   Step,
-  StepCompleteEvent,
   StepCtx,
-  StepErrorEvent,
+  StepLifecycleHooks,
   StepMap,
-  StepRetryEvent,
-  StepStartEvent,
   StreamingStepCtx,
 } from "./types";
 
@@ -79,7 +76,7 @@ export type ArmGuard =
   | { readonly kind: "when"; readonly when: Guard }
   | { readonly kind: "otherwise" };
 
-export interface TaskDef {
+export interface TaskDef extends StepLifecycleHooks<Json> {
   readonly kind: "task";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
@@ -91,14 +88,9 @@ export interface TaskDef {
     ctx: StepCtx<unknown>;
   }) => Promise<Json>;
   readonly parentMatch?: ParentMatchRef;
-
-  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
-  readonly onComplete?: (event: StepCompleteEvent) => void | Promise<void>;
-  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
-  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
-export interface StreamingTaskDef {
+export interface StreamingTaskDef extends StepLifecycleHooks<Json> {
   readonly kind: "streaming";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
@@ -110,11 +102,6 @@ export interface StreamingTaskDef {
     ctx: StreamingStepCtx<unknown>;
   }) => Promise<Json>;
   readonly parentMatch?: ParentMatchRef;
-
-  readonly onStart?: (event: StepStartEvent) => void | Promise<void>;
-  readonly onComplete?: (event: StepCompleteEvent) => void | Promise<void>;
-  readonly onError?: (event: StepErrorEvent) => void | Promise<void>;
-  readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
 export interface SignalDef {

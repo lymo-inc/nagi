@@ -20,6 +20,10 @@ import type { Hooks } from "./hooks";
 
 const MAX_ADVANCE_ITERS = 1024;
 
+type StepSettlement =
+  | { readonly kind: "complete"; readonly output: Json }
+  | { readonly kind: "fail"; readonly error: SerializedError };
+
 export interface Progression {
   advance(runId: RunId): Promise<void>;
   propagateToParent(
@@ -88,51 +92,49 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
     }
   }
 
-  // The task path writes its fact inside the runStep tx and does not route through here.
-  async function markStepComplete(args: {
+  // match/subflow settlements route through here; the task path writes its own
+  // fact inside the runStep tx and does not.
+  async function markStepSettled(args: {
     readonly flow: Flow;
     readonly runId: RunId;
     readonly stepId: StepId;
     readonly attempt: AttemptNumber;
-    readonly kind: "match" | "subflow";
-    readonly output: Json;
+    readonly stepKind: "match" | "subflow";
+    readonly settlement: StepSettlement;
   }): Promise<void> {
-    const { flow, runId, stepId, attempt, kind, output } = args;
+    const { flow, runId, stepId, attempt, stepKind, settlement } = args;
     const at = deps.clock.now();
-    const fact = Facts.stepCompleted(runId, stepId, attempt, output, at);
-    await deps.store.settleStep(runId, stepId, fact);
-    await fireHook(
-      deps.hooks?.onStepComplete,
-      {
+    const base = {
+      runId,
+      flowId: flow.id,
+      stepId,
+      attempt,
+      kind: stepKind,
+      at,
+    };
+    if (settlement.kind === "complete") {
+      await deps.store.settleStep(
         runId,
-        flowId: flow.id,
         stepId,
-        attempt,
-        kind,
-        output,
-        at,
-      },
-      "onStepComplete",
-    );
-  }
-
-  async function markStepFail(args: {
-    readonly flow: Flow;
-    readonly runId: RunId;
-    readonly stepId: StepId;
-    readonly attempt: AttemptNumber;
-    readonly kind: "match" | "subflow";
-    readonly error: SerializedError;
-  }): Promise<void> {
-    const { flow, runId, stepId, attempt, kind, error } = args;
-    const at = deps.clock.now();
-    const fact = Facts.stepFailed(runId, stepId, attempt, error, at);
-    await deps.store.settleStep(runId, stepId, fact);
-    await fireHook(
-      deps.hooks?.onStepError,
-      { runId, flowId: flow.id, stepId, attempt, kind, error, at },
-      "onStepError",
-    );
+        Facts.stepCompleted(runId, stepId, attempt, settlement.output, at),
+      );
+      await fireHook(
+        deps.hooks?.onStepComplete,
+        { ...base, output: settlement.output },
+        "onStepComplete",
+      );
+    } else {
+      await deps.store.settleStep(
+        runId,
+        stepId,
+        Facts.stepFailed(runId, stepId, attempt, settlement.error, at),
+      );
+      await fireHook(
+        deps.hooks?.onStepError,
+        { ...base, error: settlement.error },
+        "onStepError",
+      );
+    }
   }
 
   async function applyPromotions(
@@ -141,25 +143,14 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
     promotions: readonly MatchPromotion[],
   ): Promise<void> {
     for (const { matchId, attempt, result } of promotions) {
-      if (result.kind === "fail") {
-        await markStepFail({
-          flow,
-          runId: runState.runId,
-          stepId: matchId,
-          attempt,
-          kind: "match",
-          error: result.error,
-        });
-      } else {
-        await markStepComplete({
-          flow,
-          runId: runState.runId,
-          stepId: matchId,
-          attempt,
-          kind: "match",
-          output: result.output,
-        });
-      }
+      await markStepSettled({
+        flow,
+        runId: runState.runId,
+        stepId: matchId,
+        attempt,
+        stepKind: "match",
+        settlement: result,
+      });
     }
   }
 
@@ -237,29 +228,17 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
 
     const parentFlow = await deps.flowFor(parentRunId);
 
-    if (outcome.kind === "completed") {
-      const subflowOutput: Json = {
-        childRunId,
-        output: outcome.output,
-      };
-      await markStepComplete({
-        flow: parentFlow,
-        runId: parentRunId,
-        stepId: parentStepId,
-        attempt,
-        kind: "subflow",
-        output: subflowOutput,
-      });
-    } else {
-      await markStepFail({
-        flow: parentFlow,
-        runId: parentRunId,
-        stepId: parentStepId,
-        attempt,
-        kind: "subflow",
-        error: outcome.error,
-      });
-    }
+    await markStepSettled({
+      flow: parentFlow,
+      runId: parentRunId,
+      stepId: parentStepId,
+      attempt,
+      stepKind: "subflow",
+      settlement:
+        outcome.kind === "completed"
+          ? { kind: "complete", output: { childRunId, output: outcome.output } }
+          : { kind: "fail", error: outcome.error },
+    });
 
     await advance(parentRunId);
   }
