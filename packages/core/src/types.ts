@@ -74,9 +74,6 @@ export interface Step<Output = unknown> {
 export type StepOutput<S> = S extends Step<infer O> ? O : never;
 export type StepMap = Readonly<Record<string, Step<unknown>>>;
 
-// optional(step) lets a need tolerate an upstream skip: it resolves to
-// Resolved<T> (value | skipped) instead of a bare T. A required need gates
-// execution, so its value is always present.
 export interface Optional<S extends Step = Step> {
   readonly __optional: S;
 }

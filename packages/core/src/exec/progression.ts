@@ -32,9 +32,6 @@ export interface Progression {
   ): Promise<void>;
 }
 
-// Drives a run forward: derive the next transition, perform its side effects,
-// finalize the flow, and wake a waiting parent. The advance ↔ propagateToParent
-// cycle lives entirely inside this module.
 export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
   const { fireHook } = hooks;
 

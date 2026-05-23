@@ -1,5 +1,14 @@
 # @nagi-js/pgmq
 
+## 0.1.1-rc.12
+
+### Patch Changes
+
+- Internal refactors for increased readability and improved type safety
+- Updated dependencies
+- Updated dependencies [803ebb9]
+  - @nagi-js/core@0.1.1-rc.12
+
 ## 0.1.1-rc.11
 
 ### Patch Changes

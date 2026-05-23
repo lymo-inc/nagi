@@ -112,8 +112,7 @@ async function canonicalizeStep(
   return canonicalizeMatch(base, def);
 }
 
-// Shared by task/signal/subflow (not match — it has neither). Key insertion
-// order is irrelevant to the flow hash: stableStringify sorts keys.
+// Key insertion order is irrelevant to the flow hash: stableStringify sorts keys.
 async function applyGuardAndTimeout(
   out: Mutable<CanonicalStep>,
   def: { readonly when?: Guard; readonly timeoutMs?: Millis },
