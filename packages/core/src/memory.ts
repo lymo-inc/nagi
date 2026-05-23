@@ -1,4 +1,5 @@
 import { Facts } from "./facts";
+import { decideSignal } from "./signals";
 import {
   foldRun,
   isTerminalRun,
@@ -224,70 +225,18 @@ export class InMemoryStore implements Store, StreamTransport {
     // completion with no interleaving await, giving the same atomicity the
     // postgres store gets from a per-run advisory lock.
     const runState = foldRun(runId, this.facts.get(runId) ?? []);
-    const step = stepStateOf(runState, stepId);
-
-    if (
-      step.tag === "completed" ||
-      step.tag === "failed" ||
-      step.tag === "skipped" ||
-      step.tag === "canceled"
-    ) {
-      return { tag: "noop" };
+    const decision = decideSignal({ runState, stepId, at, incoming });
+    switch (decision.kind) {
+      case "noop":
+        return decision.result;
+      case "buffer":
+        if (decision.fact !== null) await this.appendFact(runId, decision.fact);
+        return decision.result;
+      case "deliver":
+        await this.appendFact(runId, decision.received);
+        await this.appendFact(runId, decision.completed);
+        return decision.result;
     }
-
-    if (step.tag === "awaitingSignal") {
-      const source = incoming ?? runState.bufferedSignals[stepId];
-      if (source === undefined) return { tag: "noop" };
-      const { attempt } = step;
-      await this.appendFact(
-        runId,
-        Facts.signalReceived({
-          runId,
-          stepId,
-          payload: source.payload,
-          at,
-          ...(source.signalName !== undefined
-            ? { signalName: source.signalName }
-            : {}),
-        }),
-      );
-      const completedFact = Facts.stepCompleted(
-        runId,
-        stepId,
-        attempt,
-        source.payload,
-        at,
-      );
-      await this.appendFact(runId, completedFact);
-      return {
-        tag: "delivered",
-        attempt,
-        payload: source.payload,
-        ...(source.signalName !== undefined
-          ? { signalName: source.signalName }
-          : {}),
-      };
-    }
-
-    // Pre-awaiting (pending/running/backoff/aborting): park an incoming signal.
-    // A consume call (no incoming) here has nothing to apply.
-    if (incoming === undefined) return { tag: "noop" };
-    if (runState.bufferedSignals[stepId] !== undefined) {
-      return { tag: "buffered" };
-    }
-    await this.appendFact(
-      runId,
-      Facts.signalBuffered({
-        runId,
-        stepId,
-        payload: incoming.payload,
-        at,
-        ...(incoming.signalName !== undefined
-          ? { signalName: incoming.signalName }
-          : {}),
-      }),
-    );
-    return { tag: "buffered" };
   }
 
   async recordOnce(

@@ -29,6 +29,7 @@ import type {
   Json,
   QueueMessage,
   RunId,
+  RunState,
   StepCtx,
   StreamingStepCtx,
 } from "../types";
@@ -42,7 +43,7 @@ type Dispatched =
 
 type Admission =
   | { readonly tag: "skip" }
-  | { readonly tag: "run"; readonly def: StepDef };
+  | { readonly tag: "run"; readonly def: StepDef; readonly state: RunState };
 
 interface ExecuteTaskResult {
   readonly output: Json;
@@ -73,14 +74,14 @@ export function makeMessage(
       await queue.ack(message.receipt);
       return;
     }
-    const { def } = admission;
+    const { def, state } = admission;
 
-    await recordStarted({ flow, message, def });
+    await recordStarted({ flow, message, def, state });
 
     const startedAt = Date.now();
     let outcome: Dispatched;
     try {
-      outcome = await execute({ flow, message, def });
+      outcome = await execute({ flow, message, def, state });
     } catch (err) {
       outcome = await handleStepError({ flow, message, def, err });
     }
@@ -121,15 +122,20 @@ export function makeMessage(
     const claim = await store.claimStep(runId, stepId, attempt);
     if (claim === null) return { tag: "skip" };
 
-    return { tag: "run", def: getDef(step) };
+    // preState carries the immutable flow input and the (terminal) upstream
+    // outputs this step needs, so the rest of the dispatch reuses it instead of
+    // re-folding the history. The signal branch and the post-handler abort check
+    // still load fresh, since those depend on facts written after admission.
+    return { tag: "run", def: getDef(step), state: preState };
   }
 
   async function recordStarted(args: {
     flow: Flow;
     message: QueueMessage;
     def: StepDef;
+    state: RunState;
   }): Promise<void> {
-    const { flow, message, def } = args;
+    const { flow, message, def, state } = args;
     const { store, clock } = deps;
     const { runId, stepId, attempt } = message;
     const handler = handlerDef(def);
@@ -139,12 +145,11 @@ export function makeMessage(
       Facts.stepStarted(runId, stepId, attempt, def.kind, clock.now()),
     );
     // Start events surface the flow input only where the start is an
-    // input-processing moment; signal/match start with null by contract.
+    // input-processing moment; signal/match start with null by contract. Input
+    // is immutable after flow.started, so the admission snapshot is current.
     const startCarriesInput =
       def.kind === "task" || def.kind === "streaming" || def.kind === "subflow";
-    const input: Json = startCarriesInput
-      ? (await store.loadRunState(runId)).input
-      : null;
+    const input: Json = startCarriesInput ? state.input : null;
     await fireStepLifecycle(
       handler?.onStart,
       deps.hooks?.onStepStart,
@@ -165,8 +170,9 @@ export function makeMessage(
     flow: Flow;
     message: QueueMessage;
     def: StepDef;
+    state: RunState;
   }): Promise<Dispatched> {
-    const { flow, message, def } = args;
+    const { flow, message, def, state } = args;
     const { runId, stepId, attempt } = message;
 
     switch (def.kind) {
@@ -177,6 +183,7 @@ export function makeMessage(
           runId,
           stepId,
           attempt,
+          state,
         });
         return skipAdvance ? { tag: "parked" } : { tag: "completed", output };
       }
@@ -210,10 +217,10 @@ export function makeMessage(
         return { tag: "parked" };
       }
       case "match":
-        await executeMatch({ def, runId, stepId });
+        await executeMatch({ def, runId, stepId, state });
         return { tag: "advance" };
       case "subflow":
-        await executeSubflow({ def, runId, stepId, attempt });
+        await executeSubflow({ def, runId, stepId, attempt, state });
         return { tag: "parked" };
     }
   }
@@ -296,14 +303,12 @@ export function makeMessage(
     runId: RunId;
     stepId: string;
     attempt: number;
+    state: RunState;
   }): Promise<ExecuteTaskResult> {
-    const { def, runId, stepId, attempt } = args;
+    const { def, runId, stepId, attempt, state } = args;
     const { store, clock } = deps;
-    const runState = await store.loadRunState(runId);
-    const input = runState.input;
-    const needs = resolveNeeds(def, (id) =>
-      resolvedOf(stepStateOf(runState, id)),
-    );
+    const input = state.input;
+    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
 
     const ac = new AbortController();
     const watcher = startCancelWatcher({
@@ -364,20 +369,17 @@ export function makeMessage(
     runId: RunId;
     stepId: string;
     attempt: number;
+    state: RunState;
   }): Promise<void> {
-    const { def, runId, stepId, attempt } = args;
-    const { store } = deps;
+    const { def, runId, stepId, attempt, state } = args;
     const child = deps.lookupFlow(def.childFlowId);
     if (child === undefined) {
       throw new Error(
         `Subflow step "${stepId}" references child flow "${def.childFlowId}" which is not registered with nagi(). Pass it to flows[].`,
       );
     }
-    const runState = await store.loadRunState(runId);
-    const parentInput = runState.input;
-    const needs = resolveNeeds(def, (id) =>
-      resolvedOf(stepStateOf(runState, id)),
-    );
+    const parentInput = state.input;
+    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
     const childInput = def.buildInput({ input: parentInput, needs });
     await deps.startChildRun({
       child,
@@ -390,15 +392,13 @@ export function makeMessage(
     def: MatchDef;
     runId: RunId;
     stepId: string;
+    state: RunState;
   }): Promise<void> {
-    const { def, runId, stepId } = args;
+    const { def, runId, stepId, state } = args;
     const { store, clock } = deps;
 
-    const runState = await store.loadRunState(runId);
-    const input = runState.input;
-    const needs = resolveNeeds(def, (id) =>
-      resolvedOf(stepStateOf(runState, id)),
-    );
+    const input = state.input;
+    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
 
     const armId = selectArm(def, { input, needs });
 

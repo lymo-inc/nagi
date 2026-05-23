@@ -36,6 +36,7 @@ export {
   type StartOpts,
   type Wf,
 } from "./runtime";
+export { decideSignal, type SignalDecision } from "./signals";
 export type {
   Anomaly,
   Resolved,

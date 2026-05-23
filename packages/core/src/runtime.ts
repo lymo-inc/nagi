@@ -1,32 +1,23 @@
 import {
-  type CanonicalDag,
   canonicalize,
   fingerprintFlows,
   sha256Canonical,
 } from "./canonicalize";
-import { type DispatchDeps, type Dispatcher, makeDispatcher } from "./dispatch";
+import { type DispatchDeps, makeDispatcher } from "./dispatch";
 import {
   NagiCanceledError,
   NagiRuntimeError,
-  NagiSnapshotDriftError,
-  NagiValidationError,
   serializeError,
   validationError,
 } from "./errors";
 import { makeHooks } from "./exec/hooks";
 import { Facts } from "./facts";
 import { makeFlowRegistry } from "./flow-registry";
-import {
-  asStepMapWithDefs,
-  compact,
-  getDef,
-  makeEmit,
-  type SignalDef,
-} from "./internal";
+import { asStepMapWithDefs, compact, getDef, makeEmit } from "./internal";
 import { InMemoryClock } from "./memory";
 import { makeOperator } from "./operator";
-import { synthesizeReplayFlow } from "./replay-synth";
-import { descendantsOf } from "./scheduler";
+import { makeReplay } from "./replay";
+import { makeSignals } from "./signals";
 import { isTerminalRun, runStatusOf } from "./state";
 import type {
   CancelArgs,
@@ -49,7 +40,6 @@ import type {
   RetryPolicy,
   RunId,
   SerializedError,
-  StandardSchemaV1,
   StepId,
   Store,
   StreamEvent,
@@ -58,6 +48,7 @@ import type {
   Worker,
   WorkerConfig,
 } from "./types";
+import { validate } from "./validate";
 import { makeWorker } from "./worker";
 
 export interface NagiConfig {
@@ -378,6 +369,21 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   // cancelRunRecursive) — outside the dispatch path, so it owns its own Hooks.
   const hooks = makeHooks(dispatchDeps);
 
+  const signals = makeSignals({
+    dispatcher,
+    store: config.store,
+    clock,
+    registry,
+    hooks,
+    emitLog,
+    ...compact({ flowHooks: config.hooks }),
+  });
+  const replayer = makeReplay({
+    ...dispatchDeps,
+    registry,
+    hashFor: (id) => flowHashById.get(id),
+  });
+
   const wf: Wf = {
     async start<F extends Flow>(
       flow: F,
@@ -411,69 +417,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       return runId;
     },
 
-    async signal(
-      runId: RunId,
-      signalName: string,
-      payload: unknown,
-    ): Promise<void> {
-      const runState = await config.store.loadRunState(runId);
-      const flow = registry.requireForRun(runState.flowId, runId);
-      const resolved = resolveSignalStep(flow, signalName);
-      if (resolved === null) {
-        throw new NagiRuntimeError(
-          `Flow "${flow.id}" has no signal step accepting "${signalName}".`,
-        );
-      }
-      const { stepId, def } = resolved;
-      const validated = (await validate(def.schema, payload)) as Json;
-      const carriesAlias = signalName !== stepId;
-
-      // Atomic under the store's per-run lock; parks a signal.buffered fact when
-      // the step isn't claimed yet (the start/await race). The worker applies a
-      // buffered signal when it claims the step — see dispatch's signal branch.
-      const result = await config.store.settleSignal({
-        runId,
-        stepId,
-        at: clock.now(),
-        incoming: {
-          payload: validated,
-          ...(carriesAlias ? { signalName } : {}),
-        },
-      });
-
-      switch (result.tag) {
-        case "delivered":
-          await hooks.fireHook(
-            config.hooks?.onSignalReceived,
-            {
-              runId,
-              flowId: flow.id,
-              stepId,
-              attempt: result.attempt,
-              kind: "signal",
-              payload: validated,
-              at: clock.now(),
-            },
-            "onSignalReceived",
-          );
-          await dispatcher.advance(runId);
-          return;
-        case "buffered":
-          emitLog({
-            level: "info",
-            msg: "nagi: signal buffered before step ready; will apply on dispatch",
-            attrs: { runId, stepId, signalName },
-          });
-          return;
-        case "noop":
-          emitLog({
-            level: "info",
-            msg: "nagi: signal arrived after step resolved",
-            attrs: { runId, stepId, signalName },
-          });
-          return;
-      }
-    },
+    signal: signals.signal,
 
     async cancel(runId: RunId, opts?: CancelOpts): Promise<void> {
       await cancelRunRecursive(runId, {
@@ -502,82 +446,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       return makeWorker({ ...dispatchDeps, clock }, workerConfig);
     },
 
-    async replay(
-      runId: RunId,
-      opts: ReplayOpts = { mode: "continue" },
-    ): Promise<void> {
-      const runState = await config.store.loadRunState(runId);
-      const liveFlow = registry.requireForRun(runState.flowId, runId);
-      if (runState.phase.tag === "canceled") {
-        throw new NagiRuntimeError(
-          `Run ${runId} was canceled (superseded by a newer run with the same concurrency key). ` +
-            `Replay is not supported for canceled runs — start a new run instead.`,
-        );
-      }
-      if (opts.mode === "inspect") return;
-
-      const fireHooks = opts.fireHooks !== false;
-      const baseDeps: DispatchDeps = fireHooks
-        ? dispatchDeps
-        : { ...dispatchDeps, fireHooks: false };
-
-      let replayDeps = baseDeps;
-      let effectiveFlow: Flow = liveFlow;
-      const pinned = runState.flowHash;
-      if (pinned !== undefined) {
-        const liveHash = flowHashById.get(liveFlow.id);
-        if (liveHash !== undefined && liveHash !== pinned) {
-          if (!opts.allowDrift) {
-            throw new NagiSnapshotDriftError({
-              runId,
-              expected: pinned,
-              actual: liveHash,
-            });
-          }
-          const snapshot = await config.store.loadSnapshot(pinned);
-          if (snapshot === null) {
-            throw new NagiRuntimeError(
-              `Run ${runId} pinned to flow hash ${pinned.slice(0, 12)}… but ` +
-                `no snapshot with that hash was found. Cannot replay with allowDrift.`,
-            );
-          }
-          const synthesized = synthesizeReplayFlow(
-            snapshot.dag as unknown as CanonicalDag,
-            liveFlow,
-          );
-          replayDeps = { ...baseDeps, flowFor: async () => synthesized };
-          effectiveFlow = synthesized;
-        }
-      }
-
-      if (opts.from !== undefined) {
-        if (runState.phase.tag === "running") {
-          throw new NagiRuntimeError(
-            `Run ${runId} is still running — replay({ from }) would race in-flight workers. ` +
-              `Wait for the run to settle (completed / failed) before resetting from a step.`,
-          );
-        }
-        if (!(opts.from in effectiveFlow.steps)) {
-          throw validationError(
-            `replay({ from }): step "${opts.from}" is not a step in flow "${effectiveFlow.id}".`,
-            ["from"],
-          );
-        }
-        const cascade = descendantsOf(effectiveFlow, opts.from);
-        const at = clock.now();
-        for (const stepId of cascade) {
-          const fact =
-            stepId === opts.from
-              ? Facts.stepReset({ runId, stepId, at })
-              : Facts.stepReset({ runId, stepId, at, cascadedFrom: opts.from });
-          await config.store.appendFact(runId, fact);
-        }
-      }
-
-      const replayDispatcher = makeDispatcher(replayDeps);
-      await replayDispatcher.advance(runId);
-      if (!fireHooks) await drainInline(replayDispatcher, config.queue);
-    },
+    replay: replayer.replay,
 
     async queryRuns(opts: QueryRunsOpts = {}): Promise<QueryRunsResult> {
       if (opts.latest === true) {
@@ -725,51 +594,4 @@ function asStreamTransport(store: Store): StreamTransport | undefined {
     typeof s.publishChunk === "function"
     ? (s as StreamTransport)
     : undefined;
-}
-
-function resolveSignalStep(
-  flow: Flow,
-  signalName: string,
-): { readonly stepId: StepId; readonly def: SignalDef } | null {
-  const steps = asStepMapWithDefs(flow.steps);
-
-  const direct = steps[signalName];
-  if (direct !== undefined) {
-    const d = getDef(direct);
-    if (d.kind === "signal" && d.names === undefined) {
-      return { stepId: signalName, def: d };
-    }
-  }
-
-  for (const [id, s] of Object.entries(steps)) {
-    const d = getDef(s);
-    if (d.kind === "signal" && d.names?.includes(signalName)) {
-      return { stepId: id, def: d };
-    }
-  }
-
-  return null;
-}
-
-const MAX_REPLAY_DISPATCHES = 4096;
-async function drainInline(
-  dispatcher: Dispatcher,
-  queue: Queue,
-): Promise<void> {
-  for (let i = 0; i < MAX_REPLAY_DISPATCHES; i++) {
-    const messages = await queue.dequeue({ count: 1 });
-    if (messages.length === 0) return;
-    for (const msg of messages) await dispatcher.dispatchMessage(msg);
-  }
-}
-
-async function validate<S extends StandardSchemaV1>(
-  schema: S,
-  value: unknown,
-): Promise<unknown> {
-  const result = await schema["~standard"].validate(value);
-  if ("issues" in result && result.issues !== undefined) {
-    throw new NagiValidationError(result.issues);
-  }
-  return (result as { value: unknown }).value;
 }

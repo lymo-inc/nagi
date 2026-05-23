@@ -26,7 +26,7 @@ import type {
   Store,
   Tx,
 } from "@nagi-js/core";
-import { projectRunState, stepStateOf } from "@nagi-js/core";
+import { decideSignal, projectRunState } from "@nagi-js/core";
 import type { Kysely } from "kysely";
 import { sql } from "kysely";
 import { uuidv7 } from "./uuidv7";
@@ -235,71 +235,30 @@ class PostgresStore<DB = unknown> implements Store {
         );
 
         const runState = await this.loadRunStateWith(trx, runId);
-        const step = stepStateOf(runState, stepId);
-
-        // Already resolved (or otherwise terminal): nothing to deliver.
-        if (
-          step.tag === "completed" ||
-          step.tag === "failed" ||
-          step.tag === "skipped" ||
-          step.tag === "canceled"
-        ) {
-          return { tag: "noop" };
+        const decision = decideSignal({ runState, stepId, at, incoming });
+        switch (decision.kind) {
+          case "noop":
+            return decision.result;
+          case "buffer":
+            if (decision.fact !== null)
+              await this.insertFact(trx, runId, decision.fact);
+            return decision.result;
+          case "deliver":
+            await this.insertFact(trx, runId, decision.received);
+            // step.completed isn't materialized via insertFact (see
+            // applyFactToMaterialized), so settle the step row + lease here, the
+            // same way settleStep/runStep do for the task path.
+            await this.upsertStepCompleted(
+              trx,
+              runId,
+              stepId,
+              decision.attempt,
+              decision.completed.output,
+            );
+            await this.insertFact(trx, runId, decision.completed);
+            await this.deleteLease(trx, runId, stepId);
+            return decision.result;
         }
-
-        if (step.tag === "awaitingSignal") {
-          const source = incoming ?? runState.bufferedSignals[stepId];
-          if (source === undefined) return { tag: "noop" };
-          const { attempt } = step;
-          const { signalName } = source;
-          await this.insertFact(trx, runId, {
-            kind: "signal.received",
-            runId,
-            stepId,
-            payload: source.payload,
-            at,
-            ...(signalName !== undefined ? { signalName } : {}),
-          });
-          await this.upsertStepCompleted(
-            trx,
-            runId,
-            stepId,
-            attempt,
-            source.payload,
-          );
-          await this.insertFact(trx, runId, {
-            kind: "step.completed",
-            runId,
-            stepId,
-            attempt,
-            output: source.payload,
-            at,
-          });
-          await this.deleteLease(trx, runId, stepId);
-          return {
-            tag: "delivered",
-            attempt,
-            payload: source.payload,
-            ...(signalName !== undefined ? { signalName } : {}),
-          };
-        }
-
-        // Pre-awaiting (pending/running/backoff/aborting): park an incoming
-        // signal. A consume call (no incoming) has nothing to apply yet.
-        if (incoming === undefined) return { tag: "noop" };
-        if (runState.bufferedSignals[stepId] !== undefined) {
-          return { tag: "buffered" };
-        }
-        const { signalName } = incoming;
-        await this.insertFact(trx, runId, {
-          kind: "signal.buffered",
-          runId,
-          stepId,
-          payload: incoming.payload,
-          at,
-          ...(signalName !== undefined ? { signalName } : {}),
-        });
-        return { tag: "buffered" };
       });
     await this.maybeNotify(runId);
     return result;

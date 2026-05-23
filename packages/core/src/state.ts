@@ -101,6 +101,8 @@ export interface RunState {
     Record<StepId, { readonly payload: Json; readonly signalName?: string }>
   >;
   readonly anomalies: readonly Anomaly[];
+  // The source log this projection folded from, kept for introspection and
+  // test/debug assertions; the engine reads the projection above, never this.
   readonly facts: readonly Fact[];
   readonly parent?: ParentLink;
   readonly flowHash?: string;
