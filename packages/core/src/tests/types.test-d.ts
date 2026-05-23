@@ -1,7 +1,7 @@
 import { describe, expectTypeOf, it } from "vitest";
-import { flow } from "../builder";
+import { flow, optional } from "../builder";
 import { nagi, type Wf } from "../runtime";
-import { type Resolved, unwrap } from "../state";
+import type { Resolved } from "../state";
 import type {
   Builder,
   Fact,
@@ -108,13 +108,26 @@ describe("Builder.task", () => {
     const downstream = builderX.task({
       needs: { rec: upstream },
       run: async ({ needs }) => {
-        expectTypeOf(needs.rec).toEqualTypeOf<
-          Resolved<{ recordingUrl: string }>
-        >();
+        expectTypeOf(needs.rec).toEqualTypeOf<{ recordingUrl: string }>();
         return { ok: true };
       },
     });
     expectTypeOf(downstream).toEqualTypeOf<Step<{ ok: boolean }>>();
+  });
+
+  it("optional() need surfaces Resolved<Output>, bare need stays raw", () => {
+    const upstream = builderX.task({
+      run: async () => ({ recordingUrl: "url" }),
+    });
+    builderX.task({
+      needs: { rec: optional(upstream) },
+      run: async ({ needs }) => {
+        expectTypeOf(needs.rec).toEqualTypeOf<
+          Resolved<{ recordingUrl: string }>
+        >();
+        return null;
+      },
+    });
   });
 
   it("when predicate sees both input and needs", () => {
@@ -123,10 +136,8 @@ describe("Builder.task", () => {
       needs: { review: upstream },
       when: ({ input, needs }) => {
         expectTypeOf(input).toEqualTypeOf<{ x: number }>();
-        expectTypeOf(needs.review).toEqualTypeOf<
-          Resolved<{ approved: boolean }>
-        >();
-        return unwrap(needs.review).approved;
+        expectTypeOf(needs.review).toEqualTypeOf<{ approved: boolean }>();
+        return needs.review.approved;
       },
       run: async () => null,
     });
@@ -139,7 +150,7 @@ describe("Builder.match — guard mode", () => {
       needs: { s: scoreStep },
       arms: [
         {
-          when: ({ needs }) => unwrap(needs.s).value >= 90,
+          when: ({ needs }) => needs.s.value >= 90,
           build: (b) => ({
             f: b.task({ run: async () => ({ tier: "premium" as const }) }),
           }),
@@ -162,7 +173,7 @@ describe("Builder.match — guard mode", () => {
     // @ts-expect-error
     const _badArm: MatchArm<unknown, ScoreNeeds, StepMap> = {
       when: (args: { input: unknown; needs: ResolvedNeeds<ScoreNeeds> }) =>
-        unwrap(args.needs.s).intent,
+        args.needs.s.intent,
       otherwise: true,
       build: (b) => ({ f: b.task({ run: async () => null }) }),
     };

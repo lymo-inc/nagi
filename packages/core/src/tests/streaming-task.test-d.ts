@@ -1,6 +1,5 @@
 import { describe, expectTypeOf, it } from "vitest";
 import type { Wf } from "../runtime";
-import type { Resolved } from "../state";
 import type {
   AttemptNumber,
   Builder,
@@ -51,7 +50,7 @@ describe("Builder.streamingTask — output inference", () => {
     builderX.task({
       needs: { gen: upstream },
       run: async ({ needs }) => {
-        expectTypeOf(needs.gen).toEqualTypeOf<Resolved<{ final: string }>>();
+        expectTypeOf(needs.gen).toEqualTypeOf<{ final: string }>();
         return null;
       },
     });

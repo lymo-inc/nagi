@@ -326,57 +326,33 @@ class PostgresStore<DB = unknown> implements Store {
     return row ? (row.token as ClaimToken) : null;
   }
 
-  async completeStep(
+  async settleStep(
     runId: RunId,
     stepId: StepId,
-    output: Json,
-    fact: Fact,
+    fact: StepCompletedFact | StepFailedFact,
   ): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
-      await this.upsertStepCompleted(
-        trx,
-        runId,
-        stepId,
-        fact.kind === "step.completed" ? fact.attempt : 1,
-        output,
-      );
+      if (fact.kind === "step.completed") {
+        await this.upsertStepCompleted(
+          trx,
+          runId,
+          stepId,
+          fact.attempt,
+          fact.output,
+        );
+      } else {
+        await this.upsertStepFailed(
+          trx,
+          runId,
+          stepId,
+          fact.attempt,
+          fact.error,
+        );
+      }
       await this.insertFact(trx, runId, fact);
-      await this.applyFactToMaterialized(trx, runId, fact);
       await this.deleteLease(trx, runId, stepId);
     });
     await this.maybeNotify(runId);
-  }
-
-  async failStep(
-    runId: RunId,
-    stepId: StepId,
-    error: SerializedError,
-    fact: Fact,
-  ): Promise<void> {
-    await this.db.transaction().execute(async (trx) => {
-      await this.upsertStepFailed(
-        trx,
-        runId,
-        stepId,
-        fact.kind === "step.failed" ? fact.attempt : 1,
-        error,
-      );
-      await this.insertFact(trx, runId, fact);
-      await this.applyFactToMaterialized(trx, runId, fact);
-      await this.deleteLease(trx, runId, stepId);
-    });
-    await this.maybeNotify(runId);
-  }
-
-  async getStepOutput(runId: RunId, stepId: StepId): Promise<Json | null> {
-    const r = await sql<{ output: Json | null }>`
-      SELECT output
-        FROM ${sql.raw(this.t("step_run"))}
-       WHERE run_id = ${runId} AND step_id = ${stepId} AND status = 'completed'
-       ORDER BY attempt DESC
-       LIMIT 1
-    `.execute(this.db);
-    return r.rows[0]?.output ?? null;
   }
 
   async recordOnce(

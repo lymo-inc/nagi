@@ -1,9 +1,11 @@
-import type { Resolved } from "./state";
+import { type Resolved, unwrap } from "./state";
 import type {
   Json,
   LogEntry,
   Millis,
+  NeedRef,
   NeedsMap,
+  Optional,
   RetryPolicy,
   StandardSchemaV1,
   Step,
@@ -17,6 +19,29 @@ import type {
 } from "./types";
 
 export type EmitLog = (entry: LogEntry) => void;
+
+export interface NeedRefDef {
+  readonly step: Step;
+  readonly optional: boolean;
+}
+export type NeedsDefMap = Readonly<Record<string, NeedRefDef>>;
+
+function isOptional(ref: NeedRef): ref is Optional<Step> {
+  return "__optional" in ref;
+}
+
+// Normalizes optionality once, at the builder boundary, so internals work
+// against a single {step, optional} shape.
+export function normalizeNeeds(needs: NeedsMap | undefined): NeedsDefMap {
+  const out: Record<string, NeedRefDef> = {};
+  if (needs === undefined) return out;
+  for (const [key, ref] of Object.entries(needs)) {
+    out[key] = isOptional(ref)
+      ? { step: ref.__optional, optional: true }
+      : { step: ref, optional: false };
+  }
+  return out;
+}
 
 export function makeEmit(onLog?: (entry: LogEntry) => void): EmitLog {
   if (!onLog) return () => {};
@@ -44,15 +69,22 @@ export interface ParentMatchRef {
   readonly armId: string;
 }
 
+export type GuardArgs = {
+  readonly input: unknown;
+  readonly needs: Record<string, unknown>;
+};
+export type Guard = (args: GuardArgs) => boolean;
+
+export type ArmGuard =
+  | { readonly kind: "when"; readonly when: Guard }
+  | { readonly kind: "otherwise" };
+
 export interface TaskDef {
   readonly kind: "task";
-  readonly needs: NeedsMap;
+  readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
   readonly timeoutMs?: Millis;
-  readonly when?: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-  }) => boolean;
+  readonly when?: Guard;
   readonly run: (args: {
     input: unknown;
     needs: Record<string, unknown>;
@@ -68,13 +100,10 @@ export interface TaskDef {
 
 export interface StreamingTaskDef {
   readonly kind: "streaming";
-  readonly needs: NeedsMap;
+  readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
   readonly timeoutMs?: Millis;
-  readonly when?: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-  }) => boolean;
+  readonly when?: Guard;
   readonly run: (args: {
     input: unknown;
     needs: Record<string, unknown>;
@@ -90,64 +119,47 @@ export interface StreamingTaskDef {
 
 export interface SignalDef {
   readonly kind: "signal";
-  readonly needs: NeedsMap;
+  readonly needs: NeedsDefMap;
   readonly schema: StandardSchemaV1;
   readonly names?: readonly [string, ...string[]];
   readonly timeoutMs?: Millis;
-  readonly when?: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-  }) => boolean;
+  readonly when?: Guard;
   readonly parentMatch?: ParentMatchRef;
 }
 
 export interface MatchArmDef {
   readonly id: string;
-  readonly when?: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-  }) => boolean;
-  readonly otherwise?: true;
+  readonly guard: ArmGuard;
   readonly stepIds: readonly string[];
 }
 
 export interface MatchDef {
   readonly kind: "match";
-  readonly needs: NeedsMap;
+  readonly needs: NeedsDefMap;
   readonly arms: readonly MatchArmDef[];
   readonly parentMatch?: ParentMatchRef;
 }
 
 export interface PendingMatchArm {
   readonly id: string;
-  readonly when?: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-  }) => boolean;
-  readonly otherwise?: true;
+  readonly guard: ArmGuard;
   readonly nested: StepMap;
 }
 
 export interface PendingMatchDef {
   readonly kind: "match";
-  readonly needs: NeedsMap;
+  readonly needs: NeedsDefMap;
   readonly arms: readonly PendingMatchArm[];
   readonly parentMatch?: ParentMatchRef;
 }
 
 export interface SubflowDef {
   readonly kind: "subflow";
-  readonly needs: NeedsMap;
+  readonly needs: NeedsDefMap;
   readonly childFlowId: string;
-  readonly buildInput: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-  }) => unknown;
+  readonly buildInput: (args: GuardArgs) => unknown;
   readonly timeoutMs?: Millis;
-  readonly when?: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-  }) => boolean;
+  readonly when?: Guard;
   readonly parentMatch?: ParentMatchRef;
 }
 
@@ -195,7 +207,7 @@ export function handlerDef(def: StepDef): HandlerDef | undefined {
 }
 
 export function needsStepIds(def: StepDef): readonly string[] {
-  return Object.values(def.needs).map((upstream) => upstream.id);
+  return Object.values(def.needs).map((ref) => ref.step.id);
 }
 
 export function resolveNeeds(
@@ -203,8 +215,11 @@ export function resolveNeeds(
   loadResolved: (stepId: string) => Resolved,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
-  for (const [localKey, upstream] of Object.entries(def.needs)) {
-    result[localKey] = loadResolved(upstream.id);
+  for (const [localKey, ref] of Object.entries(def.needs)) {
+    const resolved = loadResolved(ref.step.id);
+    // A required need is gated on completion, so it always carries a value;
+    // only optional needs surface the Resolved union to the handler.
+    result[localKey] = ref.optional ? resolved : unwrap(resolved);
   }
   return result;
 }
@@ -215,13 +230,10 @@ export function asStepMapWithDefs(steps: StepMap): StepMapWithDefs {
   return steps as StepMapWithDefs;
 }
 
-export function selectArm(
-  def: MatchDef,
-  args: { readonly input: unknown; readonly needs: Record<string, unknown> },
-): string {
+export function selectArm(def: MatchDef, args: GuardArgs): string {
   for (const arm of def.arms) {
-    if (arm.otherwise) return arm.id;
-    if (arm.when?.(args)) return arm.id;
+    if (arm.guard.kind === "otherwise") return arm.id;
+    if (arm.guard.when(args)) return arm.id;
   }
   throw new Error(
     `match: no arm matched and no { otherwise: true } fallback was provided`,

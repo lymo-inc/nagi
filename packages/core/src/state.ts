@@ -1,3 +1,4 @@
+import { compact } from "./internal";
 import type {
   AttemptNumber,
   Fact,
@@ -20,8 +21,6 @@ import type {
 } from "./types";
 
 export type SkipReason = "when-false" | "transitive" | "manual";
-
-export type Cascade = "skip" | "continue";
 
 export type StepCancelCause =
   | { readonly kind: "run-canceled" }
@@ -70,7 +69,6 @@ export type StepState =
   | {
       readonly tag: "skipped";
       readonly reason: SkipReason;
-      readonly cascade: Cascade;
     }
   | { readonly tag: "canceled"; readonly cause: StepCancelCause };
 
@@ -95,6 +93,7 @@ export interface Anomaly {
 export interface RunState {
   readonly runId: RunId;
   readonly flowId: string;
+  readonly input: Json;
   readonly phase: RunPhase;
   readonly steps: Readonly<Record<StepId, StepState>>;
   readonly selectedArms: Readonly<Record<StepId, string>>;
@@ -186,13 +185,14 @@ export function isTerminalRun(state: RunState): boolean {
   return state.phase.tag !== "pending" && state.phase.tag !== "running";
 }
 
-export function extractInput(runState: RunState): Json {
-  for (const fact of runState.facts) {
-    if (fact.kind === "flow.started") return fact.input;
-  }
-  throw new Error(
-    "No flow.started fact in run — was the run initialized via wf.start?",
-  );
+// Reads the projected `aborting` tag rather than rescanning facts. Sound inside
+// the runStep tx and the cancel watcher because the step is still non-terminal
+// there, so the tag faithfully reflects an outstanding abort for this attempt.
+export function isAbortRequested(
+  s: StepState,
+  attempt: AttemptNumber,
+): boolean {
+  return s.tag === "aborting" && s.attempt === attempt;
 }
 
 export function isStepTerminal(s: StepState): boolean {
@@ -267,10 +267,7 @@ function stepTransition(prev: StepState, fact: StepScopedFact): StepTransition {
       if (isStepTerminal(prev)) return keep(prev);
       const cause: StepCancelCause =
         prev.tag === "aborting"
-          ? {
-              kind: "aborted",
-              ...(fact.error !== undefined ? { error: fact.error } : {}),
-            }
+          ? { kind: "aborted", ...compact({ error: fact.error }) }
           : { kind: "run-canceled" };
       return { next: { tag: "canceled", cause }, anomaly: false };
     }
@@ -296,7 +293,6 @@ function stepTransition(prev: StepState, fact: StepScopedFact): StepTransition {
           next: {
             tag: "skipped",
             reason: fact.reason,
-            cascade: fact.cascade ?? "skip",
           },
           anomaly: false,
         };
@@ -328,20 +324,21 @@ function runCancelCause(fact: FlowCanceledFact): RunCancelCause {
       return {
         kind: "explicit",
         reason: fact.reason,
-        ...(fact.note !== undefined ? { note: fact.note } : {}),
+        ...compact({ note: fact.note }),
       };
     case "operator":
       return {
         kind: "operator",
         actor: fact.actor,
         reason: fact.reason,
-        ...(fact.note !== undefined ? { note: fact.note } : {}),
+        ...compact({ note: fact.note }),
       };
   }
 }
 
 export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
   let flowId = "";
+  let input: Json = null;
   let phase: RunPhase = { tag: "pending" };
   let parent: ParentLink | undefined;
   let flowHash: string | undefined;
@@ -358,6 +355,7 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
     switch (fact.kind) {
       case "flow.started":
         flowId = fact.flowId;
+        input = fact.input;
         phase = { tag: "running" };
         parent = fact.parent;
         flowHash = fact.flowHash;
@@ -405,9 +403,7 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
         if (!(fact.stepId in bufferedSignals)) {
           bufferedSignals[fact.stepId] = {
             payload: fact.payload,
-            ...(fact.signalName !== undefined
-              ? { signalName: fact.signalName }
-              : {}),
+            ...compact({ signalName: fact.signalName }),
           };
         }
         break;
@@ -421,14 +417,13 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
   return {
     runId,
     flowId,
+    input,
     phase,
     steps,
     selectedArms,
     bufferedSignals,
     anomalies,
     facts,
-    ...(parent !== undefined ? { parent } : {}),
-    ...(flowHash !== undefined ? { flowHash } : {}),
-    ...(codeVersion !== undefined ? { codeVersion } : {}),
+    ...compact({ parent, flowHash, codeVersion }),
   };
 }

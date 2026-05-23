@@ -272,19 +272,14 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
       at: new Date(1100),
       parent: { runId: parentId, stepId: "sub" },
     });
-    await store.completeStep(
-      childId,
-      "s1",
-      { ok: 1 },
-      {
-        kind: "step.completed",
-        runId: childId,
-        stepId: "s1",
-        attempt: 1,
-        at: new Date(1200),
-        output: { ok: 1 },
-      },
-    );
+    await store.settleStep(childId, "s1", {
+      kind: "step.completed",
+      runId: childId,
+      stepId: "s1",
+      attempt: 1,
+      at: new Date(1200),
+      output: { ok: 1 },
+    });
     await store.recordOnce(childId, "s1", "scope", { recorded: true });
     await store.claimStep(childId, "s2", 1);
     await store.appendFact(childId, {
@@ -299,7 +294,7 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
     );
 
     expect(await store.listChildren(parentId)).toEqual([]);
-    expect(await store.getStepOutput(childId, "s1")).toBeNull();
+    expect((await store.loadRunState(childId)).facts).toEqual([]);
     expect(await store.getOnce(childId, "s1", "scope")).toBeNull();
     expect(await store.claimStep(childId, "s2", 1)).toBeTruthy();
   });

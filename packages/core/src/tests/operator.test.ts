@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "../builder";
+import { flow, optional } from "../builder";
 import { NagiRuntimeError, NagiValidationError } from "../errors";
 import type {
   FlowCanceledFact,
@@ -10,7 +10,7 @@ import type {
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
 describe("wf.operator().skip()", () => {
-  it("manual skip with cascade=skip transitively skips downstream", async () => {
+  it("manual skip transitively skips a bare-need downstream", async () => {
     let bRan = 0;
     const f = flow({
       id: "skip-cascade-skip",
@@ -49,20 +49,19 @@ describe("wf.operator().skip()", () => {
     expect(manual?.reason).toBe("manual");
     expect(manual?.actor).toBe("ops@nagi");
     expect(manual?.note).toBe("vendor down");
-    expect(manual?.cascade).toBe("skip");
   });
 
-  it("manual skip with cascade=continue lets downstream run with needs.x resolved as skipped", async () => {
+  it("optional() need lets downstream run with the upstream resolved as skipped", async () => {
     let observed: unknown = "untouched";
     const f = flow({
-      id: "skip-cascade-continue",
+      id: "skip-optional-need",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => {
         const a = b.signal({
           schema: passthroughSchema<{ v: number }>(),
         });
         const bStep = b.task({
-          needs: { a },
+          needs: { a: optional(a) },
           run: async ({ needs }) => {
             observed = needs.a;
             return { ran: true };
@@ -75,10 +74,7 @@ describe("wf.operator().skip()", () => {
     const runId = await h.wf.start(f, {});
     await h.drain();
 
-    await h.wf.operator().skip(runId, "a", {
-      actor: "ops@nagi",
-      cascade: "continue",
-    });
+    await h.wf.operator().skip(runId, "a", { actor: "ops@nagi" });
     await h.drain();
 
     const result = await h.result(runId);

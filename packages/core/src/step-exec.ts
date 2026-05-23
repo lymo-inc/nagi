@@ -1,9 +1,9 @@
+import { Facts } from "./facts";
 import { makeIdempotencyKey, makeOnce } from "./idempotency";
 import type { EmitLog } from "./internal";
-import { isTerminalRun } from "./state";
+import { isAbortRequested, isTerminalRun, stepStateOf } from "./state";
 import type {
   Clock,
-  Fact,
   Json,
   Logger,
   LogLevel,
@@ -51,26 +51,6 @@ class NagiAbortError extends Error {
   }
 }
 
-export function hasAbortRequest(
-  facts: ReadonlyArray<Fact>,
-  stepId: string,
-  attempt: number,
-): boolean {
-  for (let i = facts.length - 1; i >= 0; i--) {
-    const f = facts[i];
-    if (f === undefined) continue;
-    if (f.kind === "step.reset" && f.stepId === stepId) return false;
-    if (
-      f.kind === "step.abort-requested" &&
-      f.stepId === stepId &&
-      f.attempt === attempt
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Computed inside the runStep tx so the fact commits atomically with the step's
 // writes. An operator abort reports abortedHere so the caller skips advancing —
 // the abort re-enqueues the step elsewhere.
@@ -86,28 +66,22 @@ export function resolveExecutionFact(args: {
   readonly abortedHere: boolean;
 } {
   const { postState, runId, stepId, attempt, output, at } = args;
-  const canceled: StepCanceledFact = {
-    kind: "step.canceled",
-    runId,
-    stepId,
-    attempt,
-    at,
-  };
   if (postState.phase.tag === "canceled") {
-    return { fact: canceled, abortedHere: false };
+    return {
+      fact: Facts.stepCanceled(runId, stepId, attempt, at),
+      abortedHere: false,
+    };
   }
-  if (hasAbortRequest(postState.facts, stepId, attempt)) {
-    return { fact: canceled, abortedHere: true };
+  if (isAbortRequested(stepStateOf(postState, stepId), attempt)) {
+    return {
+      fact: Facts.stepCanceled(runId, stepId, attempt, at),
+      abortedHere: true,
+    };
   }
-  const completed: StepCompletedFact = {
-    kind: "step.completed",
-    runId,
-    stepId,
-    attempt,
-    output,
-    at,
+  return {
+    fact: Facts.stepCompleted(runId, stepId, attempt, output, at),
+    abortedHere: false,
   };
-  return { fact: completed, abortedHere: false };
 }
 
 export function startCancelWatcher(args: {
@@ -130,7 +104,7 @@ export function startCancelWatcher(args: {
           if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
           return;
         }
-        if (hasAbortRequest(s.facts, stepId, attempt)) {
+        if (isAbortRequested(stepStateOf(s, stepId), attempt)) {
           if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "step"));
           return;
         }

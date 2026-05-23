@@ -1,3 +1,4 @@
+import { Facts } from "./facts";
 import {
   foldRun,
   isTerminalRun,
@@ -29,7 +30,6 @@ import type {
   RunId,
   RunState,
   RunSummary,
-  SerializedError,
   SettleSignalResult,
   StepCanceledFact,
   StepCompletedFact,
@@ -37,6 +37,7 @@ import type {
   StepId,
   Store,
   StreamEvent,
+  StreamTransport,
   Trigger,
   Tx,
 } from "./types";
@@ -52,9 +53,8 @@ export interface InMemoryStoreOpts {
 
 const DEFAULT_STORE_LEASE_MS: Millis = 60_000;
 
-export class InMemoryStore implements Store {
+export class InMemoryStore implements Store, StreamTransport {
   private readonly facts = new Map<string, Fact[]>();
-  private readonly outputs = new Map<string, Json>();
   private readonly onces = new Map<string, Json>();
   private readonly leases = new Map<string, MemoryLease>();
   private readonly snapshots = new Map<
@@ -124,7 +124,6 @@ export class InMemoryStore implements Store {
       for (const key of this.leases.keys()) {
         if (key.startsWith(leasePrefix)) this.leases.delete(key);
       }
-      this.outputs.delete(`${runId}::${fact.stepId}`);
     }
   }
 
@@ -154,14 +153,12 @@ export class InMemoryStore implements Store {
       const slot = `${fact.flowId}::${concurrency.key}`;
       const priorRunId = this.activeByKey.get(slot);
       if (priorRunId !== undefined) {
-        const cancelFact: FlowCanceledByConcurrencyFact = {
-          kind: "flow.canceled",
-          cause: "concurrency",
+        const cancelFact = Facts.flowCanceledByConcurrency({
           runId: priorRunId,
           at: fact.at,
           canceledByRunId: runId,
           concurrencyKey: concurrency.key,
-        };
+        });
         await this.appendFact(priorRunId, cancelFact);
         canceled.push({ runId: priorRunId, fact: cancelFact });
       }
@@ -205,21 +202,10 @@ export class InMemoryStore implements Store {
     return token;
   }
 
-  async completeStep(
-    runId: RunId,
-    stepId: StepId,
-    output: Json,
-    fact: Fact,
-  ): Promise<void> {
-    this.outputs.set(`${runId}::${stepId}`, output);
-    await this.appendFact(runId, fact);
-  }
-
-  async failStep(
+  async settleStep(
     runId: RunId,
     _stepId: StepId,
-    _error: SerializedError,
-    fact: Fact,
+    fact: StepCompletedFact | StepFailedFact,
   ): Promise<void> {
     await this.appendFact(runId, fact);
   }
@@ -253,25 +239,26 @@ export class InMemoryStore implements Store {
       const source = incoming ?? runState.bufferedSignals[stepId];
       if (source === undefined) return { tag: "noop" };
       const { attempt } = step;
-      await this.appendFact(runId, {
-        kind: "signal.received",
+      await this.appendFact(
         runId,
-        stepId,
-        payload: source.payload,
-        at,
-        ...(source.signalName !== undefined
-          ? { signalName: source.signalName }
-          : {}),
-      });
-      const completedFact: StepCompletedFact = {
-        kind: "step.completed",
+        Facts.signalReceived({
+          runId,
+          stepId,
+          payload: source.payload,
+          at,
+          ...(source.signalName !== undefined
+            ? { signalName: source.signalName }
+            : {}),
+        }),
+      );
+      const completedFact = Facts.stepCompleted(
         runId,
         stepId,
         attempt,
-        output: source.payload,
+        source.payload,
         at,
-      };
-      await this.completeStep(runId, stepId, source.payload, completedFact);
+      );
+      await this.appendFact(runId, completedFact);
       return {
         tag: "delivered",
         attempt,
@@ -288,21 +275,19 @@ export class InMemoryStore implements Store {
     if (runState.bufferedSignals[stepId] !== undefined) {
       return { tag: "buffered" };
     }
-    await this.appendFact(runId, {
-      kind: "signal.buffered",
+    await this.appendFact(
       runId,
-      stepId,
-      payload: incoming.payload,
-      at,
-      ...(incoming.signalName !== undefined
-        ? { signalName: incoming.signalName }
-        : {}),
-    });
+      Facts.signalBuffered({
+        runId,
+        stepId,
+        payload: incoming.payload,
+        at,
+        ...(incoming.signalName !== undefined
+          ? { signalName: incoming.signalName }
+          : {}),
+      }),
+    );
     return { tag: "buffered" };
-  }
-
-  async getStepOutput(runId: RunId, stepId: StepId): Promise<Json | null> {
-    return this.outputs.get(`${runId}::${stepId}`) ?? null;
   }
 
   async recordOnce(
@@ -324,7 +309,7 @@ export class InMemoryStore implements Store {
 
   async runStep<T extends Json>(
     runId: RunId,
-    stepId: StepId,
+    _stepId: StepId,
     _attempt: AttemptNumber,
     body: (tx: Tx) => Promise<{
       readonly output: T;
@@ -332,13 +317,7 @@ export class InMemoryStore implements Store {
     }>,
   ): Promise<T> {
     const result = await body(undefined as unknown as Tx);
-    if (result.fact.kind === "step.completed") {
-      await this.completeStep(runId, stepId, result.output, result.fact);
-    } else if (result.fact.kind === "step.failed") {
-      await this.failStep(runId, stepId, result.fact.error, result.fact);
-    } else {
-      await this.appendFact(runId, result.fact);
-    }
+    await this.appendFact(runId, result.fact);
     return result.output;
   }
 
@@ -458,7 +437,6 @@ export class InMemoryStore implements Store {
     let factsPruned = 0;
     for (const v of victims) {
       this.facts.delete(v.runId);
-      deleteByRunPrefix(this.outputs, v.runId);
       deleteByRunPrefix(this.onces, v.runId);
       deleteByRunPrefix(this.leases, v.runId);
       this.childrenByParent.delete(v.runId);

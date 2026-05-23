@@ -13,6 +13,8 @@ import {
   serializeError,
   validationError,
 } from "./errors";
+import { makeHooks } from "./exec/hooks";
+import { Facts } from "./facts";
 import { makeFlowRegistry } from "./flow-registry";
 import {
   asStepMapWithDefs,
@@ -29,13 +31,10 @@ import { isTerminalRun, runStatusOf } from "./state";
 import type {
   CancelArgs,
   Clock,
-  Fact,
   Flow,
-  FlowCanceledFact,
   FlowHooks,
   FlowIdOf,
   FlowInput,
-  FlowStartedFact,
   Json,
   LogEntry,
   Operator,
@@ -54,6 +53,7 @@ import type {
   StepId,
   Store,
   StreamEvent,
+  StreamTransport,
   Trigger,
   Worker,
   WorkerConfig,
@@ -63,6 +63,7 @@ import { makeWorker } from "./worker";
 export interface NagiConfig {
   readonly flows: ReadonlyArray<Flow>;
   readonly store: Store;
+  readonly streamTransport?: StreamTransport;
   readonly queue: Queue;
   readonly clock?: Clock;
   readonly trigger?: Trigger;
@@ -121,17 +122,22 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
   const registry = makeFlowRegistry(config.flows);
 
-  // Streaming steps publish ephemeral chunks out-of-band, so a store without
-  // subscribeStream cannot transport them. Only scanned on the failure path.
-  if (config.store.subscribeStream === undefined) {
+  // Falls back to the store when it also implements StreamTransport (the
+  // in-memory reference does); real deployments inject a dedicated transport.
+  const streamTransport =
+    config.streamTransport ?? asStreamTransport(config.store);
+
+  // Streaming steps publish ephemeral chunks out-of-band, so without a transport
+  // they cannot be carried. Only scanned on the failure path.
+  if (streamTransport === undefined) {
     for (const f of registry.all) {
       for (const [stepId, step] of Object.entries(asStepMapWithDefs(f.steps))) {
         if (getDef(step).kind !== "streaming") continue;
         throw new NagiRuntimeError(
           `Flow "${f.id}" has a streaming step "${stepId}" (b.streamingTask), ` +
-            `but the configured store does not implement subscribeStream — ` +
-            `it cannot transport ephemeral chunks. Use a store with streaming ` +
-            `support (e.g. the in-memory store) or remove the streaming step.`,
+            `but no StreamTransport is configured — it cannot transport ` +
+            `ephemeral chunks. Pass streamTransport (or a store that implements ` +
+            `it, e.g. the in-memory store) or remove the streaming step.`,
         );
       }
     }
@@ -151,13 +157,14 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     const previousHash = await config.store.getRef(f.id);
     if (previousHash !== flowHash) {
       await config.store.setRef(f.id, flowHash);
-      await config.store.appendGlobalFact({
-        kind: "flow_ref.updated",
-        flowId: f.id,
-        from: previousHash,
-        to: flowHash,
-        at: clock.now(),
-      });
+      await config.store.appendGlobalFact(
+        Facts.flowRefUpdated({
+          flowId: f.id,
+          from: previousHash,
+          to: flowHash,
+          at: clock.now(),
+        }),
+      );
     }
   }
 
@@ -187,8 +194,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     const startedAt = clock.now();
     const flowHash = flowHashById.get(flow.id);
 
-    const fact: FlowStartedFact = {
-      kind: "flow.started",
+    const fact = Facts.flowStarted({
       runId,
       flowId: flow.id,
       input: validatedInput,
@@ -201,7 +207,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
             ? { runId: parent.runId, stepId: parent.stepId }
             : undefined,
       }),
-    };
+    });
 
     let concurrencyArg:
       | { readonly key: string; readonly mode: "cancel-in-progress" }
@@ -243,8 +249,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         error: serialized,
         at: c.fact.at,
       };
-      await dispatcher.fireHook(flow.onError, errorEvent, "flow.onError");
-      await dispatcher.fireHook(
+      await hooks.fireHook(flow.onError, errorEvent, "flow.onError");
+      await hooks.fireHook(
         config.hooks?.onFlowError,
         errorEvent,
         "onFlowError",
@@ -270,12 +276,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
             input: validatedInput,
             at: startedAt,
           };
-    await dispatcher.fireHook(flow.onStart, startEvent, "flow.onStart");
-    await dispatcher.fireHook(
-      config.hooks?.onFlowStart,
-      startEvent,
-      "onFlowStart",
-    );
+    await hooks.fireHook(flow.onStart, startEvent, "flow.onStart");
+    await hooks.fireHook(config.hooks?.onFlowStart, startEvent, "onFlowStart");
 
     await dispatcher.advance(runId);
     return { started: true };
@@ -322,12 +324,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       return;
     }
     const flow = registry.get(state.flowId);
-    const canceledFact: FlowCanceledFact = {
-      ...args,
-      kind: "flow.canceled",
-      runId,
-      at: clock.now(),
-    };
+    const canceledFact = Facts.flowCanceled(runId, args, clock.now());
     await config.store.appendFact(runId, canceledFact);
     const cancelError: SerializedError = {
       name: "NagiCanceledError",
@@ -340,12 +337,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         error: cancelError,
         at: clock.now(),
       };
-      await dispatcher.fireHook(flow.onError, event, "flow.onError");
-      await dispatcher.fireHook(
-        config.hooks?.onFlowError,
-        event,
-        "onFlowError",
-      );
+      await hooks.fireHook(flow.onError, event, "flow.onError");
+      await hooks.fireHook(config.hooks?.onFlowError, event, "onFlowError");
     }
 
     const children = await config.store.listChildren(runId);
@@ -377,9 +370,13 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     ...compact({
       hooks: config.hooks,
       defaultRetry: config.defaultRetry,
+      streamTransport,
     }),
   };
   const dispatcher = makeDispatcher(dispatchDeps);
+  // Runtime fires flow-level hooks directly (concurrency-cancel on start, and
+  // cancelRunRecursive) — outside the dispatch path, so it owns its own Hooks.
+  const hooks = makeHooks(dispatchDeps);
 
   const wf: Wf = {
     async start<F extends Flow>(
@@ -431,11 +428,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       const validated = (await validate(def.schema, payload)) as Json;
       const carriesAlias = signalName !== stepId;
 
-      // Atomic under a per-run lock in the store: delivers if the step is
-      // awaitingSignal, parks the payload as a signal.buffered fact if the step
-      // hasn't been claimed yet (the start/await race), or no-ops if the step
-      // already resolved. The worker applies any buffered signal the moment it
-      // claims the step — see dispatch's signal branch.
+      // Atomic under the store's per-run lock; parks a signal.buffered fact when
+      // the step isn't claimed yet (the start/await race). The worker applies a
+      // buffered signal when it claims the step — see dispatch's signal branch.
       const result = await config.store.settleSignal({
         runId,
         stepId,
@@ -448,7 +443,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
       switch (result.tag) {
         case "delivered":
-          await dispatcher.fireHook(
+          await hooks.fireHook(
             config.hooks?.onSignalReceived,
             {
               runId,
@@ -571,16 +566,10 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         const cascade = descendantsOf(effectiveFlow, opts.from);
         const at = clock.now();
         for (const stepId of cascade) {
-          const fact: Fact =
+          const fact =
             stepId === opts.from
-              ? { kind: "step.reset", runId, at, stepId }
-              : {
-                  kind: "step.reset",
-                  runId,
-                  at,
-                  stepId,
-                  cascadedFrom: opts.from,
-                };
+              ? Facts.stepReset({ runId, stepId, at })
+              : Facts.stepReset({ runId, stepId, at, cascadedFrom: opts.from });
           await config.store.appendFact(runId, fact);
         }
       }
@@ -607,8 +596,8 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       stepId: StepId,
       opts?: { readonly replayBuffered?: boolean },
     ): AsyncIterable<StreamEvent<C>> {
-      // Registration guarantees subscribeStream exists when a streaming step
-      // does, so the `!` below is sound once this check passes.
+      // Registration guarantees a transport exists when a streaming step does,
+      // so the `!` below is sound once this check passes.
       if (!registry.isStreaming(stepId)) {
         throw new NagiRuntimeError(
           `wf.subscribe: step "${stepId}" is not a streaming step ` +
@@ -616,9 +605,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
             `Only streaming steps can be subscribed to.`,
         );
       }
-      // C is caller-asserted; the store yields StreamEvent<Json>. This cast
+      // C is caller-asserted; the transport yields StreamEvent<Json>. This cast
       // bridges the Json→C assertion.
-      return config.store.subscribeStream!(
+      return streamTransport!.subscribeStream(
         runId,
         stepId,
         opts,
@@ -728,6 +717,14 @@ export const nagi: typeof nagiImpl & { run: typeof nagiRun } = Object.assign(
 
 function mintRunId(): RunId {
   return `run-${crypto.randomUUID()}` as RunId;
+}
+
+function asStreamTransport(store: Store): StreamTransport | undefined {
+  const s = store as Partial<StreamTransport>;
+  return typeof s.subscribeStream === "function" &&
+    typeof s.publishChunk === "function"
+    ? (s as StreamTransport)
+    : undefined;
 }
 
 function resolveSignalStep(

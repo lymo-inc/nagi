@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { getDef } from "../internal";
-import { unwrap } from "../state";
 import type { Step } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
@@ -29,15 +28,15 @@ describe("flow()", () => {
         const upstream = b.task({ run: async () => ({ v: 1 }) });
         const downstream = b.task({
           needs: { foo: upstream },
-          run: async ({ needs }) => ({ v: unwrap(needs.foo).v + 1 }),
+          run: async ({ needs }) => ({ v: needs.foo.v + 1 }),
         });
         return { upstream, downstream };
       },
     });
 
     const downstreamDef = getDef(f.steps.downstream as never);
-    const upstreamRef = downstreamDef.needs["foo"] as { id: string };
-    expect(upstreamRef.id).toBe("upstream");
+    const upstreamRef = downstreamDef.needs["foo"] as { step: { id: string } };
+    expect(upstreamRef.step.id).toBe("upstream");
   });
 
   it("preserves rename: local needs key is independent of upstream id", () => {
@@ -56,7 +55,9 @@ describe("flow()", () => {
 
     const def = getDef(f.steps.downstream as never);
     expect(Object.keys(def.needs)).toEqual(["localName"]);
-    expect((def.needs["localName"] as { id: string }).id).toBe("a");
+    expect((def.needs["localName"] as { step: { id: string } }).step.id).toBe(
+      "a",
+    );
   });
 
   it("throws when build returns a step that needs an unreturned upstream", () => {
@@ -172,15 +173,15 @@ describe("flow() — streamingTask", () => {
         });
         const persist = b.task({
           needs: { gen: generate },
-          run: async ({ needs }) => ({ saved: unwrap(needs.gen).text }),
+          run: async ({ needs }) => ({ saved: needs.gen.text }),
         });
         return { generate, persist };
       },
     });
 
     const persistDef = getDef(f.steps.persist as never);
-    const upstreamRef = persistDef.needs["gen"] as { id: string };
-    expect(upstreamRef.id).toBe("generate");
+    const upstreamRef = persistDef.needs["gen"] as { step: { id: string } };
+    expect(upstreamRef.step.id).toBe("generate");
   });
 
   it("nests under a match arm with the arm-prefixed id", () => {

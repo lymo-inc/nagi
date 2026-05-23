@@ -3,7 +3,6 @@ import { flow } from "../builder";
 import { NagiRuntimeError } from "../errors";
 import { InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
-import { unwrap } from "../state";
 import type { Json, RunId, StepId, StreamEvent } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
@@ -78,7 +77,7 @@ describe("streamingTask — emit → subscribe happy path", () => {
         });
         const consume = b.task({
           needs: { gen },
-          run: async ({ needs }) => ({ echoed: unwrap(needs.gen).text }),
+          run: async ({ needs }) => ({ echoed: needs.gen.text }),
         });
         return { gen, consume };
       },

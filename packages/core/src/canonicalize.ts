@@ -166,8 +166,10 @@ async function canonicalizeArm(arm: MatchArmDef): Promise<CanonicalMatchArm> {
     id: arm.id,
     stepIds: [...arm.stepIds].sort(),
   };
-  if (arm.otherwise) out.otherwise = true;
-  if (arm.when !== undefined) out.whenHash = await hashFnSource(arm.when);
+  // CanonicalMatchArm stays flat (otherwise?/whenHash?) to keep the flow hash
+  // stable; the guard union is internal-only.
+  if (arm.guard.kind === "otherwise") out.otherwise = true;
+  else out.whenHash = await hashFnSource(arm.guard.when);
   return out;
 }
 

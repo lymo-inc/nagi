@@ -74,13 +74,25 @@ export interface Step<Output = unknown> {
 export type StepOutput<S> = S extends Step<infer O> ? O : never;
 export type StepMap = Readonly<Record<string, Step<unknown>>>;
 
-export type NeedsMap = StepMap;
+// optional(step) lets a need tolerate an upstream skip: it resolves to
+// Resolved<T> (value | skipped) instead of a bare T. A required need gates
+// execution, so its value is always present.
+export interface Optional<S extends Step = Step> {
+  readonly __optional: S;
+}
+export type NeedRef = Step | Optional<Step>;
+export type NeedsMap = Readonly<Record<string, NeedRef>>;
+
 export type NeedsOutputs<N extends NeedsMap> = {
   readonly [K in keyof N]: StepOutput<N[K]>;
 };
 
 export type ResolvedNeeds<N extends NeedsMap> = {
-  readonly [K in keyof N]: Resolved<StepOutput<N[K]>>;
+  readonly [K in keyof N]: N[K] extends Optional<infer S>
+    ? Resolved<StepOutput<S>>
+    : N[K] extends Step
+      ? StepOutput<N[K]>
+      : never;
 };
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -502,20 +514,14 @@ export interface Store {
     attempt: AttemptNumber,
   ): Promise<ClaimToken | null>;
 
-  completeStep(
+  // Append a terminal step fact for a step that did not run under `runStep`
+  // (match/subflow promotions, operator-driven settles). The output travels on
+  // the StepCompletedFact, so there is no separate output store to keep in sync.
+  settleStep(
     runId: RunId,
     stepId: StepId,
-    output: Json,
-    fact: Fact,
+    fact: StepCompletedFact | StepFailedFact,
   ): Promise<void>;
-  failStep(
-    runId: RunId,
-    stepId: StepId,
-    error: SerializedError,
-    fact: Fact,
-  ): Promise<void>;
-
-  getStepOutput(runId: RunId, stepId: StepId): Promise<Json | null>;
 
   recordOnce(
     runId: RunId,
@@ -563,19 +569,22 @@ export interface Store {
 
   // MUST never prune non-terminal runs; delete in batches of opts.batchSize.
   pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult>;
+}
 
-  // Optional streaming read-side. If a registered flow has a streaming step and
-  // this is undefined, nagi() throws at registration. The iterator MUST close
-  // when the step reaches a terminal fact.
-  subscribeStream?(
+// Streaming side-channel for b.streamingTask, separate from Store: chunk
+// transport is ephemeral and out-of-band, never transactional. A Store may
+// implement it (the in-memory reference does); otherwise nagi() throws at
+// registration if a flow has a streaming step.
+export interface StreamTransport {
+  // The iterator MUST close when the step reaches a terminal fact.
+  subscribeStream(
     runId: RunId,
     stepId: StepId,
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<Json>>;
 
-  // Optional streaming write-side. Fire-and-forget and out-of-band — MUST NOT be
-  // routed through `tx`.
-  publishChunk?(runId: RunId, stepId: StepId, chunk: Json): void;
+  // Fire-and-forget and out-of-band — MUST NOT be routed through `tx`.
+  publishChunk(runId: RunId, stepId: StepId, chunk: Json): void;
 }
 
 export interface QueryRunsWhere<FlowId extends string = string> {
@@ -802,7 +811,6 @@ export interface StepSkippedFact extends FactBase {
   readonly reason: "when-false" | "transitive" | "manual";
   readonly actor?: string;
   readonly note?: string;
-  readonly cascade?: "skip" | "continue";
 }
 
 export interface SignalSentFact extends FactBase {
@@ -906,12 +914,8 @@ export interface OperatorAuditOpts {
   readonly note?: string;
 }
 
-export interface OperatorSkipOpts extends OperatorAuditOpts {
-  readonly cascade?: "skip" | "continue";
-}
-
 export interface Operator {
-  skip(runId: RunId, stepId: StepId, opts: OperatorSkipOpts): Promise<void>;
+  skip(runId: RunId, stepId: StepId, opts: OperatorAuditOpts): Promise<void>;
 
   // For a `running` step, MUST first abort the in-flight handler via
   // step.abort-requested and wait for it to settle before resetting.

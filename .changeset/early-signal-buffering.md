@@ -1,6 +1,6 @@
 ---
-"@nagi-js/core": minor
-"@nagi-js/postgres": minor
+"@nagi-js/core": patch
+"@nagi-js/postgres": patch
 ---
 
 Buffer signals that arrive before their target step is claimed, closing the

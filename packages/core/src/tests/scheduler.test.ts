@@ -7,7 +7,6 @@ import {
   nextRunnable,
   nextTransition,
 } from "../scheduler";
-import { extractInput, unwrap } from "../state";
 import type { Fact, Flow, RunId, RunState } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
@@ -68,7 +67,7 @@ function linearFlow(): Flow {
       });
       const c = b.task({
         needs: { a },
-        run: async ({ needs }) => ({ tripled: unwrap(needs.a).doubled * 3 }),
+        run: async ({ needs }) => ({ tripled: needs.a.doubled * 3 }),
       });
       return { a, c };
     },
@@ -85,7 +84,7 @@ function gatedFlow(): Flow {
       });
       const branch = b.task({
         needs: { gate },
-        when: ({ needs }) => unwrap(needs.gate).enabled,
+        when: ({ needs }) => needs.gate.enabled,
         run: async () => ({ ran: true }),
       });
       return { gate, branch };
@@ -235,15 +234,15 @@ describe("flowTermination", () => {
   });
 });
 
-describe("extractInput", () => {
-  it("returns the input from the flow.started fact", async () => {
+describe("input projection", () => {
+  it("projects the input from the flow.started fact", async () => {
     const state = await projectFacts([startedFact("any", { hello: "world" })]);
-    expect(extractInput(state)).toEqual({ hello: "world" });
+    expect(state.input).toEqual({ hello: "world" });
   });
 
-  it("throws when no flow.started fact exists", async () => {
+  it("is null when no flow.started fact exists", async () => {
     const state = await projectFacts([]);
-    expect(() => extractInput(state)).toThrow(/No flow.started/);
+    expect(state.input).toBeNull();
   });
 });
 

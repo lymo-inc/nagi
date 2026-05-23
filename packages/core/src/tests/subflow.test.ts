@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { outputOf, stepStateOf, unwrap } from "../state";
+import { outputOf, stepStateOf } from "../state";
 import type { FlowStartedFact } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
@@ -27,8 +27,8 @@ describe("b.subflow — happy path", () => {
         const consume = b.task({
           needs: { sub },
           run: async ({ needs }) => ({
-            tripled: unwrap(needs.sub).output.doubled * 1.5,
-            via: unwrap(needs.sub).childRunId,
+            tripled: needs.sub.output.doubled * 1.5,
+            via: needs.sub.childRunId,
           }),
         });
         return { sub, consume };
@@ -97,7 +97,7 @@ describe("b.subflow — happy path", () => {
           needs: { upstream },
           input: ({ input, needs }) => ({
             a: input.base,
-            b: unwrap(needs.upstream).multiplier,
+            b: needs.upstream.multiplier,
           }),
         });
         return { upstream, sub };
@@ -178,7 +178,7 @@ describe("b.subflow — nesting", () => {
         const inc = b.task({
           needs: { gc },
           run: async ({ needs }) => ({
-            result: unwrap(needs.gc).output.squared + 1,
+            result: needs.gc.output.squared + 1,
           }),
         });
         return { gc, inc };

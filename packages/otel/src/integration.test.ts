@@ -5,7 +5,6 @@ import {
   InMemoryStore,
   nagi,
   type RunId,
-  unwrap,
 } from "@nagi-js/core";
 import {
   BasicTracerProvider,
@@ -73,7 +72,7 @@ describe("@nagi-js/otel — end-to-end against a real nagi runtime", () => {
         });
         const c = b.task({
           needs: { a },
-          run: async ({ needs }) => ({ tripled: unwrap(needs.a).doubled * 3 }),
+          run: async ({ needs }) => ({ tripled: needs.a.doubled * 3 }),
         });
         return { a, c };
       },

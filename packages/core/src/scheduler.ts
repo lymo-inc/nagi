@@ -7,7 +7,6 @@ import {
 } from "./internal";
 import {
   attemptOf,
-  extractInput,
   isStepTerminal,
   isTerminalRun,
   outputOf,
@@ -43,8 +42,6 @@ export interface ScheduleArgs {
   readonly input: unknown;
 }
 
-// Each pending step resolves to exactly one outcome. Computing it as data lets
-// nextRunnable be a flat partition instead of a continue-driven accumulator.
 type StepGate =
   | { readonly kind: "run" }
   | { readonly kind: "skip"; readonly reason: SkipReason }
@@ -109,14 +106,14 @@ function gateFor(status: "blocked" | "transitive-skip"): StepGate {
 type UpstreamStatus = "ready" | "blocked" | "transitive-skip";
 
 function checkUpstream(def: StepDef, runState: RunState): UpstreamStatus {
-  for (const upstream of Object.values(def.needs)) {
-    const upstreamState = stepStateOf(runState, upstream.id);
+  for (const ref of Object.values(def.needs)) {
+    const upstreamState = stepStateOf(runState, ref.step.id);
     if (upstreamState.tag === "completed") continue;
-    if (upstreamState.tag === "skipped") {
-      if (upstreamState.cascade === "continue") continue;
-      return "transitive-skip";
-    }
-    if (upstreamState.tag === "failed") {
+    // An optional need tolerates a skipped upstream — the step still runs and
+    // receives Resolved<skipped>. A bare (required) need cascades the skip (or
+    // failure) so its value is always present when the step runs.
+    if (ref.optional && upstreamState.tag === "skipped") continue;
+    if (upstreamState.tag === "skipped" || upstreamState.tag === "failed") {
       return "transitive-skip";
     }
     return "blocked";
@@ -248,7 +245,7 @@ export function nextTransition(flow: Flow, runState: RunState): Transition {
       break;
   }
 
-  const input = extractInput(runState);
+  const input = runState.input;
   const { runnable, skip } = nextRunnable({ flow, runState, input });
   if (runnable.length > 0) return { kind: "dispatch", runnable, skip };
   if (skip.length > 0) return { kind: "skip", skip };

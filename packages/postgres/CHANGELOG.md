@@ -1,8 +1,8 @@
 # @nagi-js/postgres
 
-## 0.2.0-rc.11
+## 0.1.1-rc.11
 
-### Minor Changes
+### Patch Changes
 
 - c8041c5: Buffer signals that arrive before their target step is claimed, closing the
   start/await race.
@@ -24,15 +24,13 @@ pending)` when a signal lands before the worker has claimed the signal step. The
   both apply, and a signal that arrives after the step has already resolved is
   still a no-op.
 
-### Patch Changes
-
 - Stronger state and type representation
 - Updated dependencies [c8041c5]
 - Updated dependencies [5cbca32]
 - Updated dependencies
 - Updated dependencies [e451bfd]
 - Updated dependencies [5cbca32]
-  - @nagi-js/core@0.2.0-rc.11
+  - @nagi-js/core@0.1.1-rc.11
 
 ## 0.1.1-rc.10
 

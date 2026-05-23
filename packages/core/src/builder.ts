@@ -1,8 +1,12 @@
 import {
+  type ArmGuard,
   attachDef,
   compact,
+  type Guard,
   type MatchArmDef,
   type MatchDef,
+  type NeedRefDef,
+  normalizeNeeds,
   type ParentMatchRef,
   type PendingMatchArm,
   type PendingMatchDef,
@@ -25,6 +29,7 @@ import type {
   MatchArm,
   MatchGuardConfig,
   NeedsMap,
+  Optional,
   ResolvedConcurrency,
   SignalConfig,
   StandardSchemaV1,
@@ -42,7 +47,7 @@ function makeBuilder<Input>(): Builder<Input> {
   ): Step<O> {
     const def: TaskDef = {
       kind: "task",
-      needs: (config.needs ?? {}) as NeedsMap,
+      needs: normalizeNeeds(config.needs),
       run: config.run as TaskDef["run"],
       ...compact({
         retry: config.retry,
@@ -62,7 +67,7 @@ function makeBuilder<Input>(): Builder<Input> {
   ): Step<O> {
     const def: StreamingTaskDef = {
       kind: "streaming",
-      needs: (config.needs ?? {}) as NeedsMap,
+      needs: normalizeNeeds(config.needs),
       run: config.run as StreamingTaskDef["run"],
       ...compact({
         retry: config.retry,
@@ -82,10 +87,11 @@ function makeBuilder<Input>(): Builder<Input> {
   ): Step<InferSchemaOutput<S>> {
     const def: SignalDef = {
       kind: "signal",
-      needs: (config.needs ?? {}) as NeedsMap,
+      needs: normalizeNeeds(config.needs),
       schema: config.schema,
       ...compact({
-        ...config,
+        names: config.names,
+        timeoutMs: config.timeoutMs,
         when: config.when as SignalDef["when"],
       }),
     };
@@ -98,7 +104,7 @@ function makeBuilder<Input>(): Builder<Input> {
   ): Step<SubflowStepOutput<FlowOutput<Child>>> {
     const def: SubflowDef = {
       kind: "subflow",
-      needs: (config.needs ?? {}) as NeedsMap,
+      needs: normalizeNeeds(config.needs),
       childFlowId: child.id,
       buildInput: config.input as SubflowDef["buildInput"],
       ...compact({
@@ -115,25 +121,16 @@ function makeBuilder<Input>(): Builder<Input> {
   function match(
     config: MatchGuardConfig<Input, NeedsMap, StepMap>,
   ): Step<unknown> {
-    const needs = (config.needs ?? {}) as NeedsMap;
+    const needs = normalizeNeeds(config.needs);
     const arms: PendingMatchArm[] = [];
     for (let i = 0; i < config.arms.length; i++) {
       const arm = config.arms[i] as MatchArm<Input, NeedsMap, StepMap>;
       const nested = arm.build(makeBuilder<Input>()) as StepMap;
-      const armId = arm.otherwise ? "otherwise" : `arm${i}`;
-      arms.push({
-        id: armId,
-        ...(arm.when !== undefined
-          ? {
-              when: arm.when as (args: {
-                input: unknown;
-                needs: Record<string, unknown>;
-              }) => boolean,
-            }
-          : {}),
-        ...(arm.otherwise ? { otherwise: true as const } : {}),
-        nested,
-      });
+      const guard: ArmGuard = arm.otherwise
+        ? { kind: "otherwise" }
+        : { kind: "when", when: arm.when as Guard };
+      const armId = guard.kind === "otherwise" ? "otherwise" : `arm${i}`;
+      arms.push({ id: armId, guard, nested });
     }
     const def: PendingMatchDef = { kind: "match", needs, arms };
     return attachDef<unknown>({ kind: "match", id: "" }, def);
@@ -190,6 +187,10 @@ export function flow<
       ? { concurrency: normalizeConcurrency(config.concurrency) }
       : {}),
   };
+}
+
+export function optional<S extends Step>(step: S): Optional<S> {
+  return { __optional: step };
 }
 
 function normalizeConcurrency<Input>(
@@ -256,8 +257,9 @@ function walkAndRewrite(args: WalkArgs): void {
       );
     }
 
-    const rewrittenNeeds: Record<string, Step<unknown>> = {};
-    for (const [localKey, upstream] of Object.entries(def.needs)) {
+    const rewrittenNeeds: Record<string, NeedRefDef> = {};
+    for (const [localKey, ref] of Object.entries(def.needs)) {
+      const upstream = ref.step;
       const upstreamId = idByIdentity.get(upstream);
       if (upstreamId === undefined) {
         const fromOtherFlow = upstream.id !== "";
@@ -270,7 +272,10 @@ function walkAndRewrite(args: WalkArgs): void {
                 `that was not returned from build(). Add it to the returned object.`,
         );
       }
-      rewrittenNeeds[localKey] = { ...upstream, id: upstreamId };
+      rewrittenNeeds[localKey] = {
+        step: { ...upstream, id: upstreamId },
+        optional: ref.optional,
+      };
     }
 
     if (def.kind === "match") {
@@ -293,8 +298,7 @@ function walkAndRewrite(args: WalkArgs): void {
         });
         finalizedArms.push({
           id: arm.id,
-          ...(arm.when !== undefined ? { when: arm.when } : {}),
-          ...(arm.otherwise ? { otherwise: true as const } : {}),
+          guard: arm.guard,
           stepIds: nestedStepIds,
         });
       }
@@ -303,17 +307,18 @@ function walkAndRewrite(args: WalkArgs): void {
         kind: "match",
         needs: rewrittenNeeds,
         arms: finalizedArms,
-        ...(parentMatch ? { parentMatch } : {}),
+        ...compact({ parentMatch }),
       };
 
       out[id] = attachDef({ kind: "match", id }, finalizedDef);
       continue;
     }
 
-    const baseRewritten = { ...def, needs: rewrittenNeeds } as StepDef;
-    const finalizedDef = parentMatch
-      ? ({ ...baseRewritten, parentMatch } as StepDef)
-      : baseRewritten;
+    const finalizedDef = {
+      ...def,
+      needs: rewrittenNeeds,
+      ...compact({ parentMatch }),
+    } as StepDef;
     out[id] = attachDef({ kind: finalizedDef.kind, id }, finalizedDef);
   }
 }

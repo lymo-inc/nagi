@@ -1,5 +1,6 @@
 import type { Dispatcher } from "./dispatch";
 import { NagiRuntimeError, validationError } from "./errors";
+import { Facts } from "./facts";
 import type { FlowRegistry } from "./flow-registry";
 import { compact, type EmitLog } from "./internal";
 import { descendantsOf, stepStateOf } from "./scheduler";
@@ -13,10 +14,8 @@ import {
 import type {
   CancelArgs,
   Clock,
-  Fact,
   Operator,
   OperatorAuditOpts,
-  OperatorSkipOpts,
   RunId,
   StepId,
   Store,
@@ -53,10 +52,9 @@ export function makeOperator(o: OperatorDeps): Operator {
   async function skip(
     runId: RunId,
     stepId: StepId,
-    opts: OperatorSkipOpts,
+    opts: OperatorAuditOpts,
   ): Promise<void> {
     requireActor("operator.skip", opts.actor);
-    const cascade = opts.cascade ?? "skip";
     const state = await store.loadRunState(runId);
     const flow = registry.requireForRun(state.flowId, runId);
     if (!(stepId in flow.steps)) {
@@ -79,17 +77,17 @@ export function makeOperator(o: OperatorDeps): Operator {
         `operator.skip: run ${runId} is already terminal (${runStatusOf(state)}); cannot skip step "${stepId}".`,
       );
     }
-    const fact: Fact = {
-      kind: "step.skipped",
+    await store.appendFact(
       runId,
-      at: clock.now(),
-      stepId,
-      reason: "manual",
-      actor: opts.actor,
-      cascade,
-      ...compact({ note: opts.note }),
-    };
-    await store.appendFact(runId, fact);
+      Facts.stepSkipped({
+        runId,
+        stepId,
+        at: clock.now(),
+        reason: "manual",
+        actor: opts.actor,
+        ...compact({ note: opts.note }),
+      }),
+    );
     await dispatcher.advance(runId);
   }
 
@@ -137,16 +135,17 @@ export function makeOperator(o: OperatorDeps): Operator {
     const stepState = stepStateOf(state, stepId);
 
     if (stepState.tag === "running") {
-      const abortFact: Fact = {
-        kind: "step.abort-requested",
+      await store.appendFact(
         runId,
-        at: clock.now(),
-        stepId,
-        attempt: stepState.attempt,
-        actor: opts.actor,
-        ...compact({ note: opts.note }),
-      };
-      await store.appendFact(runId, abortFact);
+        Facts.stepAbortRequested({
+          runId,
+          stepId,
+          attempt: stepState.attempt,
+          at: clock.now(),
+          actor: opts.actor,
+          ...compact({ note: opts.note }),
+        }),
+      );
       await waitForStepToSettle(
         runId,
         stepId,
@@ -158,23 +157,16 @@ export function makeOperator(o: OperatorDeps): Operator {
     const cascade = descendantsOf(flow, stepId);
     const at = clock.now();
     for (const id of cascade) {
-      const fact: Fact =
+      const fact =
         id === stepId
-          ? {
-              kind: "step.reset",
+          ? Facts.stepReset({
               runId,
-              at,
               stepId: id,
+              at,
               actor: opts.actor,
               ...compact({ note: opts.note }),
-            }
-          : {
-              kind: "step.reset",
-              runId,
-              at,
-              stepId: id,
-              cascadedFrom: stepId,
-            };
+            })
+          : Facts.stepReset({ runId, stepId: id, at, cascadedFrom: stepId });
       await store.appendFact(runId, fact);
     }
     await dispatcher.advance(runId);
