@@ -20,9 +20,11 @@ import {
   CANCEL_POLL_INTERVAL_MS,
   classifyFailure,
   DEFAULT_RETRY,
+  makeActivityCtx,
   makeStepCtx,
   resolveExecutionFact,
   startCancelWatcher,
+  startHeartbeat,
 } from "../step-exec";
 import type {
   Flow,
@@ -54,9 +56,6 @@ export interface MessageHandler {
   dispatchMessage(message: QueueMessage): Promise<void>;
 }
 
-// Handles one queue message: admit (claim + dedupe), record start, execute by
-// kind, classify failure, then interpret the outcome (fire completion hook +
-// advance, or park). Drives the run forward via progression.advance.
 export function makeMessage(
   deps: DispatchDeps,
   hooks: Hooks,
@@ -79,11 +78,22 @@ export function makeMessage(
     await recordStarted({ flow, message, def, state });
 
     const startedAt = Date.now();
+    // Hold the message lease for the whole handler run so a slow step (e.g. a
+    // multi-minute LLM call) isn't redelivered and re-executed concurrently.
+    const heartbeat = startHeartbeat({
+      queue,
+      receipt: message.receipt,
+      intervalMs: deps.heartbeat.intervalMs,
+      leaseMs: deps.heartbeat.leaseMs,
+      emitLog: deps.emitLog,
+    });
     let outcome: Dispatched;
     try {
       outcome = await execute({ flow, message, def, state });
     } catch (err) {
       outcome = await handleStepError({ flow, message, def, err });
+    } finally {
+      heartbeat.stop();
     }
 
     await queue.ack(message.receipt);
@@ -148,7 +158,10 @@ export function makeMessage(
     // input-processing moment; signal/match start with null by contract. Input
     // is immutable after flow.started, so the admission snapshot is current.
     const startCarriesInput =
-      def.kind === "task" || def.kind === "streaming" || def.kind === "subflow";
+      def.kind === "task" ||
+      def.kind === "activity" ||
+      def.kind === "streaming" ||
+      def.kind === "subflow";
     const input: Json = startCarriesInput ? state.input : null;
     await fireStepLifecycle(
       handler?.onStart,
@@ -187,12 +200,21 @@ export function makeMessage(
         });
         return skipAdvance ? { tag: "parked" } : { tag: "completed", output };
       }
+      case "activity": {
+        const { output, skipAdvance } = await executeActivity({
+          def,
+          runId,
+          stepId,
+          attempt,
+          state,
+        });
+        return skipAdvance ? { tag: "parked" } : { tag: "completed", output };
+      }
       case "signal": {
         // recordStarted just moved this signal step into awaitingSignal. If a
         // signal arrived early (the start/await race) it was parked as a
         // signal.buffered fact; apply it now, atomically under the store's
-        // per-run lock. With nothing buffered this no-ops and the step stays
-        // parked until wf.signal delivers.
+        // per-run lock.
         const settled = await deps.store.settleSignal({
           runId,
           stepId,
@@ -345,6 +367,72 @@ export function makeMessage(
             runId,
             stepId,
           });
+          const postState = await store.loadRunState(runId);
+          const { fact, abortedHere } = resolveExecutionFact({
+            postState,
+            runId,
+            stepId,
+            attempt,
+            output: out,
+            at: clock.now(),
+          });
+          stepAbortedHere = abortedHere;
+          return { output: out, fact };
+        },
+      );
+      return { output, skipAdvance: stepAbortedHere };
+    } finally {
+      watcher.stop();
+    }
+  }
+
+  // Like executeTask, but the handler runs OUTSIDE the durable transaction
+  // (RFC 0013). External-effect bodies (LLM/HTTP calls) must not hold a tx for
+  // minutes. The handler runs first with an activity ctx (no tx); only the
+  // terminal fact is then committed in a short runStep tx whose body does no
+  // work beyond resolving the fact. Cancel/abort/replay semantics are identical
+  // to executeTask because the same resolveExecutionFact + runStep path commits.
+  async function executeActivity(args: {
+    def: HandlerDef;
+    runId: RunId;
+    stepId: string;
+    attempt: number;
+    state: RunState;
+  }): Promise<ExecuteTaskResult> {
+    const { def, runId, stepId, attempt, state } = args;
+    const { store, clock } = deps;
+    const input = state.input;
+    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
+
+    const ac = new AbortController();
+    const watcher = startCancelWatcher({
+      store,
+      runId,
+      stepId,
+      attempt,
+      ac,
+      intervalMs: deps.cancelPollIntervalMs ?? CANCEL_POLL_INTERVAL_MS,
+    });
+
+    try {
+      const ctx = makeActivityCtx({
+        runId,
+        stepId,
+        attempt,
+        input,
+        store,
+        clock,
+        signal: ac.signal,
+        emitLog: deps.emitLog,
+      });
+      const out = await runHandler(def, { input, needs, ctx, runId, stepId });
+
+      let stepAbortedHere = false;
+      const output = await store.runStep<Json>(
+        runId,
+        stepId,
+        attempt,
+        async () => {
           const postState = await store.loadRunState(runId);
           const { fact, abortedHere } = resolveExecutionFact({
             postState,

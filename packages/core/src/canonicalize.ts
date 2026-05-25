@@ -1,4 +1,5 @@
 import {
+  type ActivityDef,
   asStepMapWithDefs,
   type Guard,
   getDef,
@@ -104,8 +105,13 @@ async function canonicalizeStep(
   const needs = [...needsStepIds(def)].sort();
   const base: CanonicalStep = { id, kind: def.kind, needs };
   // A streaming step hashes as a task: chunks are ephemeral and never affect the
-  // flow hash, so only its task-shaped fields are canonicalized.
-  if (def.kind === "task" || def.kind === "streaming")
+  // flow hash, so only its task-shaped fields are canonicalized. An activity
+  // hashes like a task too (it differs only in execution, not in DAG shape).
+  if (
+    def.kind === "task" ||
+    def.kind === "activity" ||
+    def.kind === "streaming"
+  )
     return canonicalizeTask(base, def);
   if (def.kind === "signal") return canonicalizeSignal(base, def);
   if (def.kind === "subflow") return canonicalizeSubflow(base, def);
@@ -123,7 +129,7 @@ async function applyGuardAndTimeout(
 
 async function canonicalizeTask(
   base: CanonicalStep,
-  def: TaskDef | StreamingTaskDef,
+  def: TaskDef | ActivityDef | StreamingTaskDef,
 ): Promise<CanonicalStep> {
   const out: Mutable<CanonicalStep> = { ...base };
   await applyGuardAndTimeout(out, def);

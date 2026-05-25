@@ -63,7 +63,13 @@ export interface Register {}
 
 export type Tx = Register extends { tx: infer T } ? T : unknown;
 
-export type StepKind = "task" | "signal" | "match" | "subflow" | "streaming";
+export type StepKind =
+  | "task"
+  | "activity"
+  | "signal"
+  | "match"
+  | "subflow"
+  | "streaming";
 
 export interface Step<Output = unknown> {
   readonly kind: StepKind;
@@ -122,6 +128,10 @@ export interface StepCtx<Input = unknown> {
   idempotencyKey(scope: string): string;
 }
 
+// An activity step runs its body OUTSIDE the durable transaction (RFC 0013), so
+// it has no `tx`.
+export type ActivityCtx<Input = unknown> = Omit<StepCtx<Input>, "tx">;
+
 export type StreamEvent<C = Json> =
   | { readonly kind: "chunk"; readonly chunk: C }
   | { readonly kind: "dropped"; readonly count: number }
@@ -169,6 +179,17 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
     readonly ctx: StepCtx<NoInfer<Input>>;
+  }) => Promise<Output>;
+}
+
+export interface ActivityConfig<Input, N extends NeedsMap, Output>
+  extends StepConfigBase<Input, N>,
+    StepLifecycleHooks<Output> {
+  readonly retry?: RetryPolicy;
+  readonly run: (args: {
+    readonly input: NoInfer<Input>;
+    readonly needs: NoInfer<ResolvedNeeds<N>>;
+    readonly ctx: ActivityCtx<NoInfer<Input>>;
   }) => Promise<Output>;
 }
 
@@ -255,6 +276,10 @@ export interface SubflowStepOutput<ChildOutput> {
 export interface Builder<Input = unknown> {
   task<N extends NeedsMap, Output>(
     config: TaskConfig<Input, N, Output>,
+  ): Step<Output>;
+
+  activity<N extends NeedsMap, Output>(
+    config: ActivityConfig<Input, N, Output>,
   ): Step<Output>;
 
   streamingTask<N extends NeedsMap, O, C = Json>(

@@ -3,11 +3,13 @@ import { makeIdempotencyKey, makeOnce } from "./idempotency";
 import type { EmitLog } from "./internal";
 import { isAbortRequested, isTerminalRun, stepStateOf } from "./state";
 import type {
+  ActivityCtx,
   Clock,
   Json,
   Logger,
   LogLevel,
   Millis,
+  Queue,
   RetryPolicy,
   RunId,
   RunState,
@@ -122,6 +124,60 @@ export function startCancelWatcher(args: {
   };
 }
 
+export const DEFAULT_HEARTBEAT_LEASE_MS: Millis = 120_000;
+export const DEFAULT_HEARTBEAT_INTERVAL_MS: Millis = 40_000;
+
+// Keeps an in-flight step's queue message invisible while its handler runs. A
+// long handler (e.g. a multi-minute LLM call) otherwise outlives the queue's
+// visibility timeout, so the broker redelivers the message and the step body
+// runs a second time concurrently — duplicating side effects. Every intervalMs
+// we push the lease out by leaseMs; the caller stops the heartbeat once the
+// step settles, just before ack. A crashed worker simply stops extending, so
+// the message redelivers after at most one leaseMs, preserving crash recovery.
+// intervalMs must be shorter than the queue's initial visibility timeout, or
+// the first redelivery happens before the first extension lands.
+export function startHeartbeat(args: {
+  readonly queue: Queue;
+  readonly receipt: string;
+  readonly intervalMs: Millis;
+  readonly leaseMs: Millis;
+  readonly emitLog: EmitLog;
+}): { readonly stop: () => void } {
+  const { queue, receipt, intervalMs, leaseMs, emitLog } = args;
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const schedule = (): void => {
+    timer = setTimeout(() => {
+      void (async () => {
+        try {
+          await queue.extend(receipt, leaseMs);
+        } catch (err) {
+          // A missed extension only risks an early redelivery, which admit()'s
+          // claimStep dedupes — never tear the loop down, the next tick may win.
+          emitLog({
+            level: "warn",
+            msg: "heartbeat: failed to extend message visibility",
+            attrs: { receipt, error: String(err) },
+          });
+        }
+        if (!stopped) schedule();
+      })();
+    }, intervalMs);
+  };
+  schedule();
+
+  return {
+    // Clear the pending timer so a settled step strands nothing on the event
+    // loop — without this every fast step would leak a timer for up to
+    // intervalMs, keeping the process alive and delaying clean shutdown.
+    stop: () => {
+      stopped = true;
+      if (timer !== undefined) clearTimeout(timer);
+    },
+  };
+}
+
 // Cancellation/abort wins over retry. An operator-aborted step is re-enqueued
 // elsewhere so it must not advance, whereas a run-cancellation must advance so
 // the run can finalize; only an abort/cancel error is recorded on the fact.
@@ -167,19 +223,20 @@ function retryAllows(policy: RetryPolicy, err: unknown): boolean {
   return policy.retryOn(err);
 }
 
-export function makeStepCtx(args: {
+// Every handler-kind ctx is identical except for `tx` (a real transaction for a
+// task, absent for an activity), so the common fields are built once here. The
+// concrete builders only attach the tx slot.
+function makeBaseCtx(args: {
   runId: RunId;
   stepId: string;
   attempt: number;
   input: unknown;
   store: Store;
   clock: Clock;
-  tx: Tx;
   signal: AbortSignal;
   emitLog: EmitLog;
-}): StepCtx<unknown> {
-  const { runId, stepId, attempt, input, store, clock, tx, signal, emitLog } =
-    args;
+}): ActivityCtx<unknown> {
+  const { runId, stepId, attempt, input, store, clock, signal, emitLog } = args;
 
   // Spread caller attrs first, then the correlation keys, so the runtime wins on
   // collision — a handler can't clobber the real runId/stepId/attempt.
@@ -202,9 +259,48 @@ export function makeStepCtx(args: {
     attempt,
     signal,
     now: () => clock.now(),
-    tx,
     logger,
     once: makeOnce({ runId, stepId, store }),
     idempotencyKey: makeIdempotencyKey(runId, stepId),
+  };
+}
+
+export function makeStepCtx(args: {
+  runId: RunId;
+  stepId: string;
+  attempt: number;
+  input: unknown;
+  store: Store;
+  clock: Clock;
+  tx: Tx;
+  signal: AbortSignal;
+  emitLog: EmitLog;
+}): StepCtx<unknown> {
+  const { tx, ...base } = args;
+  return { ...makeBaseCtx(base), tx };
+}
+
+// Identical to a task's ctx except there is no durable transaction — an activity
+// runs OUTSIDE the step tx by design (RFC 0013), so ctx.tx is absent on the
+// public ActivityCtx type. The throwing getter is the runtime backstop for any
+// internal caller that reaches for it through the looser StepCtx type.
+export function makeActivityCtx(args: {
+  runId: RunId;
+  stepId: string;
+  attempt: number;
+  input: unknown;
+  store: Store;
+  clock: Clock;
+  signal: AbortSignal;
+  emitLog: EmitLog;
+}): StepCtx<unknown> {
+  return {
+    ...makeBaseCtx(args),
+    get tx(): Tx {
+      throw new Error(
+        "nagi: activity steps have no ctx.tx — they run outside the durable " +
+          "transaction. Write idempotently via your own client, or use a task.",
+      );
+    },
   };
 }

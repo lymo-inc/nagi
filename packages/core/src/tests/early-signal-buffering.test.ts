@@ -3,9 +3,6 @@ import { flow } from "../builder";
 import type { SignalReceivedEvent, SignalReceivedFact } from "../types";
 import { makeHarness, passthroughSchema, spyOnLog } from "./test-helpers";
 
-// Mirrors the production flow: a single signal step fed by either the Mux
-// `audioReady` rendition or the recall `recordingReady` transcript. Whichever
-// upstream finishes first signals; the step has no deps, so it is the run root.
 function transcriptFlow() {
   return flow({
     id: "early-signal-transcript",
@@ -29,9 +26,6 @@ describe("early-signal buffering", () => {
 
     const runId = await h.wf.start(f, {});
 
-    // Nothing has dispatched the enqueued signal step yet, so it is still
-    // pending (never entered awaitingSignal). The old behavior threw here; now
-    // the payload is parked.
     await expect(
       h.wf.signal(runId, "recordingReady", { transcript: "t" }),
     ).resolves.toBeUndefined();
@@ -58,8 +52,6 @@ describe("early-signal buffering", () => {
       signalName: "recordingReady",
     });
 
-    // The worker claims the step (pending -> awaitingSignal) and immediately
-    // applies the buffered signal in the same dispatch.
     await h.drain();
 
     const result = await h.result(runId);
@@ -118,7 +110,6 @@ describe("early-signal buffering", () => {
     const h = await makeHarness(f);
 
     const runId = await h.wf.start(f, {});
-    // Dispatch first so the step is awaitingSignal before the signal lands.
     await h.drain();
     const awaiting = await h.store.loadRunState(runId);
     expect(awaiting.steps["transcript"]?.tag).toBe("awaitingSignal");

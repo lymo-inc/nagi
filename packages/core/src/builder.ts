@@ -1,4 +1,5 @@
 import {
+  type ActivityDef,
   type ArmGuard,
   attachDef,
   compact,
@@ -18,6 +19,7 @@ import {
   type TaskDef,
 } from "./internal";
 import type {
+  ActivityConfig,
   Builder,
   Flow,
   FlowCompleteEvent,
@@ -60,6 +62,26 @@ function makeBuilder<Input>(): Builder<Input> {
       }),
     };
     return attachDef<O>({ kind: "task", id: "" }, def);
+  }
+
+  function activity<N extends NeedsMap, O>(
+    config: ActivityConfig<Input, N, O>,
+  ): Step<O> {
+    const def: ActivityDef = {
+      kind: "activity",
+      needs: normalizeNeeds(config.needs),
+      run: config.run as ActivityDef["run"],
+      ...compact({
+        retry: config.retry,
+        timeoutMs: config.timeoutMs,
+        when: config.when as ActivityDef["when"],
+        onStart: config.onStart,
+        onComplete: config.onComplete as ActivityDef["onComplete"],
+        onError: config.onError,
+        onRetry: config.onRetry,
+      }),
+    };
+    return attachDef<O>({ kind: "activity", id: "" }, def);
   }
 
   function streamingTask<N extends NeedsMap, O, C = Json>(
@@ -138,6 +160,7 @@ function makeBuilder<Input>(): Builder<Input> {
 
   return {
     task,
+    activity,
     streamingTask,
     signal,
     subflow,

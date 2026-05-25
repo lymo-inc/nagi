@@ -231,6 +231,7 @@ function startTarget(stepKind: StepKind, attempt: AttemptNumber): StepState {
     case "subflow":
       return { tag: "awaitingChild", attempt };
     case "task":
+    case "activity":
     case "streaming":
     case "match":
       return { tag: "running", attempt };

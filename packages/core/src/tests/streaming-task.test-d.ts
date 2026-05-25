@@ -125,7 +125,7 @@ describe("StepKind", () => {
     void k;
     expectTypeOf<"streaming">().toMatchTypeOf<StepKind>();
     expectTypeOf<StepKind>().toEqualTypeOf<
-      "task" | "signal" | "match" | "subflow" | "streaming"
+      "task" | "activity" | "signal" | "match" | "subflow" | "streaming"
     >();
   });
 });

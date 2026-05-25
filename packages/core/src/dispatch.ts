@@ -18,6 +18,11 @@ import type {
   StreamTransport,
 } from "./types";
 
+export interface HeartbeatConfig {
+  readonly intervalMs: Millis;
+  readonly leaseMs: Millis;
+}
+
 export interface DispatchDeps {
   readonly flowFor: (runId: RunId) => Promise<Flow>;
   readonly lookupFlow: (flowId: string) => Flow | undefined;
@@ -35,6 +40,7 @@ export interface DispatchDeps {
   readonly defaultRetry?: RetryPolicy;
   readonly fireHooks?: boolean;
   readonly cancelPollIntervalMs?: Millis;
+  readonly heartbeat: HeartbeatConfig;
 }
 
 export type SubflowChildOutcome =

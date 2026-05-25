@@ -90,6 +90,24 @@ export interface TaskDef extends StepLifecycleHooks<Json> {
   readonly parentMatch?: ParentMatchRef;
 }
 
+// Same shape as TaskDef; the difference is purely in execution — an activity's
+// body runs OUTSIDE the durable transaction (see RFC 0013). run() is typed with
+// the full StepCtx here for internal reuse; the public ActivityConfig narrows it
+// to ActivityCtx (no tx).
+export interface ActivityDef extends StepLifecycleHooks<Json> {
+  readonly kind: "activity";
+  readonly needs: NeedsDefMap;
+  readonly retry?: RetryPolicy;
+  readonly timeoutMs?: Millis;
+  readonly when?: Guard;
+  readonly run: (args: {
+    input: unknown;
+    needs: Record<string, unknown>;
+    ctx: StepCtx<unknown>;
+  }) => Promise<Json>;
+  readonly parentMatch?: ParentMatchRef;
+}
+
 export interface StreamingTaskDef extends StepLifecycleHooks<Json> {
   readonly kind: "streaming";
   readonly needs: NeedsDefMap;
@@ -152,12 +170,13 @@ export interface SubflowDef {
 
 export type StepDef =
   | TaskDef
+  | ActivityDef
   | StreamingTaskDef
   | SignalDef
   | MatchDef
   | SubflowDef;
 
-export type HandlerDef = TaskDef | StreamingTaskDef;
+export type HandlerDef = TaskDef | ActivityDef | StreamingTaskDef;
 
 export const DEF = Symbol("nagi.def");
 
@@ -190,7 +209,11 @@ export function peekDef(
 }
 
 export function handlerDef(def: StepDef): HandlerDef | undefined {
-  return def.kind === "task" || def.kind === "streaming" ? def : undefined;
+  return def.kind === "task" ||
+    def.kind === "activity" ||
+    def.kind === "streaming"
+    ? def
+    : undefined;
 }
 
 export function needsStepIds(def: StepDef): readonly string[] {

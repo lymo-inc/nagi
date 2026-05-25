@@ -19,6 +19,10 @@ import { makeOperator } from "./operator";
 import { makeReplay } from "./replay";
 import { makeSignals } from "./signals";
 import { isTerminalRun, runStatusOf } from "./state";
+import {
+  DEFAULT_HEARTBEAT_INTERVAL_MS,
+  DEFAULT_HEARTBEAT_LEASE_MS,
+} from "./step-exec";
 import type {
   CancelArgs,
   Clock,
@@ -28,6 +32,7 @@ import type {
   FlowInput,
   Json,
   LogEntry,
+  Millis,
   Operator,
   ParentRef,
   PrunableStatus,
@@ -62,6 +67,10 @@ export interface NagiConfig {
   readonly onLog?: (entry: LogEntry) => void;
   readonly defaultRetry?: RetryPolicy;
   readonly codeVersion?: string;
+  // heartbeatIntervalMs must stay below the queue's initial visibility timeout,
+  // or a slow step's message is redelivered before the first lease extension.
+  readonly heartbeatIntervalMs?: Millis;
+  readonly heartbeatLeaseMs?: Millis;
 }
 
 export interface StartOpts {
@@ -358,6 +367,12 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     queue: config.queue,
     clock,
     emitLog,
+    // The one fork point for heartbeat tuning: collapse the public optionals to
+    // a single required config here so the dispatch internals never re-check it.
+    heartbeat: {
+      intervalMs: config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
+      leaseMs: config.heartbeatLeaseMs ?? DEFAULT_HEARTBEAT_LEASE_MS,
+    },
     ...compact({
       hooks: config.hooks,
       defaultRetry: config.defaultRetry,
