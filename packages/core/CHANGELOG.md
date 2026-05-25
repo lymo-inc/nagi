@@ -1,5 +1,46 @@
 # @nagi-js/core
 
+## 0.1.1-rc.13
+
+### Patch Changes
+
+- 92f9d9f: Add `b.activity({...})`, a step kind for external-effect work (LLM/HTTP calls)
+  that runs its body **outside** the durable transaction. `b.task` is unchanged
+  and still runs its body inside a short tx so DB writes commit atomically with
+  `step.completed` — correct for DB-only work. An activity instead runs the
+  handler with no ambient tx, then commits only its terminal fact in a short
+  transaction, so a multi-minute handler never holds a connection open.
+
+  `ActivityConfig.run` receives an `ActivityCtx` (`Omit<StepCtx, "tx">`): there is
+  no `ctx.tx`, enforced at the type level and backed by a throwing runtime getter.
+  Activities are at-least-once and must be idempotent (use `ctx.idempotencyKey` /
+  upsert on a deterministic key; optionally an `idempotency-key` header to the
+  external provider).
+
+  Cancellation, retry, replay, scheduling, and output typing are identical to
+  `task`. See `docs/rfcs/0013-activity-steps.md`. This removes the need for the
+  PENDING-row + reaper pattern consumers used to track in-flight external calls,
+  and demotes the visibility heartbeat from a correctness mechanism to a cost
+  optimization.
+
+- Implement RFC#13
+- 92f9d9f: The worker now heartbeats a step's queue message while its handler runs, so a
+  long step (e.g. a multi-minute LLM call) no longer outlives the queue's
+  visibility timeout and gets redelivered + re-executed concurrently.
+
+  `dispatchMessage` starts a `startHeartbeat` loop before executing a step and
+  stops it (in a `finally`) just before ack. Each tick calls the existing
+  `queue.extend(receipt, leaseMs)`; a failed extension is logged and the loop
+  continues (an early redelivery is still deduped by `admit()`'s `claimStep`). A
+  crashed worker simply stops extending, so the message redelivers after at most
+  one lease — crash recovery is preserved.
+
+  Tunable via two new optional `NagiConfig` fields, `heartbeatIntervalMs` and
+  `heartbeatLeaseMs` (defaults `DEFAULT_HEARTBEAT_INTERVAL_MS` 40s /
+  `DEFAULT_HEARTBEAT_LEASE_MS` 120s). `heartbeatIntervalMs` must be shorter than
+  the queue's initial visibility timeout, or the first redelivery happens before
+  the first extension lands.
+
 ## 0.1.1-rc.12
 
 ### Patch Changes

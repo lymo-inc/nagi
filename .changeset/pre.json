@@ -8,6 +8,7 @@
     "@nagi-js/postgres": "0.1.1-rc.0"
   },
   "changesets": [
+    "activity-steps",
     "auto-code-version",
     "ctx-abort-signal-step-canceled",
     "early-signal-buffering",
@@ -19,6 +20,7 @@
     "late-pandas-dance",
     "multi-name-signal-waits",
     "next-transition-internal-cleanup",
+    "ninety-carrots-accept",
     "old-ideas-occur",
     "onlog-callback",
     "operator-interface",
@@ -35,6 +37,7 @@
     "step-scoped-replay-from",
     "streaming-task",
     "subflow-runtime",
-    "wf-start-by-id"
+    "wf-start-by-id",
+    "worker-visibility-heartbeat"
   ]
 }
