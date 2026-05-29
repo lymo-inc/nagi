@@ -1,5 +1,14 @@
 # @nagi-js/otel
 
+## 0.1.1-rc.14
+
+### Patch Changes
+
+- Apply fixes
+- Updated dependencies
+- Updated dependencies [3b8e7a9]
+  - @nagi-js/core@0.1.1-rc.14
+
 ## 0.1.1-rc.13
 
 ### Patch Changes
