@@ -373,3 +373,60 @@ describe("b.subflow — registration", () => {
     expect(err.message).toContain("not registered");
   });
 });
+
+describe("b.subflow — idempotent spawn (self-supersede regression)", () => {
+  // Reproduces the prod incident (2026-05-29): a parent re-delivered its
+  // subflow-spawning step (at-least-once), spawning the SAME child twice; the
+  // child's cancel-in-progress concurrency made the 2nd spawn cancel the 1st,
+  // and the parent step (bound to the 1st) failed with NagiCanceledError.
+  // With deterministic child run ids the 2nd spawn re-attaches instead.
+  it("re-delivering a subflow step yields ONE child, not a self-supersede", async () => {
+    const child = flow({
+      id: "child-cip",
+      input: passthroughSchema<{ x: number }>(),
+      // Same key for every spawn: if two children with different ids existed,
+      // the second start would cancel the first.
+      concurrency: { keyFn: () => "fixed", mode: "cancel-in-progress" },
+      build: (b) => ({
+        work: b.task({ run: async ({ input }) => ({ doubled: input.x * 2 }) }),
+      }),
+      output: (steps) => steps.work,
+    });
+    // Minimal parent — only needed to own a runId / parent link. We drive the
+    // duplicate spawn directly via startChildRun to model redelivery of the
+    // same (parentRunId, stepId, attempt) without lease/queue plumbing.
+    const parent = flow({
+      id: "parent-host",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({ noop: b.task({ run: async () => ({ ok: true }) }) }),
+    });
+
+    const h = await makeHarness([parent, child]);
+    const parentRunId = await h.wf.start(parent, {});
+    await h.drain();
+
+    const parentRef = { runId: parentRunId, stepId: "sub", attempt: 1 };
+    const first = await h.deps.startChildRun({
+      child,
+      childInput: { x: 5 },
+      parent: parentRef,
+    });
+    const second = await h.deps.startChildRun({
+      child,
+      childInput: { x: 5 },
+      parent: parentRef,
+    });
+
+    // Deterministic id ⇒ the redelivery re-attached to the same child.
+    expect(second).toBe(first);
+
+    // Exactly one child run exists for this parent.
+    const children = await h.store.listChildren(parentRunId);
+    expect(children).toEqual([first]);
+
+    // The child was never canceled by a self-supersede; it runs to completion.
+    await h.drain();
+    const childState = await h.store.loadRunState(first);
+    expect(childState.phase.tag).toBe("completed");
+  });
+});

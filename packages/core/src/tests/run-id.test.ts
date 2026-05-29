@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { NagiValidationError } from "../errors";
-import { RunId } from "../run-id";
+import { deriveChildRunId, RunId } from "../run-id";
 
 describe("RunId.parse", () => {
   it("accepts a non-empty string and returns a branded RunId", () => {
@@ -31,5 +31,35 @@ describe("RunId brand", () => {
     const parsed = JSON.parse(json) as { runId: string };
     const back = RunId.parse(parsed.runId);
     expect(back).toBe(id);
+  });
+});
+
+describe("deriveChildRunId", () => {
+  const base = {
+    runId: RunId.fromTrusted("run-parent-1"),
+    stepId: "sub",
+    attempt: 1,
+  };
+
+  it("is deterministic for the same (runId, stepId, attempt)", async () => {
+    expect(await deriveChildRunId(base)).toBe(await deriveChildRunId(base));
+  });
+
+  it("differs by attempt, stepId, and parent runId", async () => {
+    const id = await deriveChildRunId(base);
+    expect(await deriveChildRunId({ ...base, attempt: 2 })).not.toBe(id);
+    expect(await deriveChildRunId({ ...base, stepId: "other" })).not.toBe(id);
+    expect(
+      await deriveChildRunId({
+        ...base,
+        runId: RunId.fromTrusted("run-parent-2"),
+      }),
+    ).not.toBe(id);
+  });
+
+  it("produces a run- prefixed, RFC-4122 v5-shaped id", async () => {
+    expect(await deriveChildRunId(base)).toMatch(
+      /^run-[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 });

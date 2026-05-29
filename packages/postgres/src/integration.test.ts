@@ -755,6 +755,69 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(children.length).toBe(1);
     }, 20_000);
 
+    it("re-spawning a subflow step re-attaches via PG (idempotent, no self-supersede)", async () => {
+      // Child has cancel-in-progress on a fixed key: if a re-delivery minted a
+      // second child with a different id, the real SQL tryStartRun would cancel
+      // the first. Deterministic ids make the existence check fire first, so the
+      // second spawn re-attaches — proving the load-bearing PG ordering.
+      const child = flow({
+        id: "pg-idem-child",
+        input: passthroughSchema<{ x: number }>(),
+        concurrency: { keyFn: () => "fixed", mode: "cancel-in-progress" },
+        build: (b) => ({
+          work: b.task({
+            run: async ({ input }) => ({ doubled: input.x * 2 }),
+          }),
+        }),
+        output: (s) => s.work,
+      });
+      const parent = flow({
+        id: "pg-idem-parent",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({ noop: b.task({ run: async () => ({ ok: true }) }) }),
+      });
+
+      const wf = await makeNagi(parent, child);
+      const parentRunId = await wf.start(parent, {});
+      await runToEnd(wf, parentRunId);
+
+      const startChildRun = (
+        wf as unknown as {
+          __dispatchDeps: {
+            startChildRun: (a: {
+              readonly child: typeof child;
+              readonly childInput: unknown;
+              readonly parent: {
+                runId: RunId;
+                stepId: string;
+                attempt: number;
+              };
+            }) => Promise<RunId>;
+          };
+        }
+      ).__dispatchDeps.startChildRun;
+
+      const parentRef = { runId: parentRunId, stepId: "sub", attempt: 1 };
+      const first = await startChildRun({
+        child,
+        childInput: { x: 5 },
+        parent: parentRef,
+      });
+      const second = await startChildRun({
+        child,
+        childInput: { x: 5 },
+        parent: parentRef,
+      });
+      expect(second).toBe(first);
+
+      const rows = await sql<{ run_id: string; status: string }>`
+        SELECT run_id, status FROM ${sql.raw(`${schema}.workflow_run`)}
+         WHERE parent_run_id = ${parentRunId}
+      `.execute(db);
+      expect(rows.rows.length).toBe(1);
+      expect(rows.rows[0]?.status).not.toBe("canceled");
+    }, 20_000);
+
     it("wf.cancel transitively cancels children", async () => {
       const grandchild = flow({
         id: "pg-cancel-gc",
