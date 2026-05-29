@@ -18,6 +18,7 @@ import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
 import { InMemoryClock } from "./memory";
 import { makeOperator } from "./operator";
 import { makeReplay } from "./replay";
+import { deriveChildRunId } from "./run-id";
 import type { RunDescription } from "./run-view";
 import { nextTransition } from "./scheduler";
 import { makeSignals } from "./signals";
@@ -356,18 +357,21 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       );
     }
     const validated = (await validate(child.input, childInput)) as Json;
-    const childRunId = mintRunId();
-    const { started } = await startRunInternal({
+    // Deterministic per (parentRunId, stepId, attempt) so an at-least-once
+    // re-delivery of this subflow step re-attaches to the existing child
+    // instead of spawning a duplicate that cancel-in-progress would then
+    // self-supersede (failing the parent). See deriveChildRunId.
+    const childRunId = await deriveChildRunId(parent);
+    // started === false ⇒ this exact (parentRunId, stepId, attempt) already
+    // spawned the child on a prior delivery. tryStartRun checks run existence
+    // before its concurrency-cancel pass, so re-attaching cancels nothing and
+    // leaves the original child (and its parent link) intact. Idempotent.
+    await startRunInternal({
       flow: child,
       validatedInput: validated,
       runId: childRunId,
       parent,
     });
-    if (!started) {
-      throw new NagiRuntimeError(
-        `startChildRun: minted child runId collided with an existing run (${childRunId})`,
-      );
-    }
     return childRunId;
   }
 
