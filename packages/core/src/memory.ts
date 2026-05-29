@@ -1,8 +1,18 @@
 import { Facts } from "./facts";
+import { decideExpiredLeaseAction, type ReapedLease } from "./lease-reaper";
+import type {
+  RunDescription,
+  RunView,
+  StepRunStatus,
+  StepView,
+} from "./run-view";
 import { decideSignal } from "./signals";
 import {
+  attemptOf,
+  errorOf,
   foldRun,
   isTerminalRun,
+  outputOf,
   runStatusOf,
   stepStateOf,
   stepStatusOf,
@@ -177,6 +187,27 @@ export class InMemoryStore implements Store, StreamTransport {
     return { started: true, canceled };
   }
 
+  // In-memory has no real tx; we share the underlying maps with tryStartRun,
+  // so the implementation is intentionally a straight delegate. The `tx`
+  // parameter is accepted for shape-compat with the Store contract.
+  async tryStartRunOnTx(
+    _tx: Tx,
+    runId: RunId,
+    fact: FlowStartedFact,
+    concurrency?: {
+      readonly key: string;
+      readonly mode: ConcurrencyMode;
+    },
+  ): Promise<{
+    readonly started: boolean;
+    readonly canceled: ReadonlyArray<{
+      readonly runId: RunId;
+      readonly fact: FlowCanceledByConcurrencyFact;
+    }>;
+  }> {
+    return this.tryStartRun(runId, fact, concurrency);
+  }
+
   async listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>> {
     const set = this.childrenByParent.get(parentRunId);
     if (set === undefined) return [];
@@ -201,6 +232,94 @@ export class InMemoryStore implements Store, StreamTransport {
     const token = `lease-${crypto.randomUUID()}` as ClaimToken;
     this.leases.set(key, { token, expiresAt: now + this.leaseMs });
     return token;
+  }
+
+  async extendLease(
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+    leaseMs: Millis,
+  ): Promise<void> {
+    const key = `${runId}::${stepId}::${attempt}`;
+    const existing = this.leases.get(key);
+    if (existing === undefined) return; // idempotent: settled/reaped → no-op
+    this.leases.set(key, {
+      token: existing.token,
+      expiresAt: Date.now() + leaseMs,
+    });
+  }
+
+  async sweepLeases(args: {
+    readonly now: Date;
+    readonly queue: Queue;
+    readonly limit?: number;
+  }): Promise<readonly ReapedLease[]> {
+    const { now, queue, limit = 100 } = args;
+    const reaped: ReapedLease[] = [];
+
+    const candidates: Array<{
+      key: string;
+      runId: RunId;
+      stepId: StepId;
+      attempt: AttemptNumber;
+      expiresAt: Date;
+    }> = [];
+    for (const [key, lease] of this.leases) {
+      if (candidates.length >= limit) break;
+      const parts = key.split("::");
+      if (parts.length !== 3) continue;
+      const [runId, stepId, attemptStr] = parts as [string, string, string];
+      candidates.push({
+        key,
+        runId: runId as RunId,
+        stepId,
+        attempt: Number(attemptStr) as AttemptNumber,
+        expiresAt: new Date(lease.expiresAt),
+      });
+    }
+
+    for (const c of candidates) {
+      const factList = this.facts.get(c.runId);
+      const state = factList ? foldRun(c.runId, factList) : null;
+      const ss = state ? stepStateOf(state, c.stepId) : null;
+      const stepStatus: StepRunStatus =
+        ss === null ? "pending" : stepStatusOf(ss);
+      const decision = decideExpiredLeaseAction({
+        lease: {
+          runId: c.runId,
+          stepId: c.stepId,
+          attempt: c.attempt,
+          expiresAt: c.expiresAt,
+        },
+        stepStatus,
+        now,
+      });
+      if (decision.tag === "skip") continue;
+
+      this.leases.delete(c.key);
+      await this.appendFact(
+        c.runId,
+        Facts.leaseReaped({
+          runId: c.runId,
+          stepId: c.stepId,
+          attempt: c.attempt,
+          at: now,
+          reapedAt: now,
+        }),
+      );
+      await queue.enqueue(c.runId, c.stepId, {
+        attempt: decision.nextAttempt,
+        delayMs: decision.backoffMs,
+      });
+      reaped.push({
+        runId: c.runId,
+        stepId: c.stepId,
+        attempt: c.attempt,
+        nextAttempt: decision.nextAttempt,
+      });
+    }
+
+    return reaped;
   }
 
   async settleStep(
@@ -350,6 +469,130 @@ export class InMemoryStore implements Store, StreamTransport {
         ? encodeCursor({ t: last.startedAt.getTime(), r: last.runId })
         : null;
     return { runs: page, cursor };
+  }
+
+  async describe(runId: RunId): Promise<RunDescription> {
+    const factList = this.facts.get(runId);
+    if (factList === undefined || factList.length === 0) return null;
+    const first = factList[0];
+    if (first === undefined || first.kind !== "flow.started") return null;
+
+    const state = foldRun(runId, factList);
+    const status = runStatusOf(state);
+
+    let completedAt: Date | undefined;
+    let output: Json | undefined;
+    let error: Json | undefined;
+    let canceledByRunId: RunId | undefined;
+    let concurrencyKey: string | undefined;
+    for (let i = factList.length - 1; i >= 0; i--) {
+      const f = factList[i];
+      if (f === undefined) continue;
+      if (f.kind === "flow.completed") {
+        completedAt = f.at;
+        output = f.output;
+        break;
+      }
+      if (f.kind === "flow.failed") {
+        completedAt = f.at;
+        error = f.error as unknown as Json;
+        break;
+      }
+      if (f.kind === "flow.canceled") {
+        completedAt = f.at;
+        if (f.cause === "concurrency") {
+          canceledByRunId = f.canceledByRunId;
+        }
+        break;
+      }
+    }
+    const slot = this.keyByActiveRun.get(runId);
+    if (slot !== undefined) {
+      const sep = slot.indexOf("::");
+      if (sep >= 0) concurrencyKey = slot.slice(sep + 2);
+    }
+    if (concurrencyKey === undefined) {
+      for (const f of factList) {
+        if (f.kind === "flow.canceled" && f.cause === "concurrency") {
+          concurrencyKey = f.concurrencyKey;
+          break;
+        }
+      }
+    }
+
+    const childSet = this.childrenByParent.get(runId);
+    const children: RunId[] = childSet ? Array.from(childSet) : [];
+    const parent = first.parent;
+
+    const run: RunView = {
+      runId,
+      flowId: first.flowId,
+      flowHash: first.flowHash ?? "",
+      status,
+      startedAt: first.at,
+      input: first.input,
+      children,
+      ...(completedAt !== undefined ? { completedAt } : {}),
+      ...(output !== undefined ? { output } : {}),
+      ...(error !== undefined ? { error } : {}),
+      ...(canceledByRunId !== undefined ? { canceledByRunId } : {}),
+      ...(concurrencyKey !== undefined ? { concurrencyKey } : {}),
+      ...(parent !== undefined ? { parent } : {}),
+    };
+
+    const steps: StepView[] = [];
+    const startedAtByStep = new Map<StepId, Date>();
+    const completedAtByStep = new Map<StepId, Date>();
+    for (const f of factList) {
+      if (f.kind === "step.started" && !startedAtByStep.has(f.stepId)) {
+        startedAtByStep.set(f.stepId, f.at);
+      }
+      if (
+        (f.kind === "step.completed" ||
+          f.kind === "step.failed" ||
+          f.kind === "step.canceled" ||
+          f.kind === "step.skipped") &&
+        !completedAtByStep.has(f.stepId)
+      ) {
+        completedAtByStep.set(f.stepId, f.at);
+      }
+    }
+    const now = Date.now();
+    for (const [stepId, stepState] of Object.entries(state.steps)) {
+      const status = stepStatusOf(stepState);
+      const attempt = attemptOf(stepState);
+      const out = outputOf(stepState);
+      const err = errorOf(stepState);
+      const startedAt = startedAtByStep.get(stepId);
+      const completedAt = completedAtByStep.get(stepId);
+      let lease: { readonly expiresAt: Date } | undefined;
+      const leasePrefix = `${runId}::${stepId}::`;
+      let bestExpiry = 0;
+      for (const [key, l] of this.leases) {
+        if (!key.startsWith(leasePrefix)) continue;
+        if (l.expiresAt > now && l.expiresAt > bestExpiry)
+          bestExpiry = l.expiresAt;
+      }
+      if (bestExpiry > 0) lease = { expiresAt: new Date(bestExpiry) };
+      steps.push({
+        stepId,
+        attempt,
+        status,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        ...(completedAt !== undefined ? { completedAt } : {}),
+        ...(out !== null ? { output: out } : {}),
+        ...(err !== undefined ? { error: err as unknown as Json } : {}),
+        ...(lease !== undefined ? { lease } : {}),
+      });
+    }
+    steps.sort((a, b) => {
+      const ta = a.startedAt?.getTime() ?? Number.POSITIVE_INFINITY;
+      const tb = b.startedAt?.getTime() ?? Number.POSITIVE_INFINITY;
+      if (ta !== tb) return ta - tb;
+      return a.stepId < b.stepId ? -1 : a.stepId > b.stepId ? 1 : 0;
+    });
+
+    return { run, steps };
   }
 
   async pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult> {

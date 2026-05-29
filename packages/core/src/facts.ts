@@ -9,6 +9,7 @@ import type {
   FlowRefUpdatedFact,
   FlowStartedFact,
   Json,
+  LeaseReapedFact,
   MatchArmSelectedFact,
   ParentLink,
   RunId,
@@ -245,6 +246,24 @@ export const Facts = {
       payload: a.payload,
       at: a.at,
       ...compact({ signalName: a.signalName }),
+    };
+  },
+
+  leaseReaped(a: {
+    readonly runId: RunId;
+    readonly stepId: StepId;
+    readonly attempt: AttemptNumber;
+    readonly at: Date;
+    readonly reapedAt: Date;
+  }): LeaseReapedFact {
+    return {
+      kind: "lease.reaped",
+      runId: a.runId,
+      stepId: a.stepId,
+      attempt: a.attempt,
+      at: a.at,
+      reapedAt: a.reapedAt,
+      reason: "expired",
     };
   },
 

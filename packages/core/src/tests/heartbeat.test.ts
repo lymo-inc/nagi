@@ -4,8 +4,16 @@ import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
 import { isTerminalRun } from "../state";
 import { startHeartbeat } from "../step-exec";
-import type { Queue } from "../types";
+import type { Queue, RunId, Store } from "../types";
 import { passthroughSchema } from "./test-helpers";
+
+function makeStore(extendLease = vi.fn().mockResolvedValue(undefined)): {
+  store: Store;
+  extendLease: ReturnType<typeof vi.fn>;
+} {
+  const store = { extendLease } as unknown as Store;
+  return { store, extendLease };
+}
 
 describe("startHeartbeat", () => {
   it("extends the lease every interval until stopped", async () => {
@@ -13,10 +21,15 @@ describe("startHeartbeat", () => {
     try {
       const extend = vi.fn().mockResolvedValue(undefined);
       const queue = { extend } as unknown as Queue;
+      const { store, extendLease } = makeStore();
       const emitLog = vi.fn();
 
       const hb = startHeartbeat({
         queue,
+        store,
+        runId: "r" as RunId,
+        stepId: "s",
+        attempt: 1,
         receipt: "42",
         intervalMs: 100,
         leaseMs: 500,
@@ -26,6 +39,8 @@ describe("startHeartbeat", () => {
       await vi.advanceTimersByTimeAsync(350);
       expect(extend).toHaveBeenCalledTimes(3);
       expect(extend).toHaveBeenCalledWith("42", 500);
+      expect(extendLease).toHaveBeenCalledTimes(3);
+      expect(extendLease).toHaveBeenCalledWith("r", "s", 1, 500);
 
       hb.stop();
       await vi.advanceTimersByTimeAsync(500);
@@ -43,10 +58,15 @@ describe("startHeartbeat", () => {
         .mockRejectedValueOnce(new Error("boom"))
         .mockResolvedValue(undefined);
       const queue = { extend } as unknown as Queue;
+      const { store } = makeStore();
       const emitLog = vi.fn();
 
       const hb = startHeartbeat({
         queue,
+        store,
+        runId: "r" as RunId,
+        stepId: "s",
+        attempt: 1,
         receipt: "7",
         intervalMs: 50,
         leaseMs: 200,
@@ -57,6 +77,45 @@ describe("startHeartbeat", () => {
       expect(extend).toHaveBeenCalledTimes(2);
       expect(emitLog).toHaveBeenCalledWith(
         expect.objectContaining({ level: "warn" }),
+      );
+
+      hb.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("logs a warning but keeps beating when store.extendLease fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const extend = vi.fn().mockResolvedValue(undefined);
+      const queue = { extend } as unknown as Queue;
+      const extendLease = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("store boom"))
+        .mockResolvedValue(undefined);
+      const { store } = makeStore(extendLease);
+      const emitLog = vi.fn();
+
+      const hb = startHeartbeat({
+        queue,
+        store,
+        runId: "r" as RunId,
+        stepId: "s",
+        attempt: 1,
+        receipt: "9",
+        intervalMs: 50,
+        leaseMs: 200,
+        emitLog,
+      });
+
+      await vi.advanceTimersByTimeAsync(120);
+      expect(extendLease).toHaveBeenCalledTimes(2);
+      expect(emitLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          level: "warn",
+          msg: expect.stringContaining("store lease"),
+        }),
       );
 
       hb.stop();

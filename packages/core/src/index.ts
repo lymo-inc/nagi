@@ -17,10 +17,18 @@ export {
 } from "./diff";
 export {
   NagiCanceledError,
+  NagiConcurrencyConflictError,
+  NagiFlowSnapshotGoneError,
   NagiRuntimeError,
   NagiSnapshotDriftError,
   NagiValidationError,
 } from "./errors";
+export {
+  DEFAULT_REAPER_INTERVAL_MS,
+  decideExpiredLeaseAction,
+  type ReapedLease,
+  type ReaperDecision,
+} from "./lease-reaper";
 export {
   InMemoryClock,
   InMemoryQueue,
@@ -28,12 +36,21 @@ export {
   InMemoryTrigger,
   projectRunState,
 } from "./memory";
+export { RunId } from "./run-id";
+export type {
+  RunDescription,
+  RunView,
+  StepRunStatus,
+  StepView,
+} from "./run-view";
 export {
   type NagiConfig,
   type NagiRunConfig,
   nagi,
   type RuntimeHandle,
   type StartOpts,
+  type StartStagedOpts,
+  type StartStagedResult,
   type Wf,
 } from "./runtime";
 export { decideSignal, type SignalDecision } from "./signals";
@@ -59,6 +76,7 @@ export {
   stepStatusOf,
   unwrap,
 } from "./state";
+export { NagiAbortError } from "./step-exec";
 // Explicit public type surface (not `export type *`): a new type in types.ts is
 // internal-by-default, and any change to the public surface shows up as a diff.
 export type {
@@ -94,6 +112,7 @@ export type {
   InferSchemaInput,
   InferSchemaOutput,
   Json,
+  LeaseReapedFact,
   LogEntry,
   Logger,
   LogLevel,
@@ -130,7 +149,6 @@ export type {
   ResolvedConcurrency,
   ResolvedNeeds,
   RetryPolicy,
-  RunId,
   RunStatus,
   RunSummary,
   SerializedError,

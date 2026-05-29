@@ -1,3 +1,5 @@
+import type { ReapedLease } from "./lease-reaper";
+import type { RunDescription } from "./run-view";
 import type { Resolved, RunState, StepState } from "./state";
 
 export type Json =
@@ -527,11 +529,58 @@ export interface Store {
     }>;
   }>;
 
+  // Same semantics as tryStartRun, but operates on the caller's tx — the run
+  // row and flow.started fact commit (or roll back) with whatever else the
+  // caller writes. MUST NOT open its own tx, fire hooks, or propagate to
+  // parents: those are post-commit policy and belong to wf.startStaged's
+  // applyOnCommit closure. Under shared tx the advisory lock is skipped; the
+  // partial unique index on (flow_id, concurrency_key) WHERE status IN
+  // (pending, running) is the actual invariant, and a unique-violation race
+  // is retried once before throwing NagiConcurrencyConflictError.
+  tryStartRunOnTx(
+    tx: Tx,
+    runId: RunId,
+    fact: FlowStartedFact,
+    concurrency?: {
+      readonly key: string;
+      readonly mode: ConcurrencyMode;
+    },
+  ): Promise<{
+    readonly started: boolean;
+    readonly canceled: ReadonlyArray<{
+      readonly runId: RunId;
+      readonly fact: FlowCanceledByConcurrencyFact;
+    }>;
+  }>;
+
   claimStep(
     runId: RunId,
     stepId: StepId,
     attempt: AttemptNumber,
   ): Promise<ClaimToken | null>;
+
+  // Heartbeat extension for the lease row, called alongside Queue.extend so the
+  // lease state and the queue VT advance together. Idempotent: a 0-row update
+  // (lease already reaped, step settled, or a stale receipt) MUST not throw —
+  // the next heartbeat tick re-checks.
+  extendLease(
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+    leaseMs: Millis,
+  ): Promise<void>;
+
+  // Periodic lease-reaper sweep. The adapter SELECTs expired leases (with row
+  // locking against concurrent reapers), feeds each through
+  // decideExpiredLeaseAction, and on "reap" atomically deletes the lease,
+  // writes a lease.reaped fact, and re-enqueues at attempt+1 via the supplied
+  // queue — all inside one tx so a crash mid-sweep leaves no half-reaped state.
+  // Returns the lease identifiers that actually re-dispatched.
+  sweepLeases(args: {
+    readonly now: Date;
+    readonly queue: Queue;
+    readonly limit?: number;
+  }): Promise<readonly ReapedLease[]>;
 
   // Append a terminal step fact for a step that did not run under `runStep`
   // (match/subflow promotions, operator-driven settles). The output travels on
@@ -583,6 +632,11 @@ export interface Store {
   // MUST order by (startedAt DESC, runId DESC) for stable cursor pagination,
   // and treat opts.where.input as JSONB containment (Postgres `@>` semantics).
   queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult>;
+
+  // MUST return null (never throw) for an unknown runId. The view reflects
+  // facts visible at call time; parent/children come from the parent_run_id
+  // column + a reverse lookup, not from a separate child registry.
+  describe(runId: RunId): Promise<RunDescription>;
 
   listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>>;
 
@@ -713,7 +767,8 @@ export type FactKind =
   | "signal.received"
   | "signal.buffered"
   | "once.recorded"
-  | "match.arm-selected";
+  | "match.arm-selected"
+  | "lease.reaped";
 
 interface FactBase {
   readonly runId: RunId;
@@ -868,6 +923,19 @@ export interface MatchArmSelectedFact extends FactBase {
   readonly arm: string;
 }
 
+// Written by the lease reaper when an expired lease on a non-terminal step is
+// reclaimed. Audit hook: surfaces the otherwise-invisible "worker died, lease
+// timed out, step re-dispatched" event that is the load-bearing crash recovery
+// path. attempt is the lease's original attempt; the new dispatch carries
+// attempt+1.
+export interface LeaseReapedFact extends FactBase {
+  readonly kind: "lease.reaped";
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly reapedAt: Date;
+  readonly reason: "expired";
+}
+
 export interface StepResetFact extends FactBase {
   readonly kind: "step.reset";
   readonly stepId: StepId;
@@ -901,7 +969,8 @@ export type Fact =
   | SignalReceivedFact
   | SignalBufferedFact
   | OnceRecordedFact
-  | MatchArmSelectedFact;
+  | MatchArmSelectedFact
+  | LeaseReapedFact;
 
 export type RunStatus =
   | "pending"

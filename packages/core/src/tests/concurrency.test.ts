@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { NagiRuntimeError, NagiValidationError } from "../errors";
+import {
+  NagiCanceledError,
+  NagiRuntimeError,
+  NagiValidationError,
+} from "../errors";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
 import type {
@@ -411,6 +415,131 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     const canceled = result.factsOf("step.canceled")[0];
     expect(canceled).toBeDefined();
     expect(canceled?.error?.name).toBe("AbortError");
+  });
+});
+
+describe("@nagi-js/core — NagiCanceledError → flow.canceled reclassification (N10)", () => {
+  it("NagiCanceledError thrown by handler produces flow.canceled fact (not flow.failed)", async () => {
+    const f = flow({
+      id: "reclassify-direct",
+      input: passthroughSchema<VideoInput>(),
+      build: (b) => ({
+        analyze: b.task({
+          run: async ({ ctx }) => {
+            throw new NagiCanceledError({
+              runId: ctx.runId,
+              canceledByRunId: "run-superseder-1" as RunId,
+              concurrencyKey: "k1",
+            });
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, { videoId: "v1" });
+    await h.drain();
+    const result = await h.result(runId);
+    expect(result.status).toBe("canceled");
+    expect(result.factCount("flow.canceled")).toBe(1);
+    expect(result.factCount("flow.failed")).toBe(0);
+    const flowCancel = result.factsOf("flow.canceled")[0];
+    expect(flowCancel?.cause).toBe("concurrency");
+    if (flowCancel?.cause === "concurrency") {
+      expect(flowCancel.canceledByRunId).toBe("run-superseder-1");
+      expect(flowCancel.concurrencyKey).toBe("k1");
+    }
+  });
+
+  it("RunView for a NagiCanceledError'd run has status='canceled' and canceledByRunId populated", async () => {
+    const f = flow({
+      id: "reclassify-runview",
+      input: passthroughSchema<VideoInput>(),
+      build: (b) => ({
+        analyze: b.task({
+          run: async ({ ctx }) => {
+            throw new NagiCanceledError({
+              runId: ctx.runId,
+              canceledByRunId: "run-superseder-2" as RunId,
+              concurrencyKey: "k2",
+            });
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, { videoId: "v1" });
+    await h.drain();
+    const desc = await h.wf.describe(runId);
+    expect(desc).not.toBeNull();
+    if (desc === null) return;
+    expect(desc.run.status).toBe("canceled");
+    expect(desc.run.canceledByRunId).toBe("run-superseder-2");
+  });
+
+  it("canceledByRunId is null for runs that failed for non-cancellation reasons", async () => {
+    const f = flow({
+      id: "non-cancel-fail",
+      input: passthroughSchema<VideoInput>(),
+      build: (b) => ({
+        analyze: b.task({
+          retry: { maxAttempts: 1, backoff: "fixed", initialDelayMs: 0 },
+          run: async () => {
+            throw new Error("regular failure");
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, { videoId: "v1" });
+    await h.drain();
+    const desc = await h.wf.describe(runId);
+    expect(desc).not.toBeNull();
+    if (desc === null) return;
+    expect(desc.run.status).toBe("failed");
+    expect(desc.run.canceledByRunId).toBeUndefined();
+  });
+
+  it("NagiCanceledError nested in error.cause chain still triggers reclassification", async () => {
+    const f = flow({
+      id: "reclassify-nested",
+      input: passthroughSchema<VideoInput>(),
+      build: (b) => ({
+        analyze: b.task({
+          run: async ({ ctx }) => {
+            const inner = new NagiCanceledError({
+              runId: ctx.runId,
+              canceledByRunId: "run-superseder-3" as RunId,
+              concurrencyKey: "k3",
+            });
+            const wrapper = new Error("wrapped", { cause: inner });
+            throw wrapper;
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, { videoId: "v1" });
+    await h.drain();
+    const result = await h.result(runId);
+    expect(result.status).toBe("canceled");
+    expect(result.factCount("flow.canceled")).toBe(1);
+    expect(result.factCount("flow.failed")).toBe(0);
+  });
+
+  it("[regression] existing concurrency-cancel-in-progress test still passes (supersession path)", async () => {
+    // Mirror of the long-running supersession test in this file, abbreviated
+    // here to act as a sanity check that N10 hasn't broken the original path.
+    const f = makeVideoFlow();
+    const h = await makeHarness(f);
+    const firstRunId = await h.wf.start(f, { videoId: "vReg" });
+    const secondRunId = await h.wf.start(f, { videoId: "vReg" });
+    const first = await h.result(firstRunId);
+    expect(first.status).toBe("canceled");
+    const cancelFact = first.factsOf("flow.canceled")[0];
+    expect(cancelFact?.cause).toBe("concurrency");
+    if (cancelFact?.cause === "concurrency") {
+      expect(cancelFact.canceledByRunId).toBe(secondRunId);
+    }
   });
 });
 

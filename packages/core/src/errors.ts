@@ -52,6 +52,74 @@ export class NagiCanceledError extends Error {
   }
 }
 
+// A run was started against a flowHash that is no longer in this process's
+// registry — typically a forward-incompatible deploy retired the old hash. We
+// raise loudly at dispatch (not silently against the new code) so an admin can
+// pin a frozen-version worker on the dead runs. `currentHash` is null when the
+// run's flowId itself isn't registered (the consumer dropped the flow); the
+// distinction matters for the operator's recovery decision.
+export class NagiFlowSnapshotGoneError extends Error {
+  readonly runId: RunId;
+  readonly flowId: string;
+  readonly pinnedHash: string;
+  readonly currentHash: string | null;
+  constructor({
+    runId,
+    flowId,
+    pinnedHash,
+    currentHash,
+  }: {
+    readonly runId: RunId;
+    readonly flowId: string;
+    readonly pinnedHash: string;
+    readonly currentHash: string | null;
+  }) {
+    super(
+      currentHash === null
+        ? `Run ${runId} is pinned to flow "${flowId}" hash ${pinnedHash.slice(0, 12)}…, ` +
+            `but flow "${flowId}" is not registered with the current nagi(). ` +
+            `Pin a worker on the prior code version or migrate the run.`
+        : `Run ${runId} is pinned to flow "${flowId}" hash ${pinnedHash.slice(0, 12)}…, ` +
+            `but the current registry has hash ${currentHash.slice(0, 12)}…. ` +
+            `Pin a worker on the prior code version or migrate the run.`,
+    );
+    this.name = "NagiFlowSnapshotGoneError";
+    this.runId = runId;
+    this.flowId = flowId;
+    this.pinnedHash = pinnedHash;
+    this.currentHash = currentHash;
+  }
+}
+
+// Thrown by Store.tryStartRunOnTx when a unique-violation on (flow_id,
+// concurrency_key) recurs across two consecutive attempts under the caller's
+// tx. The first violation is racy and absorbed by re-reading the prior set;
+// a second one means a concurrent committer landed mid-retry, and we surface
+// it to the caller (rather than blocking on an advisory lock that could
+// deadlock with their own).
+export class NagiConcurrencyConflictError extends Error {
+  readonly runId: RunId;
+  readonly flowId: string;
+  readonly concurrencyKey: string;
+  constructor({
+    runId,
+    flowId,
+    concurrencyKey,
+  }: {
+    readonly runId: RunId;
+    readonly flowId: string;
+    readonly concurrencyKey: string;
+  }) {
+    super(
+      `Run ${runId}: concurrent start lost the race on flow "${flowId}" concurrency key "${concurrencyKey}" — retry the caller transaction.`,
+    );
+    this.name = "NagiConcurrencyConflictError";
+    this.runId = runId;
+    this.flowId = flowId;
+    this.concurrencyKey = concurrencyKey;
+  }
+}
+
 export class NagiSnapshotDriftError extends Error {
   readonly runId: RunId;
   readonly expected: string;

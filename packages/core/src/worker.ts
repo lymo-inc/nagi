@@ -1,4 +1,5 @@
 import { type DispatchDeps, type Dispatcher, makeDispatcher } from "./dispatch";
+import { NagiFlowSnapshotGoneError } from "./errors";
 import type {
   Clock,
   Millis,
@@ -105,6 +106,25 @@ class WorkerImpl implements Worker {
     try {
       await this.dispatcher.dispatchMessage(msg);
     } catch (err) {
+      if (err instanceof NagiFlowSnapshotGoneError) {
+        // Nack (do not emit step.failed) so a frozen-version worker can pick
+        // the message up. Logged at warn so consumer ops see the diagnostic
+        // hash pair and grep/restart against the pinned code.
+        this.deps.emitLog({
+          level: "warn",
+          msg: "worker.dispatch: flow snapshot gone — nacking",
+          attrs: {
+            runId: err.runId,
+            flowId: err.flowId,
+            pinnedHash: err.pinnedHash,
+            currentHash: err.currentHash,
+          },
+        });
+        try {
+          await this.deps.queue.nack(msg.receipt);
+        } catch {}
+        return;
+      }
       this.deps.emitLog({
         level: "error",
         msg: "worker.dispatch threw uncaught",

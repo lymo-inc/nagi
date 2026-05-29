@@ -80,8 +80,13 @@ export function makeMessage(
     const startedAt = Date.now();
     // Hold the message lease for the whole handler run so a slow step (e.g. a
     // multi-minute LLM call) isn't redelivered and re-executed concurrently.
+    // The store lease is extended in lock-step so the reaper sees a live lease.
     const heartbeat = startHeartbeat({
       queue,
+      store: deps.store,
+      runId: message.runId,
+      stepId: message.stepId,
+      attempt: message.attempt,
       receipt: message.receipt,
       intervalMs: deps.heartbeat.intervalMs,
       leaseMs: deps.heartbeat.leaseMs,
@@ -567,6 +572,27 @@ export function makeMessage(
           { ...base, error, at },
         );
         return { tag: "advance" };
+      }
+      case "flowCanceled": {
+        const at = clock.now();
+        // Settle the step as canceled (carries cancel error for trace) and
+        // terminate the run with flow.canceled (concurrency). The materialized
+        // workflow_run.canceled_by_run_id column populates from the fact's
+        // canceledByRunId via applyFactToMaterialized.
+        await store.appendFact(
+          runId,
+          Facts.stepCanceled(runId, stepId, attempt, at, error),
+        );
+        await store.appendFact(
+          runId,
+          Facts.flowCanceledByConcurrency({
+            runId,
+            at,
+            canceledByRunId: outcome.canceledByRunId,
+            concurrencyKey: outcome.concurrencyKey,
+          }),
+        );
+        return { tag: "parked" };
       }
     }
   }

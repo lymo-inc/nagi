@@ -1,4 +1,5 @@
 import type { AttemptNumber, RunId, StepId } from "@nagi-js/core";
+import { CamelCasePlugin } from "kysely";
 import { describe, expect, it } from "vitest";
 import { pgmqQueue } from "./pgmq-queue";
 import { createCapturingDb } from "./test-helpers";
@@ -227,5 +228,74 @@ describe("pgmqQueue.ensureSchema", () => {
     await q.ensureSchema();
 
     expect(fake.queries[1]?.sql).toContain("pgmq.create_partitioned");
+  });
+});
+
+// Regression suite for N1 (RFC 0014). The pgmq adapter's internal SQL reads
+// snake_case columns (`msg_id`); a caller-installed Kysely CamelCasePlugin
+// rewrites the result to camelCase (`msgId`), so receipts came back as
+// `String(undefined)` ("undefined") and every ack threw. The fix: strip
+// plugins from the adapter's internal executor only.
+describe("pgmqQueue under Kysely CamelCasePlugin (N1 regression)", () => {
+  it("baseline: receive on a plain Kysely instance returns a stringified msg_id receipt", async () => {
+    const fake = createCapturingDb();
+    fake.enqueueRows([
+      { msg_id: "42", message: { runId: "r1", stepId: "s1", attempt: 1 } },
+    ]);
+    const q = pgmqQueue({ db: fake.db });
+
+    const messages = await q.dequeue({ count: 1 });
+    expect(messages[0]?.receipt).toBe("42");
+    expect(() => BigInt(messages[0]?.receipt ?? "")).not.toThrow();
+  });
+
+  it("receive under CamelCasePlugin still surfaces a valid receipt (msg_id is read via plugin-free executor)", async () => {
+    const fake = createCapturingDb();
+    fake.enqueueRows([
+      { msg_id: "42", message: { runId: "r1", stepId: "s1", attempt: 1 } },
+    ]);
+    const dbWithPlugin = fake.db.withPlugin(new CamelCasePlugin());
+    const q = pgmqQueue({ db: dbWithPlugin });
+
+    const messages = await q.dequeue({ count: 1 });
+    expect(messages[0]?.receipt).toBe("42");
+    expect(BigInt(messages[0]?.receipt ?? "")).toBe(42n);
+  });
+
+  it("ack under CamelCasePlugin succeeds without a malformed-receipt throw", async () => {
+    const fake = createCapturingDb();
+    const dbWithPlugin = fake.db.withPlugin(new CamelCasePlugin());
+    const q = pgmqQueue({ db: dbWithPlugin });
+
+    await expect(q.ack("42")).resolves.toBeUndefined();
+    expect(fake.queries[0]?.sql).toContain("pgmq.delete");
+    expect(fake.queries[0]?.parameters).toEqual(["nagi", "42"]);
+  });
+
+  it("nack under CamelCasePlugin reschedules via set_vt", async () => {
+    const fake = createCapturingDb();
+    const dbWithPlugin = fake.db.withPlugin(new CamelCasePlugin());
+    const q = pgmqQueue({ db: dbWithPlugin });
+
+    await q.nack("100", { delayMs: 2000 });
+    expect(fake.queries[0]?.sql).toContain("pgmq.set_vt");
+    expect(fake.queries[0]?.parameters).toEqual(["nagi", "100", 2]);
+  });
+
+  it("extend under CamelCasePlugin pushes the lease forward via set_vt", async () => {
+    const fake = createCapturingDb();
+    const dbWithPlugin = fake.db.withPlugin(new CamelCasePlugin());
+    const q = pgmqQueue({ db: dbWithPlugin });
+
+    await q.extend("100", 30_000);
+    expect(fake.queries[0]?.sql).toContain("pgmq.set_vt");
+    expect(fake.queries[0]?.parameters).toEqual(["nagi", "100", 30]);
+  });
+
+  it('parseReceipt rejects "undefined" with a typed error that names the CamelCase failure mode', async () => {
+    const fake = createCapturingDb();
+    const q = pgmqQueue({ db: fake.db });
+
+    await expect(q.ack("undefined")).rejects.toThrow(/CamelCasePlugin/);
   });
 });

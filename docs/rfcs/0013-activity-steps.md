@@ -179,3 +179,22 @@ target). Persistence schema is unchanged.
    case appears (YAGNI for now).
 2. **Should `runStep` ever hold the body for `task`?** Out of scope; `task`
    stays as-is. A future RFC could bound `task` body duration.
+3. **Heartbeat the `claimStep` lease, not just the queue message?** (Follow-up
+   fix candidate, filed from a Lymo review 2026-05-25.) Today the worker
+   heartbeats only the *queue* message visibility; the store-side step claim
+   (`claimStep`, `DEFAULT_LEASE_MS = 60_000`) is **not** extended for the life of
+   the step. For an activity that runs longer than the claim lease (e.g. a
+   3–14 min LLM call), the claim has expired well before completion, so it is no
+   longer a backstop: if the queue heartbeat fails (repeated `queue.extend`
+   errors) and a redelivery slips through, the redelivered attempt re-claims the
+   stale lease and the body runs a **second time concurrently**. The fact commit
+   still dedupes on `(runId, stepId, attempt)`, but the *external effect* (the
+   LLM call, the spend row) has already happened twice — so the queue heartbeat
+   is currently the **sole** mechanism preventing duplicate execution of a long
+   activity, i.e. a single point of failure. Options: (a) heartbeat the claim
+   lease alongside the queue message, (b) align `claimStep`'s lease with the
+   heartbeat lease, or (c) have `runStep` detect a stolen/expired claim and abort
+   the second body before it commits. (a) gives the cleanest defense-in-depth.
+   This does not affect correctness of the orphan-removal goal — only the
+   "harmless duplicate" claim above, which holds for idempotent activities but
+   not for ones with costly non-idempotent effects.

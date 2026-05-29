@@ -413,6 +413,9 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
       case "signal.sent":
       case "signal.received":
       case "once.recorded":
+      case "lease.reaped":
+        // Audit-only: the reaper re-enqueues at attempt+1; the projection
+        // updates when the next attempt writes its step.started/step.failed.
         break;
     }
   }

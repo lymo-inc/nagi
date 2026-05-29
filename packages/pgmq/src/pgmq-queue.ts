@@ -40,8 +40,11 @@ interface QueueConfig {
 }
 
 export function pgmqQueue<DB = unknown>(opts: PgmqQueueOpts<DB>): PgmqQueue {
-  // Single internal erasure: the queue body is schema-agnostic, so widen once.
-  const db = opts.db as unknown as Kysely<unknown>;
+  // Caller-installed Kysely plugins (notably CamelCasePlugin) rewrite the result
+  // transformer, turning our internal `msg_id` reads into `msgId` and breaking
+  // parseReceipt. Strip plugins from the executor used for our own SQL only —
+  // the caller's `db` is untouched so their CamelCase reads still work.
+  const db = stripPlugins(opts.db as unknown as Kysely<unknown>);
   const queueName = opts.queueName ?? DEFAULT_QUEUE_NAME;
   const vtSeconds = Math.max(
     1,
@@ -66,9 +69,20 @@ export function pgmqQueue<DB = unknown>(opts: PgmqQueueOpts<DB>): PgmqQueue {
     },
 
     withTx(tx: Tx): Queue {
-      return buildQueue(tx as unknown as Kysely<unknown>, config);
+      return buildQueue(stripPlugins(tx as unknown as Kysely<unknown>), config);
     },
   };
+}
+
+interface PluginStrippable {
+  withoutPlugins?: () => Kysely<unknown>;
+}
+
+function stripPlugins(executor: Kysely<unknown>): Kysely<unknown> {
+  const candidate = executor as Kysely<unknown> & PluginStrippable;
+  return typeof candidate.withoutPlugins === "function"
+    ? candidate.withoutPlugins()
+    : executor;
 }
 
 function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
@@ -172,8 +186,12 @@ function parseReceipt(receipt: string): string {
   try {
     BigInt(receipt);
   } catch {
+    const hint =
+      receipt === "undefined"
+        ? " (likely caller installed a Kysely CamelCasePlugin that rewrote msg_id → msgId; nagi internal executor should be plugin-stripped)"
+        : "";
     throw new Error(
-      `pgmq: malformed receipt ${JSON.stringify(receipt)} — expected stringified bigint msg_id`,
+      `pgmq: malformed receipt ${JSON.stringify(receipt)} — expected stringified bigint msg_id${hint}`,
     );
   }
   return receipt;

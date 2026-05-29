@@ -1,4 +1,4 @@
-import { NagiRuntimeError } from "./errors";
+import { NagiFlowSnapshotGoneError, NagiRuntimeError } from "./errors";
 import { asStepMapWithDefs, getDef } from "./internal";
 import type { Flow, RunId } from "./types";
 
@@ -7,7 +7,17 @@ export interface FlowRegistry {
   get(flowId: string): Flow | undefined;
   has(flowId: string): boolean;
   require(flowId: string): Flow;
-  requireForRun(flowId: string, runId: RunId): Flow;
+  // pinnedHash undefined ⇒ legacy run with no flow_hash recorded (pre-pinning);
+  // skip the hash check and resolve by flowId alone. pinnedHash present ⇒
+  // dispatch-time guard: a mismatch (or missing flow) throws
+  // NagiFlowSnapshotGoneError so a forward-incompatible deploy fails loud
+  // rather than silently running the run against the new code.
+  requireForRun(
+    flowId: string,
+    runId: RunId,
+    pinnedHash?: string,
+    currentHashOf?: (flowId: string) => string | undefined,
+  ): Flow;
   isStreaming(stepId: string): boolean;
 }
 
@@ -42,8 +52,21 @@ export function makeFlowRegistry(flows: ReadonlyArray<Flow>): FlowRegistry {
       }
       return flow;
     },
-    requireForRun(flowId, runId) {
+    requireForRun(flowId, runId, pinnedHash, currentHashOf) {
       const flow = byId.get(flowId);
+      if (pinnedHash !== undefined) {
+        const currentHash =
+          flow === undefined ? null : (currentHashOf?.(flowId) ?? null);
+        if (flow === undefined || currentHash !== pinnedHash) {
+          throw new NagiFlowSnapshotGoneError({
+            runId,
+            flowId,
+            pinnedHash,
+            currentHash,
+          });
+        }
+        return flow;
+      }
       if (!flow) {
         throw new NagiRuntimeError(
           `Run ${runId} references flow "${flowId}" which is not registered with nagi().`,

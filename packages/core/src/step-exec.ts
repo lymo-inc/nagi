@@ -1,9 +1,11 @@
+import { NagiCanceledError } from "./errors";
 import { Facts } from "./facts";
 import { makeIdempotencyKey, makeOnce } from "./idempotency";
 import type { EmitLog } from "./internal";
 import { isAbortRequested, isTerminalRun, stepStateOf } from "./state";
 import type {
   ActivityCtx,
+  AttemptNumber,
   Clock,
   Json,
   Logger,
@@ -36,20 +38,29 @@ export type StepOutcome =
       readonly includeError: boolean;
     }
   | { readonly tag: "retry"; readonly delayMs: Millis }
-  | { readonly tag: "failed" };
+  | { readonly tag: "failed" }
+  | {
+      // NagiCanceledError surfaced from a handler: the run was superseded by
+      // another. Reclassify as flow.canceled (cause: concurrency) so the
+      // canonical run status matches reality.
+      readonly tag: "flowCanceled";
+      readonly canceledByRunId: RunId;
+      readonly concurrencyKey: string;
+    };
 
-class NagiAbortError extends Error {
+// name="AbortError" so WHATWG-allowlisting fetch SDKs treat this as a real abort, not a failure.
+export class NagiAbortError extends Error {
   readonly runId: RunId;
-  readonly scope: "run" | "step";
-  constructor(runId: RunId, scope: "run" | "step") {
+  readonly kind: "run" | "step";
+  constructor(runId: RunId, kind: "run" | "step") {
     super(
-      scope === "run"
+      kind === "run"
         ? `Run ${runId} was canceled — ctx.signal aborted.`
         : `Step in run ${runId} was aborted by operator.retry() — ctx.signal aborted.`,
     );
-    this.name = "NagiAbortError";
+    this.name = "AbortError";
     this.runId = runId;
-    this.scope = scope;
+    this.kind = kind;
   }
 }
 
@@ -136,31 +147,64 @@ export const DEFAULT_HEARTBEAT_INTERVAL_MS: Millis = 40_000;
 // the message redelivers after at most one leaseMs, preserving crash recovery.
 // intervalMs must be shorter than the queue's initial visibility timeout, or
 // the first redelivery happens before the first extension lands.
+//
+// Also extends the store-side lease row in lock-step with the queue VT: the
+// lease reaper (sweepLeases) uses the store lease as ground truth for "is a
+// worker still alive on this step", so a heartbeat that only extends the queue
+// would race the reaper into double-dispatching live work. Each tick fires
+// both extensions in parallel; either failing is logged but never re-thrown so
+// a transient store outage doesn't tear down a still-healthy handler.
 export function startHeartbeat(args: {
   readonly queue: Queue;
+  readonly store: Store;
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly attempt: number;
   readonly receipt: string;
   readonly intervalMs: Millis;
   readonly leaseMs: Millis;
   readonly emitLog: EmitLog;
 }): { readonly stop: () => void } {
-  const { queue, receipt, intervalMs, leaseMs, emitLog } = args;
+  const {
+    queue,
+    store,
+    runId,
+    stepId,
+    attempt,
+    receipt,
+    intervalMs,
+    leaseMs,
+    emitLog,
+  } = args;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
   const schedule = (): void => {
     timer = setTimeout(() => {
       void (async () => {
-        try {
-          await queue.extend(receipt, leaseMs);
-        } catch (err) {
-          // A missed extension only risks an early redelivery, which admit()'s
-          // claimStep dedupes — never tear the loop down, the next tick may win.
-          emitLog({
-            level: "warn",
-            msg: "heartbeat: failed to extend message visibility",
-            attrs: { receipt, error: String(err) },
-          });
-        }
+        await Promise.all([
+          queue.extend(receipt, leaseMs).catch((err: unknown) => {
+            // A missed extension only risks an early redelivery, which admit()'s
+            // claimStep dedupes — never tear the loop down, the next tick may win.
+            emitLog({
+              level: "warn",
+              msg: "heartbeat: failed to extend message visibility",
+              attrs: { receipt, error: String(err) },
+            });
+          }),
+          store
+            .extendLease(runId, stepId, attempt as AttemptNumber, leaseMs)
+            .catch((err: unknown) => {
+              // Same logic as queue extend: a missed store-lease extension only
+              // risks an early sweep, and the sweeper itself re-checks step
+              // status before reaping.
+              emitLog({
+                level: "warn",
+                msg: "heartbeat: failed to extend store lease",
+                attrs: { runId, stepId, attempt, error: String(err) },
+              });
+            }),
+        ]);
         if (!stopped) schedule();
       })();
     }, intervalMs);
@@ -181,6 +225,9 @@ export function startHeartbeat(args: {
 // Cancellation/abort wins over retry. An operator-aborted step is re-enqueued
 // elsewhere so it must not advance, whereas a run-cancellation must advance so
 // the run can finalize; only an abort/cancel error is recorded on the fact.
+// A handler that throws NagiCanceledError reclassifies the whole run to
+// flow.canceled (cause: concurrency) — the run was superseded; calling it
+// "failed" would mis-discriminate the canonical status.
 export function classifyFailure(args: {
   readonly attempt: number;
   readonly policy: RetryPolicy;
@@ -199,10 +246,32 @@ export function classifyFailure(args: {
       includeError: isAbort,
     };
   }
+  const cancel = findNagiCanceledError(err);
+  if (cancel !== undefined) {
+    return {
+      tag: "flowCanceled",
+      canceledByRunId: cancel.canceledByRunId,
+      concurrencyKey: cancel.concurrencyKey,
+    };
+  }
   if (attempt < policy.maxAttempts && retryAllows(policy, err)) {
     return { tag: "retry", delayMs: computeBackoff(policy, attempt) };
   }
   return { tag: "failed" };
+}
+
+// Walk the error cause chain looking for a real NagiCanceledError instance.
+// Requiring the class (not just shape) defends against forged JSONB cause data
+// re-thrown as plain Errors.
+function findNagiCanceledError(err: unknown): NagiCanceledError | undefined {
+  let cursor: unknown = err;
+  const seen = new Set<unknown>();
+  while (cursor instanceof Error && !seen.has(cursor)) {
+    if (cursor instanceof NagiCanceledError) return cursor;
+    seen.add(cursor);
+    cursor = (cursor as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 export function computeBackoff(policy: RetryPolicy, attempt: number): Millis {
@@ -284,6 +353,12 @@ export function makeStepCtx(args: {
 // runs OUTSIDE the step tx by design (RFC 0013), so ctx.tx is absent on the
 // public ActivityCtx type. The throwing getter is the runtime backstop for any
 // internal caller that reaches for it through the looser StepCtx type.
+//
+// CAUTION: `tx` is a getter that throws, so spreading this ctx (`{ ...ctx }`)
+// EAGERLY invokes the getter and throws — even when the spreader never touches
+// tx. Handlers and internal callers must read fields off the ctx directly and
+// never spread it. (The streaming path builds its ctx from a real task ctx, not
+// this one, so it is unaffected.)
 export function makeActivityCtx(args: {
   runId: RunId;
   stepId: string;

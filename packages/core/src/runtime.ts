@@ -14,11 +14,14 @@ import { makeHooks } from "./exec/hooks";
 import { Facts } from "./facts";
 import { makeFlowRegistry } from "./flow-registry";
 import { asStepMapWithDefs, compact, getDef, makeEmit } from "./internal";
+import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
 import { InMemoryClock } from "./memory";
 import { makeOperator } from "./operator";
 import { makeReplay } from "./replay";
+import type { RunDescription } from "./run-view";
+import { nextTransition } from "./scheduler";
 import { makeSignals } from "./signals";
-import { isTerminalRun, runStatusOf } from "./state";
+import { foldRun, isTerminalRun, runStatusOf } from "./state";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_LEASE_MS,
@@ -30,6 +33,7 @@ import type {
   FlowHooks,
   FlowIdOf,
   FlowInput,
+  FlowStartedFact,
   Json,
   LogEntry,
   Millis,
@@ -50,6 +54,7 @@ import type {
   StreamEvent,
   StreamTransport,
   Trigger,
+  Tx,
   Worker,
   WorkerConfig,
 } from "./types";
@@ -71,10 +76,35 @@ export interface NagiConfig {
   // or a slow step's message is redelivered before the first lease extension.
   readonly heartbeatIntervalMs?: Millis;
   readonly heartbeatLeaseMs?: Millis;
+  // Lease-reaper sweep cadence. Default 30s — stay ≤ ½ the store lease TTL so
+  // a crashed worker is reaped within one TTL. 0 disables the reaper (tests,
+  // or external/cron-driven reaping).
+  readonly reaperIntervalMs?: Millis;
 }
 
 export interface StartOpts {
   readonly runId?: RunId;
+}
+
+// Two-phase staged start (D5=B). The caller supplies a transaction that the
+// store run-row insert + flow.started fact + initial-step queue enqueue all
+// commit (or roll back) atomically with the caller's own writes. Hooks and
+// child-of-parent propagation are deferred to applyOnCommit so they only run
+// after the caller's tx commits — never against a half-canceled-now-rolled-
+// back prior run.
+export interface StartStagedOpts {
+  readonly tx: Tx;
+  readonly runId?: RunId;
+}
+
+// `started` is false when an existing runId blocked the insert. `canceled`
+// lists the prior runs that were superseded under concurrency-cancel (their
+// row + fact commit with the caller tx; their hooks fire from applyOnCommit).
+// applyOnCommit is idempotent: a second call after the first is a no-op.
+export interface StartStagedResult {
+  readonly started: boolean;
+  readonly canceled: readonly RunId[];
+  readonly applyOnCommit: () => Promise<void>;
 }
 
 export interface CancelOpts {
@@ -90,6 +120,24 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
 
   startById(flowId: string, input: unknown, opts?: StartOpts): Promise<RunId>;
 
+  // Staged transactional start (D5=B). The store run-row insert, flow.started
+  // fact, and initial-step queue enqueue commit (or roll back) on the
+  // caller's `opts.tx`. Concurrency-supersession cancel hooks AND
+  // dispatcher.propagateToParent fire from applyOnCommit, which the caller
+  // MUST invoke after their tx commits. Idempotent: a second applyOnCommit
+  // call is a no-op.
+  startStaged<F extends TFlows[number]>(
+    flow: F,
+    input: FlowInput<F>,
+    opts: StartStagedOpts,
+  ): Promise<StartStagedResult & { readonly runId: RunId }>;
+
+  startStagedById(
+    flowId: string,
+    input: unknown,
+    opts: StartStagedOpts,
+  ): Promise<StartStagedResult & { readonly runId: RunId }>;
+
   signal(runId: RunId, stepName: string, payload: unknown): Promise<void>;
 
   cancel(runId: RunId, opts?: CancelOpts): Promise<void>;
@@ -101,6 +149,11 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
   queryRuns(
     opts?: QueryRunsOpts<FlowIdOf<TFlows>>,
   ): Promise<QueryRunsResult<FlowIdOf<TFlows>>>;
+
+  // Returns the canonical projection of a single run + its steps. Returns null
+  // for an unknown runId (never throws). Parent/children are nested on the
+  // returned RunView; the outer envelope is `{run, steps}` only.
+  describe(runId: RunId): Promise<RunDescription>;
 
   subscribe<C = Json>(
     runId: RunId,
@@ -171,9 +224,17 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   const codeVersion =
     config.codeVersion ?? (await fingerprintFlows(config.flows));
 
+  // dispatch path: when the run was pinned to a flowHash, fail loud if the
+  // registry no longer matches (NagiFlowSnapshotGoneError). Legacy runs with
+  // no pinned hash continue to resolve by flowId.
   async function flowFor(runId: RunId): Promise<Flow> {
     const runState = await config.store.loadRunState(runId);
-    return registry.requireForRun(runState.flowId, runId);
+    return registry.requireForRun(
+      runState.flowId,
+      runId,
+      runState.flowHash,
+      (id) => flowHashById.get(id),
+    );
   }
 
   function lookupFlow(flowId: string): Flow | undefined {
@@ -432,6 +493,146 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       return runId;
     },
 
+    async startStaged<F extends Flow>(
+      flow: F,
+      input: FlowInput<F>,
+      opts: StartStagedOpts,
+    ): Promise<StartStagedResult & { readonly runId: RunId }> {
+      return wf.startStagedById(flow.id, input, opts);
+    },
+
+    async startStagedById(
+      flowId: string,
+      input: unknown,
+      opts: StartStagedOpts,
+    ): Promise<StartStagedResult & { readonly runId: RunId }> {
+      if (opts === undefined || opts.tx === undefined) {
+        throw validationError(
+          "startStaged: opts.tx is required (the caller-supplied transaction the run row, flow.started fact, and initial enqueue commit on).",
+          ["tx"],
+        );
+      }
+      const flow = registry.require(flowId);
+
+      let runId: RunId;
+      if (opts.runId !== undefined) {
+        if (typeof opts.runId !== "string" || opts.runId.length === 0) {
+          throw validationError("opts.runId must be a non-empty string", [
+            "runId",
+          ]);
+        }
+        runId = opts.runId;
+      } else {
+        runId = mintRunId();
+      }
+
+      const validated = (await validate(flow.input, input)) as Json;
+      const startedAt = clock.now();
+      const flowHash = flowHashById.get(flow.id);
+      const fact: FlowStartedFact = Facts.flowStarted({
+        runId,
+        flowId: flow.id,
+        input: validated,
+        at: startedAt,
+        codeVersion,
+        ...compact({ flowHash }),
+      });
+
+      let concurrencyArg:
+        | { readonly key: string; readonly mode: "cancel-in-progress" }
+        | undefined;
+      if (flow.concurrency !== undefined) {
+        const derived = flow.concurrency.keyFn(validated);
+        if (typeof derived !== "string" || derived.length === 0) {
+          throw validationError(
+            `flow.concurrency.keyFn must return a non-empty string (got ${typeof derived === "string" ? '""' : typeof derived})`,
+            ["concurrency", "keyFn"],
+          );
+        }
+        concurrencyArg = { key: derived, mode: flow.concurrency.mode };
+      }
+
+      const { started, canceled } = await config.store.tryStartRunOnTx(
+        opts.tx,
+        runId,
+        fact,
+        concurrencyArg,
+      );
+
+      if (started) {
+        // Pre-compute the initial transition off just the flow.started fact so
+        // the entrypoint enqueue can ride the caller's tx. The fresh run
+        // hasn't committed yet, so loadRunState would be invisible from
+        // outside this tx; folding the in-memory [fact] gives the same answer
+        // the dispatcher would have computed post-commit.
+        const seedState = foldRun(runId, [fact]);
+        const transition = nextTransition(flow, seedState);
+        if (transition.kind === "dispatch") {
+          const txQueue = bindQueueToTx(config.queue, opts.tx);
+          for (const stepId of transition.runnable) {
+            await txQueue.enqueue(runId, stepId);
+          }
+        }
+      }
+
+      let fired = false;
+      const applyOnCommit = async (): Promise<void> => {
+        if (fired) return;
+        fired = true;
+        if (!started) return;
+        for (const c of canceled) {
+          const cancelError = new NagiCanceledError({
+            runId: c.runId,
+            canceledByRunId: runId,
+            concurrencyKey: c.fact.concurrencyKey,
+          });
+          const serialized: SerializedError = {
+            ...serializeError(cancelError),
+            cause: {
+              canceledByRunId: runId,
+              concurrencyKey: c.fact.concurrencyKey,
+            },
+          };
+          const errorEvent = {
+            runId: c.runId,
+            flowId: flow.id,
+            error: serialized,
+            at: c.fact.at,
+          };
+          await hooks.fireHook(flow.onError, errorEvent, "flow.onError");
+          await hooks.fireHook(
+            config.hooks?.onFlowError,
+            errorEvent,
+            "onFlowError",
+          );
+          await dispatcher.propagateToParent(c.runId, {
+            kind: "canceled",
+            error: serialized,
+          });
+        }
+
+        const startEvent = {
+          runId,
+          flowId: flow.id,
+          input: validated,
+          at: startedAt,
+        };
+        await hooks.fireHook(flow.onStart, startEvent, "flow.onStart");
+        await hooks.fireHook(
+          config.hooks?.onFlowStart,
+          startEvent,
+          "onFlowStart",
+        );
+      };
+
+      return {
+        runId,
+        started,
+        canceled: canceled.map((c) => c.runId),
+        applyOnCommit,
+      };
+    },
+
     signal: signals.signal,
 
     async cancel(runId: RunId, opts?: CancelOpts): Promise<void> {
@@ -462,6 +663,10 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     },
 
     replay: replayer.replay,
+
+    async describe(runId: RunId): Promise<RunDescription> {
+      return config.store.describe(runId);
+    },
 
     async queryRuns(opts: QueryRunsOpts = {}): Promise<QueryRunsResult> {
       if (opts.latest === true) {
@@ -568,6 +773,7 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
   const worker = wf.worker({ ...config.worker, signal });
 
   const emitLog = makeEmit(config.onLog);
+  const clock = config.clock ?? new InMemoryClock();
   const loop = worker.run();
   loop.catch((err: unknown) => {
     if (signal.aborted) return; // graceful shutdown — not a crash
@@ -578,6 +784,41 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
     });
   });
 
+  // Lease-reaper loop. Driven by clock.sleep so fake clocks (tests) can step
+  // it deterministically; aborts on stop() via the shared signal so process
+  // shutdown drains cleanly without orphaning a pending timer.
+  const reaperIntervalMs =
+    config.reaperIntervalMs ?? DEFAULT_REAPER_INTERVAL_MS;
+  const reaper: Promise<void> =
+    reaperIntervalMs > 0
+      ? (async () => {
+          while (!signal.aborted) {
+            try {
+              await clock.sleep(reaperIntervalMs, signal);
+            } catch {
+              return; // aborted via signal — graceful shutdown
+            }
+            if (signal.aborted) return;
+            try {
+              await config.store.sweepLeases({
+                now: clock.now(),
+                queue: config.queue,
+              });
+            } catch (err) {
+              emitLog({
+                level: "warn",
+                msg: "nagi.run: lease reaper sweep failed",
+                attrs: { error: String(err) },
+              });
+            }
+          }
+        })()
+      : Promise.resolve();
+  reaper.catch(() => {
+    // sweep errors are already logged; this catch only guards against an
+    // uncaught rejection from the loop's own teardown.
+  });
+
   let stopping: Promise<void> | undefined;
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
@@ -586,6 +827,11 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
         await loop;
       } catch {
         // graceful abort, or a crash already logged above — stop() never throws.
+      }
+      try {
+        await reaper;
+      } catch {
+        // reaper rejections are already logged above.
       }
     })();
     return stopping;
@@ -609,4 +855,17 @@ function asStreamTransport(store: Store): StreamTransport | undefined {
     typeof s.publishChunk === "function"
     ? (s as StreamTransport)
     : undefined;
+}
+
+// Adapters that expose `withTx` (e.g. pgmq) join the supplied tx so the
+// initial-step enqueue commits atomically with the store run-row insert +
+// flow.started fact. Plain queues (in-memory) ignore the tx — there is no
+// atomicity to inherit there anyway.
+interface QueueWithTx extends Queue {
+  withTx(tx: Tx): Queue;
+}
+function bindQueueToTx(queue: Queue, tx: Tx): Queue {
+  const q = queue as Partial<QueueWithTx>;
+  if (typeof q.withTx === "function") return q.withTx(tx);
+  return queue;
 }

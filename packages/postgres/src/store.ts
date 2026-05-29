@@ -13,20 +13,31 @@ import type {
   PruneResult,
   QueryRunsOpts,
   QueryRunsResult,
+  Queue,
+  ReapedLease,
+  RunDescription,
   RunId,
   RunState,
   RunStatus,
   RunSummary,
+  RunView,
   SerializedError,
   SettleSignalResult,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
   StepId,
+  StepRunStatus,
+  StepView,
   Store,
   Tx,
 } from "@nagi-js/core";
-import { decideSignal, projectRunState } from "@nagi-js/core";
+import {
+  decideExpiredLeaseAction,
+  decideSignal,
+  NagiConcurrencyConflictError,
+  projectRunState,
+} from "@nagi-js/core";
 import type { Kysely } from "kysely";
 import { sql } from "kysely";
 import { uuidv7 } from "./uuidv7";
@@ -189,6 +200,115 @@ class PostgresStore<DB = unknown> implements Store {
     return result;
   }
 
+  async tryStartRunOnTx(
+    tx: Tx,
+    runId: RunId,
+    fact: FlowStartedFact,
+    concurrency?: {
+      readonly key: string;
+      readonly mode: ConcurrencyMode;
+    },
+  ): Promise<{
+    readonly started: boolean;
+    readonly canceled: ReadonlyArray<{
+      readonly runId: RunId;
+      readonly fact: FlowCanceledByConcurrencyFact;
+    }>;
+  }> {
+    const trx = tx as unknown as Kysely<DB>;
+
+    if (concurrency === undefined) {
+      const insert = await sql<{ run_id: string }>`
+        INSERT INTO ${sql.raw(this.t("workflow_run"))}
+          (run_id, flow_id, status, input, started_at, flow_hash, code_version, parent_run_id, parent_step_id)
+        VALUES
+          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
+        ON CONFLICT (run_id) DO NOTHING
+        RETURNING run_id
+      `.execute(trx);
+
+      if (insert.rows.length === 0) {
+        return { started: false, canceled: [] };
+      }
+      await this.insertFact(trx, runId, fact);
+      return { started: true, canceled: [] };
+    }
+
+    // D6=A: no advisory lock under shared tx — the partial unique index on
+    // (flow_id, concurrency_key) WHERE status IN ('pending','running') is the
+    // load-bearing invariant. We retry the SELECT-prior + INSERT-new pass once
+    // on a unique-violation race; on a second violation we surface
+    // NagiConcurrencyConflictError so the caller can decide how to recover.
+    let attemptedRetry = false;
+    for (;;) {
+      const existing = await sql<{ run_id: string }>`
+        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
+         WHERE run_id = ${runId}
+         LIMIT 1
+      `.execute(trx);
+      if (existing.rows.length > 0) {
+        return { started: false, canceled: [] };
+      }
+
+      const others = await sql<{ run_id: string }>`
+        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
+         WHERE flow_id = ${fact.flowId}
+           AND concurrency_key = ${concurrency.key}
+           AND status IN ('pending', 'running')
+        FOR UPDATE
+      `.execute(trx);
+
+      const canceled: Array<{
+        runId: RunId;
+        fact: FlowCanceledByConcurrencyFact;
+      }> = [];
+      for (const row of others.rows) {
+        const priorRunId = row.run_id as RunId;
+        const cancelFact: FlowCanceledByConcurrencyFact = {
+          kind: "flow.canceled",
+          cause: "concurrency",
+          runId: priorRunId,
+          at: fact.at,
+          canceledByRunId: runId,
+          concurrencyKey: concurrency.key,
+        };
+        await sql`
+          UPDATE ${sql.raw(this.t("workflow_run"))}
+             SET status = 'canceled',
+                 canceled_by_run_id = ${runId},
+                 completed_at = ${fact.at}
+           WHERE run_id = ${priorRunId}
+        `.execute(trx);
+        await this.insertFact(trx, priorRunId, cancelFact);
+        canceled.push({ runId: priorRunId, fact: cancelFact });
+      }
+
+      try {
+        await sql`
+          INSERT INTO ${sql.raw(this.t("workflow_run"))}
+            (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key, parent_run_id, parent_step_id)
+          VALUES
+            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
+        `.execute(trx);
+      } catch (err) {
+        if (isUniqueViolation(err) && !attemptedRetry) {
+          attemptedRetry = true;
+          continue;
+        }
+        if (isUniqueViolation(err)) {
+          throw new NagiConcurrencyConflictError({
+            runId,
+            flowId: fact.flowId,
+            concurrencyKey: concurrency.key,
+          });
+        }
+        throw err;
+      }
+      await this.insertFact(trx, runId, fact);
+      return { started: true, canceled };
+    }
+  }
+
   async loadRunState(runId: RunId): Promise<RunState> {
     return this.loadRunStateWith(this.db, runId);
   }
@@ -283,6 +403,106 @@ class PostgresStore<DB = unknown> implements Store {
 
     const row = result.rows[0];
     return row ? (row.token as ClaimToken) : null;
+  }
+
+  async extendLease(
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+    leaseMs: Millis,
+  ): Promise<void> {
+    // Idempotent: 0-row update (settled/reaped/stale) is fine — the next
+    // heartbeat tick re-checks. Computing expires_at from now() inside the SQL
+    // keeps the value source-of-truth in the database, matching claimStep.
+    await sql`
+      UPDATE ${sql.raw(this.t("lease"))}
+         SET expires_at = now() + (${leaseMs}::int * interval '1 ms')
+       WHERE run_id = ${runId} AND step_id = ${stepId} AND attempt = ${attempt}
+    `.execute(this.db);
+  }
+
+  async sweepLeases(args: {
+    readonly now: Date;
+    readonly queue: Queue;
+    readonly limit?: number;
+  }): Promise<readonly ReapedLease[]> {
+    const { now, queue, limit = 100 } = args;
+    return this.db.transaction().execute(async (trx) => {
+      // FOR UPDATE OF l SKIP LOCKED so concurrent reapers split the batch
+      // without retry; the LEFT JOIN surfaces the step status that
+      // decideExpiredLeaseAction needs to skip terminal steps cleanly.
+      const rows = await sql<{
+        run_id: string;
+        step_id: string;
+        attempt: number;
+        expires_at: Date;
+        status: StepRunStatus | null;
+      }>`
+        SELECT l.run_id, l.step_id, l.attempt, l.expires_at, s.status
+          FROM ${sql.raw(this.t("lease"))} l
+          LEFT JOIN ${sql.raw(this.t("step_run"))} s
+            ON s.run_id = l.run_id
+           AND s.step_id = l.step_id
+           AND s.attempt = l.attempt
+         WHERE l.expires_at < ${now}
+         FOR UPDATE OF l SKIP LOCKED
+         LIMIT ${limit}
+      `.execute(trx);
+
+      // Bind to the same tx so the delete + fact insert + queue enqueue all
+      // commit atomically; a tx rollback (e.g. on enqueue error) leaves the
+      // lease intact for the next sweep, never a half-reaped state.
+      const txQueue = bindQueueToTx(queue, trx);
+      const reaped: ReapedLease[] = [];
+
+      for (const row of rows.rows) {
+        const runId = row.run_id as RunId;
+        const stepId = row.step_id as StepId;
+        const attempt = row.attempt as AttemptNumber;
+        const expiresAt =
+          row.expires_at instanceof Date
+            ? row.expires_at
+            : new Date(row.expires_at);
+        const stepStatus: StepRunStatus = row.status ?? "pending";
+
+        const decision = decideExpiredLeaseAction({
+          lease: { runId, stepId, attempt, expiresAt },
+          stepStatus,
+          now,
+        });
+        if (decision.tag === "skip") continue;
+
+        await sql`
+          DELETE FROM ${sql.raw(this.t("lease"))}
+           WHERE run_id = ${runId} AND step_id = ${stepId} AND attempt = ${attempt}
+        `.execute(trx);
+
+        const fact: Fact = {
+          kind: "lease.reaped",
+          runId,
+          stepId,
+          attempt,
+          at: now,
+          reapedAt: now,
+          reason: "expired",
+        };
+        await this.insertFact(trx, runId, fact);
+
+        await txQueue.enqueue(runId, stepId, {
+          attempt: decision.nextAttempt,
+          delayMs: decision.backoffMs,
+        });
+
+        reaped.push({
+          runId,
+          stepId,
+          attempt,
+          nextAttempt: decision.nextAttempt,
+        });
+      }
+
+      return reaped;
+    });
   }
 
   async settleStep(
@@ -484,6 +704,7 @@ class PostgresStore<DB = unknown> implements Store {
       case "signal.received":
       case "signal.buffered":
       case "match.arm-selected":
+      case "lease.reaped":
         return;
     }
   }
@@ -673,6 +894,134 @@ class PostgresStore<DB = unknown> implements Store {
     return { runs: page, cursor: nextCursor };
   }
 
+  async describe(runId: RunId): Promise<RunDescription> {
+    // Single tx for read consistency across the three SELECTs.
+    return this.db.transaction().execute(async (trx) => {
+      const runRows = await sql<{
+        run_id: string;
+        flow_id: string;
+        flow_hash: string | null;
+        status: RunStatus;
+        input: Json;
+        output: Json | null;
+        error: Json | null;
+        started_at: Date;
+        completed_at: Date | null;
+        concurrency_key: string | null;
+        canceled_by_run_id: string | null;
+        parent_run_id: string | null;
+        parent_step_id: string | null;
+      }>`
+        SELECT run_id, flow_id, flow_hash, status, input, output, error,
+               started_at, completed_at, concurrency_key, canceled_by_run_id,
+               parent_run_id, parent_step_id
+          FROM ${sql.raw(this.t("workflow_run"))}
+         WHERE run_id = ${runId}
+         LIMIT 1
+      `.execute(trx);
+
+      const r = runRows.rows[0];
+      if (r === undefined) return null;
+
+      const stepRows = await sql<{
+        step_id: string;
+        attempt: number;
+        status: StepRunStatus;
+        output: Json | null;
+        error: Json | null;
+        started_at: Date | null;
+        completed_at: Date | null;
+        lease_expires_at: Date | null;
+      }>`
+        SELECT s.step_id, s.attempt, s.status, s.output, s.error,
+               s.started_at, s.completed_at, l.expires_at AS lease_expires_at
+          FROM ${sql.raw(this.t("step_run"))} s
+          LEFT JOIN ${sql.raw(this.t("lease"))} l
+            ON l.run_id = s.run_id
+           AND l.step_id = s.step_id
+           AND l.attempt = s.attempt
+           AND l.expires_at > now()
+         WHERE s.run_id = ${runId}
+         ORDER BY s.started_at ASC NULLS LAST, s.step_id ASC
+      `.execute(trx);
+
+      const childRows = await sql<{ run_id: string }>`
+        SELECT run_id
+          FROM ${sql.raw(this.t("workflow_run"))}
+         WHERE parent_run_id = ${runId}
+         ORDER BY started_at ASC
+      `.execute(trx);
+
+      const startedAt =
+        r.started_at instanceof Date ? r.started_at : new Date(r.started_at);
+      const completedAt =
+        r.completed_at === null
+          ? undefined
+          : r.completed_at instanceof Date
+            ? r.completed_at
+            : new Date(r.completed_at);
+      const parent =
+        r.parent_run_id !== null && r.parent_step_id !== null
+          ? {
+              runId: r.parent_run_id as RunId,
+              stepId: r.parent_step_id,
+            }
+          : undefined;
+      const run: RunView = {
+        runId: r.run_id as RunId,
+        flowId: r.flow_id,
+        flowHash: r.flow_hash ?? "",
+        status: r.status,
+        startedAt,
+        input: r.input,
+        children: childRows.rows.map((c) => c.run_id as RunId),
+        ...(completedAt !== undefined ? { completedAt } : {}),
+        ...(r.output !== null ? { output: r.output } : {}),
+        ...(r.error !== null ? { error: r.error } : {}),
+        ...(r.canceled_by_run_id !== null
+          ? { canceledByRunId: r.canceled_by_run_id as RunId }
+          : {}),
+        ...(r.concurrency_key !== null
+          ? { concurrencyKey: r.concurrency_key }
+          : {}),
+        ...(parent !== undefined ? { parent } : {}),
+      };
+
+      const steps: StepView[] = stepRows.rows.map((sr) => {
+        const sStartedAt =
+          sr.started_at === null
+            ? undefined
+            : sr.started_at instanceof Date
+              ? sr.started_at
+              : new Date(sr.started_at);
+        const sCompletedAt =
+          sr.completed_at === null
+            ? undefined
+            : sr.completed_at instanceof Date
+              ? sr.completed_at
+              : new Date(sr.completed_at);
+        const sLeaseAt =
+          sr.lease_expires_at === null
+            ? undefined
+            : sr.lease_expires_at instanceof Date
+              ? sr.lease_expires_at
+              : new Date(sr.lease_expires_at);
+        return {
+          stepId: sr.step_id,
+          attempt: sr.attempt as AttemptNumber,
+          status: sr.status,
+          ...(sStartedAt !== undefined ? { startedAt: sStartedAt } : {}),
+          ...(sCompletedAt !== undefined ? { completedAt: sCompletedAt } : {}),
+          ...(sr.output !== null ? { output: sr.output } : {}),
+          ...(sr.error !== null ? { error: sr.error } : {}),
+          ...(sLeaseAt !== undefined ? { lease: { expiresAt: sLeaseAt } } : {}),
+        };
+      });
+
+      return { run, steps };
+    });
+  }
+
   async listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>> {
     const rows = await sql<{ run_id: string }>`
       SELECT run_id
@@ -820,4 +1169,31 @@ function reviveFact(kind: string, at: Date, payload: unknown): Fact {
 
 function jsonb(value: Json) {
   return sql`${JSON.stringify(value)}::jsonb`;
+}
+
+// pg driver attaches the PostgreSQL SQLSTATE code on the error's `code` field.
+// 23505 = unique_violation. Kysely/pg may wrap or re-throw, so we walk a couple
+// of common shapes (direct .code, .cause.code) before giving up.
+function isUniqueViolation(err: unknown): boolean {
+  if (err === null || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === "string" && code === "23505") return true;
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause !== null && typeof cause === "object") {
+    const c = (cause as { code?: unknown }).code;
+    if (typeof c === "string" && c === "23505") return true;
+  }
+  return false;
+}
+
+// Adapters that expose `withTx` (pgmq) join the supplied tx so enqueue commits
+// atomically with the surrounding lease delete + fact insert. Plain queues
+// (in-memory) ignore the tx — there is no atomicity to inherit anyway.
+interface QueueWithTx extends Queue {
+  withTx(tx: Tx): Queue;
+}
+function bindQueueToTx(queue: Queue, tx: unknown): Queue {
+  const q = queue as Partial<QueueWithTx>;
+  if (typeof q.withTx === "function") return q.withTx(tx as Tx);
+  return queue;
 }
