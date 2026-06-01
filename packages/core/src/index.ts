@@ -20,6 +20,7 @@ export {
   NagiConcurrencyConflictError,
   NagiFlowSnapshotGoneError,
   NagiRuntimeError,
+  NagiSignalTimeoutError,
   NagiSnapshotDriftError,
   NagiValidationError,
 } from "./errors";
@@ -53,7 +54,12 @@ export {
   type StartStagedResult,
   type Wf,
 } from "./runtime";
-export { decideSignal, type SignalDecision } from "./signals";
+export {
+  decideSignal,
+  decideTimeout,
+  type SignalDecision,
+  type TimeoutDecision,
+} from "./signals";
 export type {
   Anomaly,
   Resolved,
@@ -189,6 +195,7 @@ export type {
   SubflowConfig,
   SubflowStepOutput,
   TaskConfig,
+  TimedOutSignal,
   Trigger,
   Tx,
   Worker,

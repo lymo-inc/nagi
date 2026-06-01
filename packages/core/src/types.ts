@@ -452,6 +452,10 @@ export interface WorkerConfig {
   readonly concurrency?: number;
   readonly pollIntervalMs?: Millis;
   readonly signal?: AbortSignal;
+  // Cadence for the in-worker signal-timeout sweep. Default 30s; 0 disables it
+  // (tests that drive the sweep explicitly). Checked by elapsed wall-clock each
+  // loop iteration, so a fully-busy worker still sweeps on schedule.
+  readonly timerSweepIntervalMs?: Millis;
 }
 
 export interface WorkerRunOnceOpts {
@@ -490,6 +494,17 @@ export type SettleSignalResult =
     }
   | { readonly tag: "buffered" }
   | { readonly tag: "noop" };
+
+// A signal step the timer-sweep settled as failed (its deadline elapsed before
+// any signal arrived). Returned by Store.sweepSignalTimeouts so the caller can
+// advance each run — the store writes the step.failed fact, progression turns
+// it into flow.failed.
+export interface TimedOutSignal {
+  readonly runId: RunId;
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly fireAt: Date;
+}
 
 export interface Store {
   appendFact(runId: RunId, fact: Fact): Promise<void>;
@@ -581,6 +596,25 @@ export interface Store {
     readonly queue: Queue;
     readonly limit?: number;
   }): Promise<readonly ReapedLease[]>;
+
+  // Arm a signal step's timeout. Keyed on (runId, stepId); MUST keep the
+  // EARLIEST fire_at (insert-if-absent) — the deadline anchors to when the step
+  // first started awaiting, so a lease-reap re-dispatch can't push it out. A
+  // genuine restart deletes the row first (step.reset), so the next arm is
+  // fresh. Additive: a signal step without timeoutMs never arms one.
+  upsertTimer(runId: RunId, stepId: StepId, fireAt: Date): Promise<void>;
+
+  // Periodic timeout sweep, the deadline counterpart to sweepLeases. The
+  // adapter SELECTs timers with fire_at < now (row-locked against concurrent
+  // sweepers), and for each — under the SAME per-run lock as settleSignal so a
+  // delivery and a timeout can't both win — folds run state, and if the step is
+  // still awaitingSignal writes step.failed (NagiSignalTimeoutError); it deletes
+  // the timer row either way. Returns the steps it failed so the caller can
+  // advance them to flow.failed. MUST NOT itself advance or fire hooks.
+  sweepSignalTimeouts(args: {
+    readonly now: Date;
+    readonly limit?: number;
+  }): Promise<readonly TimedOutSignal[]>;
 
   // Append a terminal step fact for a step that did not run under `runStep`
   // (match/subflow promotions, operator-driven settles). The output travels on

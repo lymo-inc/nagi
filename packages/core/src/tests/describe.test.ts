@@ -90,7 +90,6 @@ describe("wf.describe", () => {
       }),
     });
 
-    // Use a custom harness that we can keep mid-flight.
     const h = await makeHarness(f);
     // Inject the shared store reference for assertion (we already have h.store).
     void store;
@@ -98,7 +97,6 @@ describe("wf.describe", () => {
     const runId = await h.wf.start(f, {});
     const dispatching = h.drainOnce(1);
 
-    // Wait for the step to be running.
     const start = Date.now();
     while (Date.now() - start < 2_000) {
       const s = await h.store.loadRunState(runId);
@@ -146,7 +144,6 @@ describe("wf.describe", () => {
     const parentRunId = await h.wf.start(parent, { x: 42 });
     await h.drain();
 
-    // Find child run id via the parent's children list.
     const children = await h.store.listChildren(parentRunId);
     expect(children.length).toBe(1);
     const childRunId = children[0];
