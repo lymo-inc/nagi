@@ -52,6 +52,35 @@ export class NagiCanceledError extends Error {
   }
 }
 
+// A signal step's timeoutMs elapsed before any of its signals arrived. The
+// timer-sweep settles the awaiting step as failed with this error, which the
+// scheduler then propagates to flow.failed. `name` is the canonical
+// discriminator a consumer can pattern-match in the step/flow error (the fold
+// only persists name + message), but step identity is the cheaper signal: a
+// signal step otherwise only ever ends `canceled`, never `failed`.
+export class NagiSignalTimeoutError extends Error {
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly fireAt: Date;
+  constructor({
+    runId,
+    stepId,
+    fireAt,
+  }: {
+    readonly runId: RunId;
+    readonly stepId: string;
+    readonly fireAt: Date;
+  }) {
+    super(
+      `Signal step "${stepId}" (run ${runId}) timed out — no signal arrived before its deadline ${fireAt.toISOString()}.`,
+    );
+    this.name = "NagiSignalTimeoutError";
+    this.runId = runId;
+    this.stepId = stepId;
+    this.fireAt = fireAt;
+  }
+}
+
 // A run was started against a flowHash that is no longer in this process's
 // registry — typically a forward-incompatible deploy retired the old hash. We
 // raise loudly at dispatch (not silently against the new code) so an admin can

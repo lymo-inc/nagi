@@ -1,5 +1,9 @@
 import type { Dispatcher } from "./dispatch";
-import { NagiRuntimeError } from "./errors";
+import {
+  NagiRuntimeError,
+  NagiSignalTimeoutError,
+  serializeError,
+} from "./errors";
 import type { Hooks } from "./exec/hooks";
 import { Facts } from "./facts";
 import type { FlowRegistry } from "./flow-registry";
@@ -23,6 +27,7 @@ import type {
   SignalBufferedFact,
   SignalReceivedFact,
   StepCompletedFact,
+  StepFailedFact,
   StepId,
   Store,
 } from "./types";
@@ -117,6 +122,39 @@ export function decideSignal(args: {
       ...compact({ signalName: incoming.signalName }),
     }),
     result: { tag: "buffered" },
+  };
+}
+
+// The timeout counterpart to decideSignal, owned by core so both stores share
+// one decision (each owns only its tx/lock). A signal step resolves either by
+// delivery (decideSignal → step.completed) or by deadline (here → step.failed);
+// the scheduler then propagates the failure to flow.failed. Stale timers (the
+// signal already landed, the run was canceled, or the step was reset) fold to a
+// non-awaiting state → noop, and the caller deletes the row regardless.
+export type TimeoutDecision =
+  | { readonly kind: "noop" }
+  | {
+      readonly kind: "fail";
+      readonly attempt: AttemptNumber;
+      readonly fact: StepFailedFact;
+    };
+
+export function decideTimeout(args: {
+  readonly runState: RunState;
+  readonly stepId: StepId;
+  readonly fireAt: Date;
+  readonly at: Date;
+}): TimeoutDecision {
+  const { runState, stepId, fireAt, at } = args;
+  const step = stepStateOf(runState, stepId);
+  if (step.tag !== "awaitingSignal") return { kind: "noop" };
+  const error = serializeError(
+    new NagiSignalTimeoutError({ runId: runState.runId, stepId, fireAt }),
+  );
+  return {
+    kind: "fail",
+    attempt: step.attempt,
+    fact: Facts.stepFailed(runState.runId, stepId, step.attempt, error, at),
   };
 }
 

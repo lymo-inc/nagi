@@ -6,7 +6,7 @@ import type {
   StepRunStatus,
   StepView,
 } from "./run-view";
-import { decideSignal } from "./signals";
+import { decideSignal, decideTimeout } from "./signals";
 import {
   attemptOf,
   errorOf,
@@ -49,6 +49,7 @@ import type {
   Store,
   StreamEvent,
   StreamTransport,
+  TimedOutSignal,
   Trigger,
   Tx,
 } from "./types";
@@ -79,6 +80,10 @@ export class InMemoryStore implements Store, StreamTransport {
   private readonly childrenByParent = new Map<RunId, Set<RunId>>();
   private readonly summaries = new Map<RunId, RunSummary>();
   private readonly streamHub = new InMemoryStreamHub();
+  // Durable signal-timeout deadlines, keyed `${runId}::${stepId}` → fire_at.
+  // The Postgres analogue is the nagi.timer table; this is its in-memory twin
+  // (distinct from the InMemoryClock's setTimeout-based scheduler timers).
+  private readonly signalTimers = new Map<string, Date>();
   private readonly leaseMs: Millis;
 
   constructor(opts: InMemoryStoreOpts = {}) {
@@ -135,6 +140,7 @@ export class InMemoryStore implements Store, StreamTransport {
       for (const key of this.leases.keys()) {
         if (key.startsWith(leasePrefix)) this.leases.delete(key);
       }
+      this.signalTimers.delete(`${runId}::${fact.stepId}`);
     }
   }
 
@@ -373,8 +379,60 @@ export class InMemoryStore implements Store, StreamTransport {
       case "deliver":
         await this.appendFact(runId, decision.received);
         await this.appendFact(runId, decision.completed);
+        // The step resolved by delivery; drop its timeout so the next sweep
+        // doesn't fold a now-completed step just to no-op (Postgres parity).
+        this.signalTimers.delete(`${runId}::${stepId}`);
         return decision.result;
     }
+  }
+
+  async upsertTimer(runId: RunId, stepId: StepId, fireAt: Date): Promise<void> {
+    // Keep the earliest deadline (Postgres parity: ON CONFLICT DO NOTHING) so a
+    // lease-reap re-dispatch of a still-parked signal can't push the deadline
+    // out. A genuine restart deletes the row first (step.reset).
+    const key = `${runId}::${stepId}`;
+    if (!this.signalTimers.has(key)) this.signalTimers.set(key, fireAt);
+  }
+
+  async sweepSignalTimeouts(args: {
+    readonly now: Date;
+    readonly limit?: number;
+  }): Promise<readonly TimedOutSignal[]> {
+    const { now, limit = 100 } = args;
+    const timedOut: TimedOutSignal[] = [];
+
+    const due: Array<{ key: string; runId: RunId; stepId: StepId }> = [];
+    for (const [key, fireAt] of this.signalTimers) {
+      if (due.length >= limit) break;
+      if (fireAt > now) continue;
+      const sep = key.indexOf("::");
+      due.push({
+        key,
+        runId: key.slice(0, sep) as RunId,
+        stepId: key.slice(sep + 2),
+      });
+    }
+
+    // Single process, single thread: fold → decide → append runs with no
+    // interleaving await, the same atomicity argument settleSignal relies on.
+    for (const { key, runId, stepId } of due) {
+      const fireAt = this.signalTimers.get(key);
+      if (fireAt === undefined) continue;
+      const runState = foldRun(runId, this.facts.get(runId) ?? []);
+      const decision = decideTimeout({ runState, stepId, fireAt, at: now });
+      this.signalTimers.delete(key);
+      if (decision.kind === "noop") continue;
+      await this.appendFact(runId, decision.fact);
+      // Drop the parked step's stale lease, mirroring settleSignal's deliver
+      // path (and the Postgres timeout path).
+      const leasePrefix = `${runId}::${stepId}::`;
+      for (const k of this.leases.keys()) {
+        if (k.startsWith(leasePrefix)) this.leases.delete(k);
+      }
+      timedOut.push({ runId, stepId, attempt: decision.attempt, fireAt });
+    }
+
+    return timedOut;
   }
 
   async recordOnce(

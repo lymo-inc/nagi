@@ -13,6 +13,7 @@ import type {
 
 const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_POLL_INTERVAL_MS: Millis = 1_000;
+const DEFAULT_TIMER_SWEEP_INTERVAL_MS: Millis = 30_000;
 
 export interface WorkerDeps extends DispatchDeps {
   readonly clock: Clock;
@@ -28,6 +29,8 @@ class WorkerImpl implements Worker {
   private readonly pollIntervalMs: Millis;
   private readonly signal: AbortSignal | undefined;
   private readonly dispatcher: Dispatcher;
+  private readonly timerSweepIntervalMs: Millis;
+  private lastTimerSweepAt: number;
 
   constructor(
     private readonly deps: WorkerDeps,
@@ -37,10 +40,19 @@ class WorkerImpl implements Worker {
     this.pollIntervalMs = config?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.signal = config?.signal;
     this.dispatcher = makeDispatcher(deps);
+    this.timerSweepIntervalMs =
+      config?.timerSweepIntervalMs ?? DEFAULT_TIMER_SWEEP_INTERVAL_MS;
+    // Anchor the first sweep one interval out, like the lease-reaper sleeps
+    // before its first pass — no sweep storm at boot.
+    this.lastTimerSweepAt = this.deps.clock.now().getTime();
   }
 
   async run(): Promise<void> {
     while (!this.aborted()) {
+      // Time-based, not idle-gated: a worker pinned at full concurrency still
+      // reaches this each iteration (the slots-full branch loops every ~50ms),
+      // so signal timeouts fire on cadence regardless of load.
+      await this.maybeSweepTimers();
       const slots = this.concurrency - this.inFlight;
       if (slots <= 0) {
         await this.sleep(50);
@@ -139,6 +151,27 @@ class WorkerImpl implements Worker {
   private async drain(): Promise<void> {
     while (this.inFlight > 0) {
       await this.deps.clock.sleep(50);
+    }
+  }
+
+  // Sweep elapsed signal timeouts on cadence. Runs inline in the dispatch loop
+  // (not fired concurrently) so two sweeps never overlap; at 30s with a handful
+  // of timers the cost is negligible. Errors are logged, never thrown — a failed
+  // sweep must not kill the worker; the next tick retries.
+  private async maybeSweepTimers(): Promise<void> {
+    if (this.timerSweepIntervalMs <= 0) return;
+    const now = this.deps.clock.now();
+    if (now.getTime() - this.lastTimerSweepAt < this.timerSweepIntervalMs)
+      return;
+    this.lastTimerSweepAt = now.getTime();
+    try {
+      await this.dispatcher.sweepTimers(now);
+    } catch (err) {
+      this.deps.emitLog({
+        level: "warn",
+        msg: "worker: signal-timeout sweep failed",
+        attrs: { error: String(err) },
+      });
     }
   }
 

@@ -979,6 +979,76 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     }, 15_000);
   });
 
+  describe("b.signal timeout — fails the run via PG", () => {
+    it("fails an awaiting signal step on deadline, materializes the typed error, and cascades to flow.failed", async () => {
+      const f = flow({
+        id: "pg-signal-timeout",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => {
+          const awaitAudio = b.signal({
+            names: ["audioReady", "recordingReady"],
+            schema: passthroughSchema<{ ok: boolean }>(),
+            timeoutMs: 10,
+          });
+          return {
+            awaitAudio,
+            transcription: b.task({
+              needs: { awaitAudio },
+              run: async () => ({ done: true }),
+            }),
+          };
+        },
+      });
+
+      const wf = await makeNagi(f);
+      const runId = await wf.start(f, {});
+
+      // Tiny sweep cadence so the worker self-sweep fails the parked gate
+      // quickly; exercises upsertTimer (armed in recordStarted), the advisory-
+      // locked sweepSignalTimeouts, and advance → flow.failed end to end.
+      const ac = new AbortController();
+      const worker = wf.worker({
+        pollIntervalMs: 5,
+        timerSweepIntervalMs: 20,
+        signal: ac.signal,
+      });
+      const done = worker.run();
+      try {
+        const start = Date.now();
+        while (Date.now() - start < 10_000) {
+          if ((await loadStatus(db, schema, runId)) === "failed") break;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      } finally {
+        ac.abort();
+        await done;
+      }
+
+      expect(await loadStatus(db, schema, runId)).toBe("failed");
+
+      const store = postgresStore({ db, schema });
+      const final = await store.loadRunState(runId);
+      expect(final.steps["awaitAudio"]?.tag).toBe("failed");
+
+      const stepRow = await sql<{
+        status: string;
+        error: { name?: string } | null;
+      }>`
+        SELECT status, error FROM ${sql.raw(`${schema}.step_run`)}
+         WHERE run_id = ${runId} AND step_id = 'awaitAudio'
+      `.execute(db);
+      expect(stepRow.rows[0]?.status).toBe("failed");
+      expect(stepRow.rows[0]?.error?.name).toBe("NagiSignalTimeoutError");
+
+      // The timer row is consumed once it fires.
+      const timers = await sql<{ n: number }>`
+        SELECT count(*)::int AS n FROM ${sql.raw(`${schema}.timer`)}
+         WHERE run_id = ${runId}
+      `.execute(db);
+      expect(timers.rows[0]?.n).toBe(0);
+    }, 20_000);
+  });
+
   describe("pruneFacts — retention", () => {
     beforeEach(async () => {
       await sql

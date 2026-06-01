@@ -30,11 +30,13 @@ import type {
   StepRunStatus,
   StepView,
   Store,
+  TimedOutSignal,
   Tx,
 } from "@nagi-js/core";
 import {
   decideExpiredLeaseAction,
   decideSignal,
+  decideTimeout,
   NagiConcurrencyConflictError,
   projectRunState,
 } from "@nagi-js/core";
@@ -377,6 +379,9 @@ class PostgresStore<DB = unknown> implements Store {
             );
             await this.insertFact(trx, runId, decision.completed);
             await this.deleteLease(trx, runId, stepId);
+            // Resolved by delivery; drop any armed timeout so the next sweep
+            // doesn't fold a completed step just to no-op.
+            await this.deleteTimer(trx, runId, stepId);
             return decision.result;
         }
       });
@@ -514,6 +519,92 @@ class PostgresStore<DB = unknown> implements Store {
 
       return reaped;
     });
+  }
+
+  async upsertTimer(runId: RunId, stepId: StepId, fireAt: Date): Promise<void> {
+    // DO NOTHING, not DO UPDATE: the deadline anchors to when the step FIRST
+    // started awaiting. A lease-reap re-dispatch (which re-runs recordStarted at
+    // attempt+1 on a still-parked signal) must NOT push the deadline out, or a
+    // reaper running every leaseMs would reset it forever and the timeout would
+    // never fire. A genuine restart deletes the row first (step.reset), so the
+    // next arm is fresh.
+    await sql`
+      INSERT INTO ${sql.raw(this.t("timer"))} (run_id, step_id, fire_at)
+      VALUES (${runId}, ${stepId}, ${fireAt})
+      ON CONFLICT (run_id, step_id) DO NOTHING
+    `.execute(this.db);
+  }
+
+  async sweepSignalTimeouts(args: {
+    readonly now: Date;
+    readonly limit?: number;
+  }): Promise<readonly TimedOutSignal[]> {
+    const { now, limit = 100 } = args;
+
+    // Read due timers WITHOUT a row lock, then resolve each in its OWN
+    // transaction under one per-run advisory lock — exactly settleSignal's
+    // shape. Holding only a single advisory xact-lock at a time avoids two
+    // hazards a batch-tx would create: an ABBA deadlock with settleSignal
+    // (which takes the advisory lock, then deletes the timer row), and a
+    // deadlock between two sweepers that lock overlapping runs in different
+    // order. Concurrent sweepers stay correct without SKIP LOCKED: the advisory
+    // lock serializes them, and the loser folds a non-awaiting step → noop.
+    const rows = await sql<{
+      run_id: string;
+      step_id: string;
+      fire_at: Date;
+    }>`
+      SELECT run_id, step_id, fire_at
+        FROM ${sql.raw(this.t("timer"))}
+       WHERE fire_at < ${now}
+       LIMIT ${limit}
+    `.execute(this.db);
+
+    const timedOut: TimedOutSignal[] = [];
+    for (const row of rows.rows) {
+      const runId = row.run_id as RunId;
+      const stepId = row.step_id as StepId;
+      const fireAt =
+        row.fire_at instanceof Date ? row.fire_at : new Date(row.fire_at);
+
+      const failed = await this.db.transaction().execute(async (trx) => {
+        // The SAME per-run lock settleSignal takes: a delivery and a timeout
+        // can never both resolve the step. The lock-loser folds a non-awaiting
+        // step → noop. Held until commit, so the fail + delete land atomically.
+        const lockText = `nagi:signal:${runId}`;
+        await sql`SELECT pg_advisory_xact_lock(hashtext(${lockText}))`.execute(
+          trx,
+        );
+
+        const runState = await this.loadRunStateWith(trx, runId);
+        const decision = decideTimeout({ runState, stepId, fireAt, at: now });
+
+        // Fired once: drop the row whether or not it still had an awaiting step.
+        await this.deleteTimer(trx, runId, stepId);
+        if (decision.kind === "noop") return false;
+
+        // step.failed isn't materialized via insertFact (see
+        // applyFactToMaterialized), so settle the step row here the same way
+        // settleSignal/settleStep do for their terminal facts.
+        await this.upsertStepFailed(
+          trx,
+          runId,
+          stepId,
+          decision.attempt,
+          decision.fact.error,
+        );
+        await this.insertFact(trx, runId, decision.fact);
+        // Drop the parked step's stale lease in the same tx, as every other
+        // terminal step settlement (settleSignal/settleStep) does.
+        await this.deleteLease(trx, runId, stepId);
+        return decision.attempt;
+      });
+
+      if (failed !== false) {
+        timedOut.push({ runId, stepId, attempt: failed, fireAt });
+      }
+    }
+    return timedOut;
   }
 
   async settleStep(
@@ -689,6 +780,7 @@ class PostgresStore<DB = unknown> implements Store {
            WHERE run_id = ${runId} AND step_id = ${fact.stepId}
         `.execute(trx);
         await this.deleteLease(trx, runId, fact.stepId);
+        await this.deleteTimer(trx, runId, fact.stepId);
         return;
       case "once.recorded":
         await sql`
@@ -780,6 +872,17 @@ class PostgresStore<DB = unknown> implements Store {
   ): Promise<void> {
     await sql`
       DELETE FROM ${sql.raw(this.t("lease"))}
+       WHERE run_id = ${runId} AND step_id = ${stepId}
+    `.execute(trx);
+  }
+
+  private async deleteTimer(
+    trx: Kysely<DB>,
+    runId: RunId,
+    stepId: StepId,
+  ): Promise<void> {
+    await sql`
+      DELETE FROM ${sql.raw(this.t("timer"))}
        WHERE run_id = ${runId} AND step_id = ${stepId}
     `.execute(trx);
   }

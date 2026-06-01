@@ -168,10 +168,23 @@ export function makeMessage(
     const { runId, stepId, attempt } = message;
     const handler = handlerDef(def);
 
+    const startedAt = clock.now();
     await store.appendFact(
       runId,
-      Facts.stepStarted(runId, stepId, attempt, def.kind, clock.now()),
+      Facts.stepStarted(runId, stepId, attempt, def.kind, startedAt),
     );
+    // Arm the signal timeout off the same start instant the step.started fact
+    // records, so the deadline is derived from a persisted fact (replay-safe),
+    // never from a fresh clock read. upsertTimer keeps the earliest deadline, so
+    // a lease-reap re-dispatch of a still-parked signal doesn't push it out.
+    // Steps without timeoutMs park forever as before.
+    if (def.kind === "signal" && def.timeoutMs != null) {
+      await store.upsertTimer(
+        runId,
+        stepId,
+        new Date(startedAt.getTime() + def.timeoutMs),
+      );
+    }
     // Start events surface the flow input only where the start is an
     // input-processing moment; signal/match start with null by contract. Input
     // is immutable after flow.started, so the admission snapshot is current.
