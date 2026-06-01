@@ -792,6 +792,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
                 stepId: string;
                 attempt: number;
               };
+              readonly generation: number;
             }) => Promise<RunId>;
           };
         }
@@ -802,11 +803,15 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         child,
         childInput: { x: 5 },
         parent: parentRef,
+        generation: 0,
       });
+      // A lease-reap re-dispatch is a higher attempt but the SAME generation, so
+      // it must re-attach — not mint a second child that self-supersedes.
       const second = await startChildRun({
         child,
         childInput: { x: 5 },
-        parent: parentRef,
+        parent: { ...parentRef, attempt: 2 },
+        generation: 0,
       });
       expect(second).toBe(first);
 
@@ -817,6 +822,56 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(rows.rows.length).toBe(1);
       expect(rows.rows[0]?.status).not.toBe("canceled");
     }, 20_000);
+
+    it("sweepLeases skips a subflow step while its child is active, reaps once terminal (child_active SQL)", async () => {
+      const store = postgresStore({ db, schema, leaseMs: 50 });
+      const queue = new InMemoryQueue();
+      const parentRunId = `run-${uuidv7()}` as RunId;
+      const childRunId = `run-${uuidv7()}` as RunId;
+
+      // Parent run with a subflow step parked (awaitingChild folds to 'running').
+      await store.tryStartRun(parentRunId, {
+        kind: "flow.started",
+        runId: parentRunId,
+        flowId: "child-active-parent",
+        input: null as never,
+        at: new Date(),
+      });
+      await store.appendFact(parentRunId, {
+        kind: "step.started",
+        runId: parentRunId,
+        stepId: "sub",
+        attempt: 1,
+        stepKind: "subflow",
+        at: new Date(),
+      });
+      expect(await store.claimStep(parentRunId, "sub", 1)).not.toBeNull();
+
+      // Active child linked to (parentRunId, "sub").
+      await store.tryStartRun(childRunId, {
+        kind: "flow.started",
+        runId: childRunId,
+        flowId: "child-active-child",
+        input: null as never,
+        at: new Date(),
+        parent: { runId: parentRunId, stepId: "sub" },
+      });
+      await new Promise((r) => setTimeout(r, 80));
+
+      // Child running ⇒ the EXISTS clause skips the parent's subflow lease.
+      const skipped = await store.sweepLeases({ now: new Date(), queue });
+      expect(skipped.some((r) => r.runId === parentRunId)).toBe(false);
+
+      // Child terminal ⇒ next sweep reaps it (recovery / re-entrant wake).
+      await store.appendFact(childRunId, {
+        kind: "flow.completed",
+        runId: childRunId,
+        output: { ok: true },
+        at: new Date(),
+      });
+      const reaped = await store.sweepLeases({ now: new Date(), queue });
+      expect(reaped.some((r) => r.runId === parentRunId)).toBe(true);
+    }, 15_000);
 
     it("wf.cancel transitively cancels children", async () => {
       const grandchild = flow({

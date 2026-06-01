@@ -6,7 +6,12 @@ import {
   type SkipDecision,
   stepStateOf,
 } from "../scheduler";
-import { isTerminalRun, runStatusOf, stepStatusOf } from "../state";
+import {
+  isTerminalRun,
+  type RunCancelCause,
+  runStatusOf,
+  stepStatusOf,
+} from "../state";
 import type {
   AttemptNumber,
   Flow,
@@ -30,6 +35,57 @@ export interface Progression {
     childRunId: RunId,
     outcome: SubflowChildOutcome,
   ): Promise<void>;
+  wakeParentFromChild(childRunId: RunId): Promise<void>;
+}
+
+// Reconstruct a child's subflow outcome from its PERSISTED terminal phase, for
+// the re-entrant wake path (a re-dispatched subflow step whose child already
+// finished). undefined ⇒ the child is not terminal yet, so there is nothing to
+// propagate. Mirrors the outcomes the in-process finalize/cancel paths pass.
+function subflowOutcomeOf(
+  childRunId: RunId,
+  child: RunState,
+): SubflowChildOutcome | undefined {
+  switch (child.phase.tag) {
+    case "completed":
+      return { kind: "completed", output: child.phase.output };
+    case "failed":
+      return { kind: "failed", error: child.phase.error };
+    case "canceled":
+      return {
+        kind: "canceled",
+        error: cancelCauseToError(childRunId, child.phase.cause),
+      };
+    default:
+      return undefined;
+  }
+}
+
+function cancelCauseToError(
+  runId: RunId,
+  cause: RunCancelCause,
+): SerializedError {
+  switch (cause.kind) {
+    case "concurrency":
+      return {
+        name: "NagiCanceledError",
+        message: `Run ${runId} was canceled (superseded by ${cause.canceledByRunId})`,
+        cause: {
+          canceledByRunId: cause.canceledByRunId,
+          concurrencyKey: cause.concurrencyKey,
+        },
+      };
+    case "explicit":
+      return {
+        name: "NagiCanceledError",
+        message: `Run ${runId} was canceled: ${cause.reason}`,
+      };
+    case "operator":
+      return {
+        name: "NagiCanceledError",
+        message: `Run ${runId} was canceled by ${cause.actor}: ${cause.reason}`,
+      };
+  }
 }
 
 export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
@@ -240,5 +296,17 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
     await advance(parentRunId);
   }
 
-  return { advance, propagateToParent };
+  // Re-entrant wake: a parked subflow step was re-dispatched (lease-reap, or a
+  // recovery after a lost in-process wake) and its child is ALREADY terminal.
+  // Derive the outcome from the child's persisted phase and route it through
+  // the same guarded propagateToParent — idempotent with the in-process wake
+  // (the awaitingChild guard makes the loser a no-op).
+  async function wakeParentFromChild(childRunId: RunId): Promise<void> {
+    const child = await deps.store.loadRunState(childRunId);
+    const outcome = subflowOutcomeOf(childRunId, child);
+    if (outcome === undefined) return;
+    await propagateToParent(childRunId, outcome);
+  }
+
+  return { advance, propagateToParent, wakeParentFromChild };
 }

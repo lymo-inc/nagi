@@ -14,8 +14,9 @@ import {
   selectArm,
   type TaskDef,
 } from "../internal";
+import { deriveChildRunId } from "../run-id";
 import { stepStateOf } from "../scheduler";
-import { isAbortRequested, resolvedOf } from "../state";
+import { isAbortRequested, isTerminalRun, resolvedOf } from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
   classifyFailure,
@@ -54,6 +55,18 @@ interface ExecuteTaskResult {
 
 export interface MessageHandler {
   dispatchMessage(message: QueueMessage): Promise<void>;
+}
+
+// Replay generation for a subflow step: the count of step.reset facts for it.
+// 0 on the original run, +1 per replay (nagi#6); unchanged by lease-reap,
+// redelivery, or retry. Used to key the deterministic child runId so a
+// re-dispatch re-attaches but a replay spawns fresh. See deriveChildRunId.
+function subflowGeneration(state: RunState, stepId: string): number {
+  let n = 0;
+  for (const f of state.facts) {
+    if (f.kind === "step.reset" && f.stepId === stepId) n++;
+  }
+  return n;
 }
 
 export function makeMessage(
@@ -247,8 +260,7 @@ export function makeMessage(
         await executeMatch({ def, runId, stepId, state });
         return { tag: "advance" };
       case "subflow":
-        await executeSubflow({ def, runId, stepId, attempt, state });
-        return { tag: "parked" };
+        return await executeSubflow({ def, runId, stepId, attempt, state });
     }
   }
 
@@ -463,7 +475,7 @@ export function makeMessage(
     stepId: string;
     attempt: number;
     state: RunState;
-  }): Promise<void> {
+  }): Promise<Dispatched> {
     const { def, runId, stepId, attempt, state } = args;
     const child = deps.lookupFlow(def.childFlowId);
     if (child === undefined) {
@@ -471,6 +483,25 @@ export function makeMessage(
         `Subflow step "${stepId}" references child flow "${def.childFlowId}" which is not registered with nagi(). Pass it to flows[].`,
       );
     }
+    // generation = how many times this step has been reset (replayed). It is
+    // unchanged by lease-reap / redelivery, so every re-dispatch of the same
+    // logical spawn re-derives the SAME child id (idempotent re-attach); a
+    // replay (nagi#6) bumps it and gets a fresh child. See deriveChildRunId.
+    const generation = subflowGeneration(state, stepId);
+    const childRunId = await deriveChildRunId({ runId, stepId, generation });
+
+    // Re-entrant: a re-dispatch (lease-reap, or recovery after a lost wake) of a
+    // parked subflow step whose child has ALREADY finished settles the parent
+    // from the child's outcome instead of re-spawning — which would park forever
+    // waiting on a wake that already fired. Idempotent with the in-process wake.
+    const childState = await deps.store.loadRunState(childRunId);
+    if (isTerminalRun(childState)) {
+      await progression.wakeParentFromChild(childRunId);
+      return { tag: "parked" };
+    }
+
+    // First spawn, or re-attach to an in-flight child (deterministic id +
+    // tryStartRun existence-check ⇒ idempotent), then park.
     const parentInput = state.input;
     const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
     const childInput = def.buildInput({ input: parentInput, needs });
@@ -478,7 +509,9 @@ export function makeMessage(
       child,
       childInput,
       parent: { runId, stepId, attempt },
+      generation,
     });
+    return { tag: "parked" };
   }
 
   async function executeMatch(args: {
