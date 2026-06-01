@@ -410,11 +410,15 @@ describe("b.subflow — idempotent spawn (self-supersede regression)", () => {
       child,
       childInput: { x: 5 },
       parent: parentRef,
+      generation: 0,
     });
+    // A re-dispatch at a higher attempt (lease-reap) is the SAME generation, so
+    // it must re-attach — not spawn a second child that self-supersedes.
     const second = await h.deps.startChildRun({
       child,
       childInput: { x: 5 },
-      parent: parentRef,
+      parent: { ...parentRef, attempt: 2 },
+      generation: 0,
     });
 
     // Deterministic id ⇒ the redelivery re-attached to the same child.

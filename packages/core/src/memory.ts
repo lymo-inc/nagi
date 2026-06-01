@@ -214,6 +214,24 @@ export class InMemoryStore implements Store, StreamTransport {
     return Array.from(set);
   }
 
+  // Does a non-terminal child exist for this (parentRunId, stepId)? Used by the
+  // reaper to leave a subflow step parked while its child still runs (instead
+  // of re-dispatching it at attempt+1). childrenByParent is keyed by parent run
+  // only, so filter on the child's parent.stepId.
+  private hasActiveChild(parentRunId: RunId, parentStepId: StepId): boolean {
+    const childIds = this.childrenByParent.get(parentRunId);
+    if (childIds === undefined) return false;
+    for (const childId of childIds) {
+      const factList = this.facts.get(childId);
+      if (factList === undefined) continue;
+      const child = foldRun(childId, factList);
+      if (child.parent?.stepId === parentStepId && !isTerminalRun(child)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async loadRunState(runId: RunId): Promise<RunState> {
     return foldRun(runId, this.facts.get(runId) ?? []);
   }
@@ -292,6 +310,7 @@ export class InMemoryStore implements Store, StreamTransport {
           expiresAt: c.expiresAt,
         },
         stepStatus,
+        childActive: this.hasActiveChild(c.runId, c.stepId),
         now,
       });
       if (decision.tag === "skip") continue;

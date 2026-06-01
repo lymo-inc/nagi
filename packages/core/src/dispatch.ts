@@ -30,6 +30,7 @@ export interface DispatchDeps {
     readonly child: Flow;
     readonly childInput: unknown;
     readonly parent: ParentRef;
+    readonly generation: number;
   }) => Promise<RunId>;
   readonly store: Store;
   readonly streamTransport?: StreamTransport;

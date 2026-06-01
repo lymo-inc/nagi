@@ -431,14 +431,24 @@ class PostgresStore<DB = unknown> implements Store {
       // FOR UPDATE OF l SKIP LOCKED so concurrent reapers split the batch
       // without retry; the LEFT JOIN surfaces the step status that
       // decideExpiredLeaseAction needs to skip terminal steps cleanly.
+      // child_active: a subflow step parked on a still-running child must NOT be
+      // re-dispatched (it would re-park, or self-supersede the live child). The
+      // EXISTS mirrors the concurrency-active set (status IN pending/running).
       const rows = await sql<{
         run_id: string;
         step_id: string;
         attempt: number;
         expires_at: Date;
         status: StepRunStatus | null;
+        child_active: boolean;
       }>`
-        SELECT l.run_id, l.step_id, l.attempt, l.expires_at, s.status
+        SELECT l.run_id, l.step_id, l.attempt, l.expires_at, s.status,
+          EXISTS (
+            SELECT 1 FROM ${sql.raw(this.t("workflow_run"))} c
+             WHERE c.parent_run_id = l.run_id
+               AND c.parent_step_id = l.step_id
+               AND c.status IN ('pending', 'running')
+          ) AS child_active
           FROM ${sql.raw(this.t("lease"))} l
           LEFT JOIN ${sql.raw(this.t("step_run"))} s
             ON s.run_id = l.run_id
@@ -468,6 +478,7 @@ class PostgresStore<DB = unknown> implements Store {
         const decision = decideExpiredLeaseAction({
           lease: { runId, stepId, attempt, expiresAt },
           stepStatus,
+          childActive: row.child_active,
           now,
         });
         if (decision.tag === "skip") continue;

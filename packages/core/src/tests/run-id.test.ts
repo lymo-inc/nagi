@@ -38,16 +38,17 @@ describe("deriveChildRunId", () => {
   const base = {
     runId: RunId.fromTrusted("run-parent-1"),
     stepId: "sub",
-    attempt: 1,
+    generation: 0,
   };
 
-  it("is deterministic for the same (runId, stepId, attempt)", async () => {
+  it("is deterministic for the same (runId, stepId, generation)", async () => {
     expect(await deriveChildRunId(base)).toBe(await deriveChildRunId(base));
   });
 
-  it("differs by attempt, stepId, and parent runId", async () => {
+  it("differs by generation, stepId, and parent runId", async () => {
     const id = await deriveChildRunId(base);
-    expect(await deriveChildRunId({ ...base, attempt: 2 })).not.toBe(id);
+    // A replay (new generation) gets a fresh child...
+    expect(await deriveChildRunId({ ...base, generation: 1 })).not.toBe(id);
     expect(await deriveChildRunId({ ...base, stepId: "other" })).not.toBe(id);
     expect(
       await deriveChildRunId({

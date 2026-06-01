@@ -349,23 +349,30 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     readonly child: Flow;
     readonly childInput: unknown;
     readonly parent: ParentRef;
+    readonly generation: number;
   }): Promise<RunId> {
-    const { child, childInput, parent } = args;
+    const { child, childInput, parent, generation } = args;
     if (!registry.has(child.id)) {
       throw new NagiRuntimeError(
         `Subflow child "${child.id}" not registered with nagi(). Pass it to flows[].`,
       );
     }
     const validated = (await validate(child.input, childInput)) as Json;
-    // Deterministic per (parentRunId, stepId, attempt) so an at-least-once
-    // re-delivery of this subflow step re-attaches to the existing child
-    // instead of spawning a duplicate that cancel-in-progress would then
-    // self-supersede (failing the parent). See deriveChildRunId.
-    const childRunId = await deriveChildRunId(parent);
-    // started === false ⇒ this exact (parentRunId, stepId, attempt) already
-    // spawned the child on a prior delivery. tryStartRun checks run existence
-    // before its concurrency-cancel pass, so re-attaching cancels nothing and
-    // leaves the original child (and its parent link) intact. Idempotent.
+    // Deterministic per (parentRunId, stepId, generation) — INVARIANT under
+    // attempt — so any at-least-once re-dispatch of this subflow step (redelivery,
+    // lease-reap at attempt+1, durable child-wake) re-attaches to the existing
+    // child instead of spawning a duplicate that cancel-in-progress would then
+    // self-supersede (failing the parent). A replay (new generation) gets a
+    // fresh child. See deriveChildRunId.
+    const childRunId = await deriveChildRunId({
+      runId: parent.runId,
+      stepId: parent.stepId,
+      generation,
+    });
+    // started === false ⇒ this (parentRunId, stepId, generation) already spawned
+    // the child on a prior dispatch. tryStartRun checks run existence before its
+    // concurrency-cancel pass, so re-attaching cancels nothing and leaves the
+    // original child (and its parent link) intact. Idempotent.
     await startRunInternal({
       flow: child,
       validatedInput: validated,

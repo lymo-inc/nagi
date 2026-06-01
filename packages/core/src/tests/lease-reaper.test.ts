@@ -23,6 +23,7 @@ describe("decideExpiredLeaseAction", () => {
         expiresAt: new Date(now.getTime() - 1_000),
       },
       stepStatus: "running",
+      childActive: false,
       now,
     });
     expect(decision.tag).toBe("reap");
@@ -41,9 +42,42 @@ describe("decideExpiredLeaseAction", () => {
         expiresAt: new Date(now.getTime() + 10_000),
       },
       stepStatus: "running",
+      childActive: false,
       now,
     });
     expect(decision).toEqual({ tag: "skip", reason: "still-live" });
+  });
+
+  it("skips a subflow step parked on a still-active child, even if expired", () => {
+    const now = new Date("2025-01-01T00:00:00Z");
+    const decision = decideExpiredLeaseAction({
+      lease: {
+        runId: RUN_ID,
+        stepId: STEP_ID,
+        attempt: 1 as AttemptNumber,
+        expiresAt: new Date(now.getTime() - 1_000),
+      },
+      stepStatus: "running", // awaitingChild folds to "running"
+      childActive: true,
+      now,
+    });
+    expect(decision).toEqual({ tag: "skip", reason: "child-active" });
+  });
+
+  it("reaps once the child is terminal/gone (childActive false)", () => {
+    const now = new Date("2025-01-01T00:00:00Z");
+    const decision = decideExpiredLeaseAction({
+      lease: {
+        runId: RUN_ID,
+        stepId: STEP_ID,
+        attempt: 1 as AttemptNumber,
+        expiresAt: new Date(now.getTime() - 1_000),
+      },
+      stepStatus: "running",
+      childActive: false,
+      now,
+    });
+    expect(decision.tag).toBe("reap");
   });
 
   it("skips terminal steps (completed/failed/canceled/skipped)", () => {
@@ -62,6 +96,7 @@ describe("decideExpiredLeaseAction", () => {
           expiresAt: new Date(now.getTime() - 1_000),
         },
         stepStatus: status,
+        childActive: false,
         now,
       });
       expect(decision).toEqual({ tag: "skip", reason: "terminal" });
@@ -79,6 +114,7 @@ describe("decideExpiredLeaseAction", () => {
           expiresAt: new Date(now.getTime() - 1),
         },
         stepStatus: "pending",
+        childActive: false,
         now,
       });
       expect(decision.tag).toBe("reap");
