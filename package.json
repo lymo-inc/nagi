@@ -34,7 +34,7 @@
     "@nagi-js/pgmq": "workspace:*",
     "@nagi-js/postgres": "workspace:*",
     "husky": "^9.1.7",
-    "lint-staged": "^17.0.5",
+    "lint-staged": "^17.0.7",
     "publint": "^0.2.12",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",

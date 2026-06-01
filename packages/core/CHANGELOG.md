@@ -1,5 +1,11 @@
 # @nagi-js/core
 
+## 0.1.1-rc.15
+
+### Patch Changes
+
+- Fix subflow idempotent spawning
+
 ## 0.1.1-rc.14
 
 ### Patch Changes
