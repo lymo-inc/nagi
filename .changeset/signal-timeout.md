@@ -1,6 +1,6 @@
 ---
-"@nagi-js/core": minor
-"@nagi-js/postgres": minor
+"@nagi-js/core": patch
+"@nagi-js/postgres": patch
 ---
 
 Enforce `b.signal({ timeoutMs })` so a signal step no longer parks forever when

@@ -1,5 +1,12 @@
 # @nagi-js/pgmq
 
+## 0.1.1-rc.17
+
+### Patch Changes
+
+- Updated dependencies [771a6a2]
+  - @nagi-js/core@0.1.1-rc.17
+
 ## 0.1.1-rc.16
 
 ### Patch Changes
