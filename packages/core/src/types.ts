@@ -473,6 +473,14 @@ export interface WorkerConfig {
   // not-yet-updated worker to claim during a rolling deploy; "fail"
   // terminally fails the run with the snapshot-gone error and acks.
   readonly snapshotGonePolicy?: SnapshotGonePolicy;
+  // Cap on worker slots any single flow may occupy at once. Bounds blast
+  // radius: without it, one wedged flow's steps can hold every slot and
+  // starve all other flows (an observed multi-day outage shape). Over-cap
+  // messages are deferred with a delayed nack, not dropped. Unset = no cap
+  // (correct for single-flow deployments, where a cap only wastes slots);
+  // multi-flow deployments should set it to at most concurrency - 1 so one
+  // flow can never occupy the whole pool.
+  readonly maxConcurrencyPerFlow?: number;
 }
 
 export type SnapshotGoneDisposition =
@@ -778,6 +786,11 @@ export interface QueueMessage {
   // Unlike `attempt` (stamped at enqueue), this counts every redelivery —
   // nacks, lease expiries — so it is the poison-message signal.
   readonly readCount: number;
+  // Flow that owns the run, stamped at enqueue. Drives the worker's per-flow
+  // concurrency cap. Optional ONLY for messages enqueued before the field
+  // existed (they must still dispatch after an upgrade) — absent means exempt
+  // from the cap, and every current enqueue path stamps it.
+  readonly flowId?: string;
 }
 
 export interface QueueDequeueOpts {
@@ -788,6 +801,7 @@ export interface QueueEnqueueOpts {
   readonly attempt?: AttemptNumber;
   readonly delayMs?: Millis;
   readonly payload?: Json;
+  readonly flowId?: string;
 }
 
 export interface Queue {

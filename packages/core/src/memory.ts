@@ -335,6 +335,7 @@ export class InMemoryStore implements Store, StreamTransport {
       await queue.enqueue(c.runId, c.stepId, {
         attempt: decision.nextAttempt,
         delayMs: decision.backoffMs,
+        ...(state?.flowId !== undefined ? { flowId: state.flowId } : {}),
       });
       reaped.push({
         runId: c.runId,
@@ -901,6 +902,7 @@ export class InMemoryQueue implements Queue {
       readCount: 0,
       enqueuedAt: now,
       visibleAt: now + (opts?.delayMs ?? 0),
+      ...(opts?.flowId !== undefined ? { flowId: opts.flowId } : {}),
     };
     this.pending.push(item);
   }

@@ -31,6 +31,8 @@ interface MessageEnvelope {
   readonly runId: string;
   readonly stepId: string;
   readonly attempt: number;
+  // Absent on messages enqueued before the field existed; see QueueMessage.
+  readonly flowId?: string;
 }
 
 interface QueueConfig {
@@ -98,6 +100,7 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
         runId,
         stepId,
         attempt: options?.attempt ?? 1,
+        ...(options?.flowId !== undefined ? { flowId: options.flowId } : {}),
       };
       const delaySeconds = Math.max(
         0,
@@ -184,6 +187,7 @@ function projectMessage(
     attempt: envelope.attempt as AttemptNumber,
     readCount,
     payload: null,
+    ...(envelope.flowId !== undefined ? { flowId: envelope.flowId } : {}),
   };
 }
 

@@ -619,6 +619,7 @@ export function makeMessage(
         await queue.enqueue(runId, stepId, {
           attempt: attempt + 1,
           delayMs: outcome.delayMs,
+          flowId: flow.id,
         });
         return { tag: "parked" };
       }

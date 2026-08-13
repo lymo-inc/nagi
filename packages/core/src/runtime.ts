@@ -589,7 +589,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         if (transition.kind === "dispatch") {
           const txQueue = bindQueueToTx(config.queue, opts.tx);
           for (const stepId of transition.runnable) {
-            await txQueue.enqueue(runId, stepId);
+            await txQueue.enqueue(runId, stepId, { flowId: flow.id });
           }
         }
       }

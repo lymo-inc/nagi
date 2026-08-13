@@ -446,6 +446,7 @@ class PostgresStore<DB = unknown> implements Store {
         expires_at: Date;
         status: StepRunStatus | null;
         child_active: boolean;
+        flow_id: string | null;
       }>`
         SELECT l.run_id, l.step_id, l.attempt, l.expires_at, s.status,
           EXISTS (
@@ -453,12 +454,15 @@ class PostgresStore<DB = unknown> implements Store {
              WHERE c.parent_run_id = l.run_id
                AND c.parent_step_id = l.step_id
                AND c.status IN ('pending', 'running')
-          ) AS child_active
+          ) AS child_active,
+          r.flow_id
           FROM ${sql.raw(this.t("lease"))} l
           LEFT JOIN ${sql.raw(this.t("step_run"))} s
             ON s.run_id = l.run_id
            AND s.step_id = l.step_id
            AND s.attempt = l.attempt
+          LEFT JOIN ${sql.raw(this.t("workflow_run"))} r
+            ON r.run_id = l.run_id
          WHERE l.expires_at < ${now}
          FOR UPDATE OF l SKIP LOCKED
          LIMIT ${limit}
@@ -507,6 +511,7 @@ class PostgresStore<DB = unknown> implements Store {
         await txQueue.enqueue(runId, stepId, {
           attempt: decision.nextAttempt,
           delayMs: decision.backoffMs,
+          ...(row.flow_id !== null ? { flowId: row.flow_id } : {}),
         });
 
         reaped.push({

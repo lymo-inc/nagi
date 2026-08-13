@@ -59,6 +59,8 @@ class WorkerImpl implements Worker {
   private readonly dispatcher: Dispatcher;
   private readonly timerSweepIntervalMs: Millis;
   private readonly snapshotGonePolicy: SnapshotGonePolicy;
+  private readonly maxPerFlow: number | undefined;
+  private readonly inFlightByFlow = new Map<string, number>();
   private lastTimerSweepAt: number;
 
   constructor(
@@ -71,11 +73,44 @@ class WorkerImpl implements Worker {
     this.dispatcher = makeDispatcher(deps);
     this.snapshotGonePolicy =
       config?.snapshotGonePolicy ?? defaultSnapshotGonePolicy;
+    this.maxPerFlow =
+      config?.maxConcurrencyPerFlow !== undefined
+        ? Math.max(1, config.maxConcurrencyPerFlow)
+        : undefined;
     this.timerSweepIntervalMs =
       config?.timerSweepIntervalMs ?? DEFAULT_TIMER_SWEEP_INTERVAL_MS;
     // Anchor the first sweep one interval out, like the lease-reaper sleeps
     // before its first pass — no sweep storm at boot.
     this.lastTimerSweepAt = this.deps.clock.now().getTime();
+  }
+
+  // Per-flow blast-radius bound (maxConcurrencyPerFlow). A message over its
+  // flow's cap is DEFERRED — delayed nack, redelivered after ~pollIntervalMs —
+  // not dropped. Messages without flowId (enqueued pre-upgrade) are exempt.
+  // Deferral does raise pgmq read_ct, which the snapshot-gone policy reads;
+  // that only matters if the same flow later goes snapshot-gone, where an
+  // earlier fail is acceptable.
+  private admitFlow(msg: QueueMessage): boolean {
+    if (this.maxPerFlow === undefined || msg.flowId === undefined) return true;
+    return (this.inFlightByFlow.get(msg.flowId) ?? 0) < this.maxPerFlow;
+  }
+
+  // Returns the release fn; caller must invoke it exactly once when done.
+  private trackFlow(msg: QueueMessage): () => void {
+    const { flowId } = msg;
+    if (flowId === undefined) return () => {};
+    this.inFlightByFlow.set(flowId, (this.inFlightByFlow.get(flowId) ?? 0) + 1);
+    return () => {
+      const n = (this.inFlightByFlow.get(flowId) ?? 1) - 1;
+      if (n <= 0) this.inFlightByFlow.delete(flowId);
+      else this.inFlightByFlow.set(flowId, n);
+    };
+  }
+
+  private async defer(msg: QueueMessage): Promise<void> {
+    try {
+      await this.deps.queue.nack(msg.receipt, { delayMs: this.pollIntervalMs });
+    } catch {}
   }
 
   async run(): Promise<void> {
@@ -96,7 +131,10 @@ class WorkerImpl implements Worker {
         continue;
       }
 
-      for (const msg of messages) this.fire(msg);
+      for (const msg of messages) {
+        if (this.admitFlow(msg)) this.fire(msg);
+        else await this.defer(msg);
+      }
     }
     await this.drain();
   }
@@ -128,8 +166,26 @@ class WorkerImpl implements Worker {
       const messages = await this.dequeue(opts.batchSize(processed));
       if (messages.length === 0) break;
 
-      await Promise.all(messages.map((m) => this.dispatchSafely(m)));
-      processed += messages.length;
+      const admitted: Array<{
+        readonly m: QueueMessage;
+        readonly release: () => void;
+      }> = [];
+      for (const m of messages) {
+        // Sequential admission: each admit sees the batch-mates already
+        // admitted, so a whole batch of one flow cannot leapfrog the cap.
+        if (this.admitFlow(m)) {
+          admitted.push({ m, release: this.trackFlow(m) });
+        } else {
+          await this.defer(m);
+        }
+      }
+      await Promise.all(
+        admitted.map(({ m }) => this.dispatchSafely(m)),
+      ).finally(() => {
+        for (const { release } of admitted) release();
+      });
+      processed += admitted.length;
+      if (admitted.length === 0) break;
     }
     return { processed };
   }
@@ -140,7 +196,9 @@ class WorkerImpl implements Worker {
 
   private fire(msg: QueueMessage): void {
     this.inFlight++;
+    const release = this.trackFlow(msg);
     void this.dispatchSafely(msg).finally(() => {
+      release();
       this.inFlight = Math.max(0, this.inFlight - 1);
     });
   }

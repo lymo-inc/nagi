@@ -111,7 +111,8 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
           return;
         case "dispatch":
           await recordSkips(runId, t.skip);
-          for (const stepId of t.runnable) await queue.enqueue(runId, stepId);
+          for (const stepId of t.runnable)
+            await queue.enqueue(runId, stepId, { flowId: flow.id });
           return;
         case "skip":
           await recordSkips(runId, t.skip);
