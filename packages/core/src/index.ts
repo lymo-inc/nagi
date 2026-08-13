@@ -149,6 +149,7 @@ export type {
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
+  QueueInspectEntry,
   QueueMessage,
   Register,
   ReplayMode,

@@ -804,6 +804,17 @@ export interface QueueEnqueueOpts {
   readonly flowId?: string;
 }
 
+// Read-only snapshot of one queued message, for operator triage: a message
+// with visibleAt in the future is leased/delayed; a high readCount is a
+// redelivery loop; no entries at all for a non-terminal run means the run is
+// waiting on a signal/child — or was never scheduled (worker starvation).
+export interface QueueInspectEntry {
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly readCount: number;
+  readonly visibleAt: Date;
+}
+
 export interface Queue {
   enqueue(runId: RunId, stepId: StepId, opts?: QueueEnqueueOpts): Promise<void>;
   dequeue(opts: QueueDequeueOpts): Promise<readonly QueueMessage[]>;
@@ -813,6 +824,9 @@ export interface Queue {
   // Optional one-shot, idempotent schema provisioning. nagi() awaits it once at
   // construction (fail-fast). Adapters needing none omit it.
   ensureSchema?(): Promise<void>;
+  // Optional read-only triage view of a run's in-queue messages (see
+  // wf.inspectQueue). Optional because not every broker can query by run.
+  inspect?(runId: RunId): Promise<readonly QueueInspectEntry[]>;
 }
 
 export interface Clock {

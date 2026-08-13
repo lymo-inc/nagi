@@ -47,6 +47,7 @@ import type {
   QueryRunsOpts,
   QueryRunsResult,
   Queue,
+  QueueInspectEntry,
   ReplayOpts,
   RetryPolicy,
   RunId,
@@ -162,6 +163,13 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
   // for an unknown runId (never throws). Parent/children are nested on the
   // returned RunView; the outer envelope is `{run, steps}` only.
   describe(runId: RunId): Promise<RunDescription>;
+
+  // Read-only triage view of the run's in-queue messages, complementing
+  // describe(): a non-terminal run with pending steps and NO queue entries was
+  // never scheduled (worker starvation); a future visibleAt is leased/delayed;
+  // a high readCount is a redelivery loop. Throws NagiRuntimeError when the
+  // queue adapter doesn't implement inspect().
+  inspectQueue(runId: RunId): Promise<readonly QueueInspectEntry[]>;
 
   subscribe<C = Json>(
     runId: RunId,
@@ -685,6 +693,15 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
     async describe(runId: RunId): Promise<RunDescription> {
       return config.store.describe(runId);
+    },
+
+    async inspectQueue(runId: RunId): Promise<readonly QueueInspectEntry[]> {
+      if (config.queue.inspect === undefined) {
+        throw new NagiRuntimeError(
+          "inspectQueue: the configured queue adapter does not implement inspect().",
+        );
+      }
+      return config.queue.inspect(runId);
     },
 
     async queryRuns(opts: QueryRunsOpts = {}): Promise<QueryRunsResult> {

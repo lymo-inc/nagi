@@ -37,6 +37,7 @@ import type {
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
+  QueueInspectEntry,
   QueueMessage,
   RunId,
   RunState,
@@ -950,6 +951,18 @@ export class InMemoryQueue implements Queue {
     const item = this.leased.get(receipt);
     if (!item) return;
     this.leased.set(receipt, { ...item, visibleAt: Date.now() + leaseMs });
+  }
+
+  async inspect(runId: RunId): Promise<readonly QueueInspectEntry[]> {
+    const all = [...this.pending, ...this.leased.values()];
+    return all
+      .filter((m) => m.runId === runId)
+      .map((m) => ({
+        stepId: m.stepId,
+        attempt: m.attempt,
+        readCount: m.readCount,
+        visibleAt: new Date(m.visibleAt),
+      }));
   }
 }
 

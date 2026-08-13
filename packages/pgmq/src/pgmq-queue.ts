@@ -4,6 +4,7 @@ import type {
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
+  QueueInspectEntry,
   QueueMessage,
   RunId,
   StepId,
@@ -159,6 +160,26 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
       await sql`SELECT pgmq.set_vt(${queueName}, ${msgId}::bigint, ${vt}::int)`.execute(
         executor,
       );
+    },
+
+    async inspect(runId: RunId): Promise<readonly QueueInspectEntry[]> {
+      // Direct table read (pgmq stores queue "x" as pgmq.q_x) — pgmq has no
+      // query-by-payload API. Read-only; safe alongside consuming workers.
+      const { rows } = await sql<{
+        read_ct: number;
+        vt: Date | string;
+        message: unknown;
+      }>`SELECT read_ct, vt, message FROM ${sql.raw(`pgmq.q_${queueName}`)}
+          WHERE message->>'runId' = ${runId}`.execute(executor);
+      return rows.map((row) => {
+        const m = projectMessage("0", row.message, row.read_ct);
+        return {
+          stepId: m.stepId,
+          attempt: m.attempt,
+          readCount: row.read_ct,
+          visibleAt: row.vt instanceof Date ? row.vt : new Date(row.vt),
+        };
+      });
     },
   };
 }
