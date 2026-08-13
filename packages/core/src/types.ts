@@ -456,7 +456,19 @@ export interface WorkerConfig {
   // (tests that drive the sweep explicitly). Checked by elapsed wall-clock each
   // loop iteration, so a fully-busy worker still sweeps on schedule.
   readonly timerSweepIntervalMs?: Millis;
+  // Decides retry-vs-fail for a message whose run's flow snapshot is gone
+  // (deploy replaced the flow while the run was in flight). Defaults to
+  // defaultSnapshotGonePolicy. "retry" keeps the message alive for a
+  // not-yet-updated worker to claim during a rolling deploy; "fail"
+  // terminally fails the run with the snapshot-gone error and acks.
+  readonly snapshotGonePolicy?: SnapshotGonePolicy;
 }
+
+export type SnapshotGoneDisposition =
+  | { readonly action: "retry"; readonly delayMs: Millis }
+  | { readonly action: "fail" };
+
+export type SnapshotGonePolicy = (readCount: number) => SnapshotGoneDisposition;
 
 export interface WorkerRunOnceOpts {
   readonly maxSteps?: number;
@@ -751,6 +763,10 @@ export interface QueueMessage {
   readonly stepId: StepId;
   readonly payload: Json;
   readonly attempt: AttemptNumber;
+  // Deliveries of this message including the current one (pgmq read_ct).
+  // Unlike `attempt` (stamped at enqueue), this counts every redelivery —
+  // nacks, lease expiries — so it is the poison-message signal.
+  readonly readCount: number;
 }
 
 export interface QueueDequeueOpts {

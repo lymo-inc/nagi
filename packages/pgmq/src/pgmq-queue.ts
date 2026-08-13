@@ -113,11 +113,14 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
     }: QueueDequeueOpts): Promise<readonly QueueMessage[]> {
       const { rows } = await sql<{
         msg_id: string | number | bigint;
+        read_ct: number;
         message: unknown;
-      }>`SELECT msg_id, message FROM pgmq.read(${queueName}, ${vtSeconds}::int, ${count}::int)`.execute(
+      }>`SELECT msg_id, read_ct, message FROM pgmq.read(${queueName}, ${vtSeconds}::int, ${count}::int)`.execute(
         executor,
       );
-      return rows.map((row) => projectMessage(row.msg_id, row.message));
+      return rows.map((row) =>
+        projectMessage(row.msg_id, row.message, row.read_ct),
+      );
     },
 
     async ack(receipt: string): Promise<void> {
@@ -160,6 +163,7 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
 function projectMessage(
   rawMsgId: string | number | bigint,
   raw: unknown,
+  readCount: number,
 ): QueueMessage {
   if (
     raw === null ||
@@ -178,6 +182,7 @@ function projectMessage(
     runId: envelope.runId as RunId,
     stepId: envelope.stepId as StepId,
     attempt: envelope.attempt as AttemptNumber,
+    readCount,
     payload: null,
   };
 }

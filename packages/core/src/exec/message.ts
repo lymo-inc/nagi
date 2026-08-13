@@ -1,5 +1,5 @@
 import type { DispatchDeps } from "../dispatch";
-import { serializeError } from "../errors";
+import { NagiFlowSnapshotGoneError, serializeError } from "../errors";
 import { Facts } from "../facts";
 import {
   asStepMapWithDefs,
@@ -79,7 +79,23 @@ export function makeMessage(
 
   async function dispatchMessage(message: QueueMessage): Promise<void> {
     const { queue } = deps;
-    const flow = await deps.flowFor(message.runId);
+    let flow: Flow;
+    try {
+      flow = await deps.flowFor(message.runId);
+    } catch (err) {
+      // A terminal run's message must not outlive it: without this, a run
+      // canceled AFTER its flow snapshot went gone (deploy replaced the flow
+      // mid-flight) would nack-loop forever, because the hash check fires
+      // before admit()'s canceled-phase check ever runs.
+      if (
+        err instanceof NagiFlowSnapshotGoneError &&
+        isTerminalRun(await deps.store.loadRunState(message.runId))
+      ) {
+        await queue.ack(message.receipt);
+        return;
+      }
+      throw err;
+    }
 
     const admission = await admit({ flow, message });
     if (admission.tag === "skip") {

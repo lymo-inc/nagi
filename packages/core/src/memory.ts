@@ -898,6 +898,7 @@ export class InMemoryQueue implements Queue {
       stepId,
       payload: opts?.payload ?? null,
       attempt: opts?.attempt ?? 1,
+      readCount: 0,
       enqueuedAt: now,
       visibleAt: now + (opts?.delayMs ?? 0),
     };
@@ -915,11 +916,15 @@ export class InMemoryQueue implements Queue {
       const item = this.pending[i];
       if (item === undefined) continue;
       if (item.visibleAt > now) continue;
-      const next: QueuedItem = { ...item, visibleAt: now + this.leaseMs };
+      const delivered: QueuedItem = {
+        ...item,
+        readCount: item.readCount + 1,
+        visibleAt: now + this.leaseMs,
+      };
       this.pending.splice(i, 1);
       i--;
-      this.leased.set(item.receipt, next);
-      claimed.push(item);
+      this.leased.set(item.receipt, delivered);
+      claimed.push(delivered);
     }
     return claimed;
   }

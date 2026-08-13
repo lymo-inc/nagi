@@ -165,6 +165,8 @@ export type {
   SignalReceivedFact,
   SignalSentEvent,
   SignalSentFact,
+  SnapshotGoneDisposition,
+  SnapshotGonePolicy,
   StandardSchemaV1,
   Step,
   StepAbortRequestedFact,
@@ -204,3 +206,4 @@ export type {
   WorkerRunResult,
   WorkerRunUntilEmptyOpts,
 } from "./types";
+export { defaultSnapshotGonePolicy } from "./worker";
