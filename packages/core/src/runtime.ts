@@ -26,6 +26,7 @@ import { foldRun, isTerminalRun, runStatusOf } from "./state";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_LEASE_MS,
+  DEFAULT_LEASE_HOLD_WARN_MS,
 } from "./step-exec";
 import type {
   CancelArgs,
@@ -77,6 +78,12 @@ export interface NagiConfig {
   // or a slow step's message is redelivered before the first lease extension.
   readonly heartbeatIntervalMs?: Millis;
   readonly heartbeatLeaseMs?: Millis;
+  // Warn each time a step body has held a worker slot for another multiple of
+  // this (default 5 min; 0 disables). A firing watchdog usually means an
+  // in-step wait on an external fact — model those as b.signal steps, which
+  // park WITHOUT holding a slot. Timeout-less in-step waits have starved
+  // entire worker pools in production.
+  readonly leaseHoldWarnMs?: Millis;
   // Lease-reaper sweep cadence. Default 30s — stay ≤ ½ the store lease TTL so
   // a crashed worker is reaped within one TTL. 0 disables the reaper (tests,
   // or external/cron-driven reaping).
@@ -444,6 +451,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     heartbeat: {
       intervalMs: config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       leaseMs: config.heartbeatLeaseMs ?? DEFAULT_HEARTBEAT_LEASE_MS,
+      holdWarnMs: config.leaseHoldWarnMs ?? DEFAULT_LEASE_HOLD_WARN_MS,
     },
     ...compact({
       hooks: config.hooks,

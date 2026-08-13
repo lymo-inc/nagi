@@ -17,6 +17,7 @@ describe("wf.operator().skip()", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => {
         const a = b.signal({
+          timeoutMs: "unbounded" as const,
           schema: passthroughSchema<Record<string, never>>(),
         });
         const bStep = b.task({
@@ -58,6 +59,7 @@ describe("wf.operator().skip()", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => {
         const a = b.signal({
+          timeoutMs: "unbounded" as const,
           schema: passthroughSchema<{ v: number }>(),
         });
         const bStep = b.task({
@@ -88,7 +90,10 @@ describe("wf.operator().skip()", () => {
       id: "skip-no-actor",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        a: b.signal({ schema: passthroughSchema<Record<string, never>>() }),
+        a: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<Record<string, never>>(),
+        }),
       }),
     });
     const h = await makeHarness(f);
@@ -105,7 +110,10 @@ describe("wf.operator().skip()", () => {
       id: "skip-unknown-step",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        a: b.signal({ schema: passthroughSchema<Record<string, never>>() }),
+        a: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<Record<string, never>>(),
+        }),
       }),
     });
     const h = await makeHarness(f);
@@ -233,7 +241,10 @@ describe("wf.operator().retry()", () => {
       id: "retry-canceled-run",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        a: b.signal({ schema: passthroughSchema<Record<string, never>>() }),
+        a: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<Record<string, never>>(),
+        }),
       }),
     });
     const h = await makeHarness(f);
@@ -252,7 +263,10 @@ describe("wf.operator().abort()", () => {
       id: "abort-audit",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        a: b.signal({ schema: passthroughSchema<Record<string, never>>() }),
+        a: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<Record<string, never>>(),
+        }),
       }),
     });
     const h = await makeHarness(f);
@@ -294,7 +308,10 @@ describe("wf.operator().abort()", () => {
       id: "cancel-explicit",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        a: b.signal({ schema: passthroughSchema<Record<string, never>>() }),
+        a: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<Record<string, never>>(),
+        }),
       }),
     });
     const h = await makeHarness(f);

@@ -254,6 +254,7 @@ describe("Heartbeat extends both queue VT and store lease", () => {
         receipt: "rcpt",
         intervalMs: 25,
         leaseMs: 100,
+        holdWarnMs: 0,
         emitLog,
       });
       await vi.advanceTimersByTimeAsync(80);

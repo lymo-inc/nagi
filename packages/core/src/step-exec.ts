@@ -137,6 +137,11 @@ export function startCancelWatcher(args: {
 
 export const DEFAULT_HEARTBEAT_LEASE_MS: Millis = 120_000;
 export const DEFAULT_HEARTBEAT_INTERVAL_MS: Millis = 40_000;
+// A step body holding a worker slot this long is either a legitimately slow
+// handler or an in-step wait on an external fact (a poll loop) that should be
+// a b.signal step — parked signals hold no slot. Warn on every crossing so a
+// wedged pool announces itself long before it exhausts worker concurrency.
+export const DEFAULT_LEASE_HOLD_WARN_MS: Millis = 300_000;
 
 // Keeps an in-flight step's queue message invisible while its handler runs. A
 // long handler (e.g. a multi-minute LLM call) otherwise outlives the queue's
@@ -163,6 +168,9 @@ export function startHeartbeat(args: {
   readonly receipt: string;
   readonly intervalMs: Millis;
   readonly leaseMs: Millis;
+  // Warn each time a step has held its worker slot for another multiple of
+  // this. 0 disables (tests). See DEFAULT_LEASE_HOLD_WARN_MS.
+  readonly holdWarnMs: Millis;
   readonly emitLog: EmitLog;
 }): { readonly stop: () => void } {
   const {
@@ -174,14 +182,29 @@ export function startHeartbeat(args: {
     receipt,
     intervalMs,
     leaseMs,
+    holdWarnMs,
     emitLog,
   } = args;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const startedAtMs = Date.now();
+  let warnedCrossings = 0;
 
   const schedule = (): void => {
     timer = setTimeout(() => {
       void (async () => {
+        if (holdWarnMs > 0) {
+          const heldMs = Date.now() - startedAtMs;
+          const crossings = Math.floor(heldMs / holdWarnMs);
+          if (crossings > warnedCrossings) {
+            warnedCrossings = crossings;
+            emitLog({
+              level: "warn",
+              msg: "heartbeat: step is holding a worker slot unusually long — slow handler, or an in-step wait that should be a b.signal step?",
+              attrs: { runId, stepId, attempt, heldMs },
+            });
+          }
+        }
         await Promise.all([
           queue.extend(receipt, leaseMs).catch((err: unknown) => {
             // A missed extension only risks an early redelivery, which admit()'s

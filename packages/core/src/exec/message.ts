@@ -119,6 +119,7 @@ export function makeMessage(
       receipt: message.receipt,
       intervalMs: deps.heartbeat.intervalMs,
       leaseMs: deps.heartbeat.leaseMs,
+      holdWarnMs: deps.heartbeat.holdWarnMs,
       emitLog: deps.emitLog,
     });
     let outcome: Dispatched;
@@ -193,8 +194,9 @@ export function makeMessage(
     // records, so the deadline is derived from a persisted fact (replay-safe),
     // never from a fresh clock read. upsertTimer keeps the earliest deadline, so
     // a lease-reap re-dispatch of a still-parked signal doesn't push it out.
-    // Steps without timeoutMs park forever as before.
-    if (def.kind === "signal" && def.timeoutMs != null) {
+    // timeoutMs: "unbounded" is the (explicit, config-level) opt-in to parking
+    // forever — the only way to get a timer-less wait.
+    if (def.kind === "signal" && typeof def.timeoutMs === "number") {
       await store.upsertTimer(
         runId,
         stepId,

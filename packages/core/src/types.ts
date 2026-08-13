@@ -155,13 +155,16 @@ export interface RetryPolicy {
   readonly retryOn?: (error: unknown) => boolean;
 }
 
+// No timeoutMs here: it was only ever ENFORCED for signal steps, and an
+// unenforced timeout knob on tasks was false safety. Signal steps carry a
+// required timeout (SignalConfig); handler-step deadline enforcement is
+// tracked upstream as its own feature.
 interface StepConfigBase<Input, N extends NeedsMap> {
   readonly needs?: N;
   readonly when?: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
   }) => boolean;
-  readonly timeoutMs?: Millis;
 }
 
 export interface StepLifecycleHooks<Output> {
@@ -213,6 +216,14 @@ export interface SignalConfig<
 > extends StepConfigBase<Input, N> {
   readonly schema: Schema;
   readonly names?: readonly [string, ...string[]];
+  // REQUIRED: every wait must state its deadline. A number arms a timer that
+  // fails the step as NagiSignalTimeoutError when no signal arrives in time;
+  // "unbounded" is an explicit opt-in to parking forever. There is no default
+  // on purpose — timeout-less waits have caused multi-day production outages
+  // (a parked step whose signal never comes is invisible until something
+  // else pages), so unbounded parking must be a written decision, not an
+  // omission.
+  readonly timeoutMs: Millis | "unbounded";
 }
 
 export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {

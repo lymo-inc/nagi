@@ -237,22 +237,45 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
     expect(await hashOf(f1)).not.toBe(await hashOf(f2));
   });
 
-  it("differs when timeoutMs changes", async () => {
+  it("differs when a signal's timeoutMs changes", async () => {
     const f1 = flow({
       id: "timeout",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        only: b.task({ timeoutMs: 1000, run: async () => null }),
+        only: b.signal({
+          timeoutMs: 1000,
+          schema: passthroughSchema<{ v: number }>(),
+        }),
       }),
     });
     const f2 = flow({
       id: "timeout",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        only: b.task({ timeoutMs: 5000, run: async () => null }),
+        only: b.signal({
+          timeoutMs: 5000,
+          schema: passthroughSchema<{ v: number }>(),
+        }),
       }),
     });
     expect(await hashOf(f1)).not.toBe(await hashOf(f2));
+  });
+
+  it('timeoutMs: "unbounded" canonicalizes as omission (hash-stable across the required-timeout migration)', async () => {
+    const f = flow({
+      id: "timeout-unbounded",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        only: b.signal({
+          timeoutMs: "unbounded",
+          schema: passthroughSchema<{ v: number }>(),
+        }),
+      }),
+    });
+    const dag = await canonicalize(f);
+    const only = dag.steps.find((s) => s.id === "only");
+    expect(only).toBeDefined();
+    expect(only).not.toHaveProperty("timeoutMs");
   });
 
   it("differs when a signal schema validator body changes", async () => {
@@ -261,6 +284,7 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         s: b.signal({
+          timeoutMs: "unbounded" as const,
           schema: {
             "~standard": {
               version: 1 as const,
@@ -276,6 +300,7 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         s: b.signal({
+          timeoutMs: "unbounded" as const,
           schema: {
             "~standard": {
               version: 1 as const,
@@ -300,6 +325,7 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         s: b.signal({
+          timeoutMs: "unbounded" as const,
           schema: {
             "~standard": {
               version: 1 as const,
@@ -315,6 +341,7 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         s: b.signal({
+          timeoutMs: "unbounded" as const,
           schema: {
             "~standard": {
               version: 1 as const,

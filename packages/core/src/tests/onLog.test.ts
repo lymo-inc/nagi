@@ -107,7 +107,10 @@ describe("onLog — record shape & level routing", () => {
       id: "sig-resolved",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: boolean }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        }),
       }),
     });
     const h = await makeHarness(f, { onLog });
@@ -168,7 +171,10 @@ describe("onLog — record shape & level routing", () => {
       id: "wake-child",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        gate: b.signal({ schema: passthroughSchema<{ ok: boolean }>() }),
+        gate: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        }),
       }),
       output: (steps) => steps.gate,
     });
@@ -213,7 +219,10 @@ describe("onLog — record shape & level routing", () => {
       id: "wake2-child",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        gate: b.signal({ schema: passthroughSchema<{ ok: boolean }>() }),
+        gate: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        }),
       }),
       output: (steps) => steps.gate,
     });
@@ -222,7 +231,10 @@ describe("onLog — record shape & level routing", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         sub: b.subflow(child, { input: () => ({}) }),
-        keepalive: b.signal({ schema: passthroughSchema<{ done: boolean }>() }),
+        keepalive: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ done: boolean }>(),
+        }),
       }),
     });
     const h = await makeHarness([parent, child], { onLog });

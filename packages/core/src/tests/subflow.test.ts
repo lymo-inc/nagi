@@ -234,7 +234,10 @@ describe("b.subflow — cancel cascade", () => {
       id: "gc-parked",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
       }),
       output: (steps) => steps.wait,
     });
@@ -284,7 +287,10 @@ describe("b.subflow — cancel cascade", () => {
       id: "c-canceled-from-outside",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
       }),
       output: (steps) => steps.wait,
     });

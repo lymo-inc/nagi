@@ -151,7 +151,10 @@ describe("dispatchMessage — driver", () => {
       id: "signal-driver",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => {
-        const wait = b.signal({ schema: passthroughSchema<{ ok: boolean }>() });
+        const wait = b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        });
         const after = b.task({
           needs: { wait },
           run: async () => {
@@ -253,7 +256,10 @@ describe("dispatchMessage — driver", () => {
       id: "hook-signal-null",
       input: passthroughSchema<{ tag: string }>(),
       build: (b) => {
-        const wait = b.signal({ schema: passthroughSchema<{ ok: boolean }>() });
+        const wait = b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        });
         return { wait };
       },
     });

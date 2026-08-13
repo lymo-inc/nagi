@@ -80,7 +80,6 @@ export interface TaskDef extends StepLifecycleHooks<Json> {
   readonly kind: "task";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
-  readonly timeoutMs?: Millis;
   readonly when?: Guard;
   readonly run: (args: {
     input: unknown;
@@ -98,7 +97,6 @@ export interface ActivityDef extends StepLifecycleHooks<Json> {
   readonly kind: "activity";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
-  readonly timeoutMs?: Millis;
   readonly when?: Guard;
   readonly run: (args: {
     input: unknown;
@@ -112,7 +110,6 @@ export interface StreamingTaskDef extends StepLifecycleHooks<Json> {
   readonly kind: "streaming";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
-  readonly timeoutMs?: Millis;
   readonly when?: Guard;
   readonly run: (args: {
     input: unknown;
@@ -127,7 +124,7 @@ export interface SignalDef {
   readonly needs: NeedsDefMap;
   readonly schema: StandardSchemaV1;
   readonly names?: readonly [string, ...string[]];
-  readonly timeoutMs?: Millis;
+  readonly timeoutMs: Millis | "unbounded";
   readonly when?: Guard;
   readonly parentMatch?: ParentMatchRef;
 }
@@ -163,7 +160,6 @@ export interface SubflowDef {
   readonly needs: NeedsDefMap;
   readonly childFlowId: string;
   readonly buildInput: (args: GuardArgs) => unknown;
-  readonly timeoutMs?: Millis;
   readonly when?: Guard;
   readonly parentMatch?: ParentMatchRef;
 }

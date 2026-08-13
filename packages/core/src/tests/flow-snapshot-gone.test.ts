@@ -119,7 +119,10 @@ describe("NagiFlowSnapshotGoneError", () => {
       id: "signal-flow",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
       }),
     });
     const wfA = await nagi({ flows: [fA], store, queue, clock });
@@ -130,7 +133,10 @@ describe("NagiFlowSnapshotGoneError", () => {
       id: "signal-flow",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
         extra: b.task({ run: async () => ({}) }),
       }),
     });

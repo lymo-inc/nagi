@@ -9,6 +9,7 @@ function transcriptFlow() {
     input: passthroughSchema<Record<string, never>>(),
     build: (b) => ({
       transcript: b.signal({
+        timeoutMs: "unbounded" as const,
         names: ["audioReady", "recordingReady"],
         schema: passthroughSchema<
           { audioUrl: string } | { transcript: string }

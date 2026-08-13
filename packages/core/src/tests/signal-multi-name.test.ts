@@ -12,6 +12,7 @@ describe("b.signal — single-name back-compat", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         review: b.signal({
+          timeoutMs: "unbounded" as const,
           schema: passthroughSchema<{ ok: boolean }>(),
         }),
       }),
@@ -40,6 +41,7 @@ describe("b.signal — single-name back-compat", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         review: b.signal({
+          timeoutMs: "unbounded" as const,
           names: ["approval"],
           schema: passthroughSchema<{ ok: boolean }>(),
         }),
@@ -67,6 +69,7 @@ describe("b.signal — single-name back-compat", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         review: b.signal({
+          timeoutMs: "unbounded" as const,
           names: ["approval"],
           schema: passthroughSchema<{ ok: boolean }>(),
         }),
@@ -94,6 +97,7 @@ describe("b.signal — multi-name", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         transcript: b.signal({
+          timeoutMs: "unbounded" as const,
           names: ["audioReady", "recordingReady"],
           schema: passthroughSchema<
             { audioUrl: string } | { transcript: string }
@@ -200,10 +204,12 @@ describe("b.signal — construction-time uniqueness", () => {
         input: passthroughSchema<Record<string, never>>(),
         build: (b) => ({
           transcript: b.signal({
+            timeoutMs: "unbounded" as const,
             names: ["x"],
             schema: passthroughSchema<{ v: number }>(),
           }),
           x: b.signal({
+            timeoutMs: "unbounded" as const,
             schema: passthroughSchema<{ v: number }>(),
           }),
         }),
@@ -218,10 +224,12 @@ describe("b.signal — construction-time uniqueness", () => {
         input: passthroughSchema<Record<string, never>>(),
         build: (b) => ({
           a: b.signal({
+            timeoutMs: "unbounded" as const,
             names: ["shared", "onlyA"],
             schema: passthroughSchema<{ v: number }>(),
           }),
           b: b.signal({
+            timeoutMs: "unbounded" as const,
             names: ["shared", "onlyB"],
             schema: passthroughSchema<{ v: number }>(),
           }),
@@ -237,6 +245,7 @@ describe("b.signal — construction-time uniqueness", () => {
         input: passthroughSchema<Record<string, never>>(),
         build: (b) => ({
           ping: b.signal({
+            timeoutMs: "unbounded" as const,
             names: ["ping", "PING"],
             schema: passthroughSchema<{ v: number }>(),
           }),
@@ -255,10 +264,12 @@ describe("b.signal — canonical hash invariants", () => {
         only: b.signal(
           names !== undefined
             ? {
+                timeoutMs: "unbounded" as const,
                 names: names as readonly [string, ...string[]],
                 schema: passthroughSchema<{ v: number }>(),
               }
             : {
+                timeoutMs: "unbounded" as const,
                 schema: passthroughSchema<{ v: number }>(),
               },
         ),
@@ -305,7 +316,10 @@ describe("b.signal — canonical hash invariants", () => {
       id: "hash-target",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        x: b.signal({ schema: passthroughSchema<{ v: number }>() }),
+        x: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ v: number }>(),
+        }),
       }),
     });
     const stepYAliasedToX = flow({
@@ -313,6 +327,7 @@ describe("b.signal — canonical hash invariants", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         y: b.signal({
+          timeoutMs: "unbounded" as const,
           names: ["x"],
           schema: passthroughSchema<{ v: number }>(),
         }),
@@ -331,6 +346,7 @@ describe("b.signal — type-level constraints", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         bad: b.signal({
+          timeoutMs: "unbounded" as const,
           // @ts-expect-error
           names: [],
           schema: passthroughSchema<{ v: number }>(),
