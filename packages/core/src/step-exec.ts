@@ -1,4 +1,4 @@
-import { NagiCanceledError } from "./errors";
+import { NagiCanceledError, NagiNonRetryableError } from "./errors";
 import { Facts } from "./facts";
 import { makeIdempotencyKey, makeOnce } from "./idempotency";
 import type { EmitLog } from "./internal";
@@ -246,7 +246,7 @@ export function classifyFailure(args: {
       includeError: isAbort,
     };
   }
-  const cancel = findNagiCanceledError(err);
+  const cancel = findInCauseChain(err, NagiCanceledError);
   if (cancel !== undefined) {
     return {
       tag: "flowCanceled",
@@ -254,20 +254,26 @@ export function classifyFailure(args: {
       concurrencyKey: cancel.concurrencyKey,
     };
   }
+  if (findInCauseChain(err, NagiNonRetryableError) !== undefined) {
+    return { tag: "failed" };
+  }
   if (attempt < policy.maxAttempts && retryAllows(policy, err)) {
     return { tag: "retry", delayMs: computeBackoff(policy, attempt) };
   }
   return { tag: "failed" };
 }
 
-// Walk the error cause chain looking for a real NagiCanceledError instance.
+// Walk the error cause chain looking for a real instance of the given class.
 // Requiring the class (not just shape) defends against forged JSONB cause data
 // re-thrown as plain Errors.
-function findNagiCanceledError(err: unknown): NagiCanceledError | undefined {
+function findInCauseChain<T extends Error>(
+  err: unknown,
+  ctor: new (...args: never[]) => T,
+): T | undefined {
   let cursor: unknown = err;
   const seen = new Set<unknown>();
   while (cursor instanceof Error && !seen.has(cursor)) {
-    if (cursor instanceof NagiCanceledError) return cursor;
+    if (cursor instanceof ctor) return cursor;
     seen.add(cursor);
     cursor = (cursor as { cause?: unknown }).cause;
   }

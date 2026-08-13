@@ -24,6 +24,19 @@ export class NagiRuntimeError extends Error {
   }
 }
 
+// Marks a failure as permanently unprocessable: classifyFailure fails the step
+// immediately, skipping the remaining retry budget. For inputs where retrying
+// cannot succeed (an orphaned webhook with no owning row, a schema-invalid
+// payload) — without this, a permanent failure burns every retry before
+// reaching the same terminal state. Wrap the underlying error as `cause`; the
+// marker is honored anywhere on the cause chain, so it survives SDK wrapping.
+export class NagiNonRetryableError extends Error {
+  constructor(message: string, opts?: { readonly cause?: unknown }) {
+    super(message, opts);
+    this.name = "NagiNonRetryableError";
+  }
+}
+
 export class NagiCanceledError extends Error {
   readonly runId: RunId;
   readonly canceledByRunId: RunId;
