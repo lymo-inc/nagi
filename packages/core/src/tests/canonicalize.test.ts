@@ -5,6 +5,7 @@ import {
   sha256Canonical,
   stableStringify,
 } from "../canonicalize";
+import { DEFAULT_RETRY } from "../retry";
 import { passthroughSchema } from "./test-helpers";
 
 async function hashOf(f: Parameters<typeof canonicalize>[0]): Promise<string> {
@@ -440,6 +441,33 @@ describe("canonicalize — shape", () => {
       initialDelayMs: 1_000,
       maxDelayMs: 60_000,
     });
+  });
+
+  // DEFAULT_RETRY's delays are the canonical fill-in above, so they are hashed
+  // into every flow that declares a retry policy. An edit to them re-hashes
+  // those flows and strands every in-flight run as snapshot-gone — this pin
+  // makes that a loud test failure instead of a silent production incident.
+  it("pins the canonical retry defaults as literals", async () => {
+    expect(DEFAULT_RETRY).toEqual({
+      maxAttempts: 3,
+      backoff: "exponential",
+      initialDelayMs: 1_000,
+      maxDelayMs: 60_000,
+    });
+    const f = flow({
+      id: "retry-defaults-pin",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        only: b.task({
+          retry: { maxAttempts: 2, backoff: "fixed" },
+          run: async () => null,
+        }),
+      }),
+    });
+    const dag = await canonicalize(f);
+    expect(stableStringify(dag.steps[0]?.retry)).toBe(
+      '{"backoff":"fixed","initialDelayMs":1000,"maxAttempts":2,"maxDelayMs":60000}',
+    );
   });
 
   it("emits a stable hex string from sha256Canonical (64 chars)", async () => {

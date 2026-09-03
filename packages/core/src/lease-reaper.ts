@@ -1,3 +1,4 @@
+import { reapBackoff } from "./retry";
 import type { StepRunStatus } from "./run-view";
 import type { AttemptNumber, Millis, RunId, StepId } from "./types";
 
@@ -22,8 +23,7 @@ export type ReaperDecision =
 // terminal/gone, fall through and reap — the re-entrant subflow handler then
 // settles the parent (terminal child) or re-spawns (missing child). A still-live
 // lease means an active worker is heartbeating; reaping it would double-dispatch
-// a running step. Reap re-enqueues at attempt+1 with no backoff (the step body
-// already paid wall-clock waiting for the worker to die).
+// a running step.
 export function decideExpiredLeaseAction(args: {
   readonly lease: {
     readonly runId: RunId;
@@ -50,11 +50,8 @@ export function decideExpiredLeaseAction(args: {
   if (lease.expiresAt > now) {
     return { tag: "skip", reason: "still-live" };
   }
-  return {
-    tag: "reap",
-    nextAttempt: (lease.attempt + 1) as AttemptNumber,
-    backoffMs: 0 as Millis,
-  };
+  const nextAttempt = (lease.attempt + 1) as AttemptNumber;
+  return { tag: "reap", nextAttempt, backoffMs: reapBackoff(nextAttempt) };
 }
 
 export interface ReapedLease {
