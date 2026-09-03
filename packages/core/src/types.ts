@@ -155,13 +155,16 @@ export interface RetryPolicy {
   readonly retryOn?: (error: unknown) => boolean;
 }
 
+// No timeoutMs here: it was only ever ENFORCED for signal steps, and an
+// unenforced timeout knob on tasks was false safety. Signal steps carry a
+// required timeout (SignalConfig); handler-step deadline enforcement is
+// tracked upstream as its own feature.
 interface StepConfigBase<Input, N extends NeedsMap> {
   readonly needs?: N;
   readonly when?: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
   }) => boolean;
-  readonly timeoutMs?: Millis;
 }
 
 export interface StepLifecycleHooks<Output> {
@@ -213,6 +216,14 @@ export interface SignalConfig<
 > extends StepConfigBase<Input, N> {
   readonly schema: Schema;
   readonly names?: readonly [string, ...string[]];
+  // REQUIRED: every wait must state its deadline. A number arms a timer that
+  // fails the step as NagiSignalTimeoutError when no signal arrives in time;
+  // "unbounded" is an explicit opt-in to parking forever. There is no default
+  // on purpose — timeout-less waits have caused multi-day production outages
+  // (a parked step whose signal never comes is invisible until something
+  // else pages), so unbounded parking must be a written decision, not an
+  // omission.
+  readonly timeoutMs: Millis | "unbounded";
 }
 
 export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {
@@ -456,7 +467,27 @@ export interface WorkerConfig {
   // (tests that drive the sweep explicitly). Checked by elapsed wall-clock each
   // loop iteration, so a fully-busy worker still sweeps on schedule.
   readonly timerSweepIntervalMs?: Millis;
+  // Decides retry-vs-fail for a message whose run's flow snapshot is gone
+  // (deploy replaced the flow while the run was in flight). Defaults to
+  // defaultSnapshotGonePolicy. "retry" keeps the message alive for a
+  // not-yet-updated worker to claim during a rolling deploy; "fail"
+  // terminally fails the run with the snapshot-gone error and acks.
+  readonly snapshotGonePolicy?: SnapshotGonePolicy;
+  // Cap on worker slots any single flow may occupy at once. Bounds blast
+  // radius: without it, one wedged flow's steps can hold every slot and
+  // starve all other flows (an observed multi-day outage shape). Over-cap
+  // messages are deferred with a delayed nack, not dropped. Unset = no cap
+  // (correct for single-flow deployments, where a cap only wastes slots);
+  // multi-flow deployments should set it to at most concurrency - 1 so one
+  // flow can never occupy the whole pool.
+  readonly maxConcurrencyPerFlow?: number;
 }
+
+export type SnapshotGoneDisposition =
+  | { readonly action: "retry"; readonly delayMs: Millis }
+  | { readonly action: "fail" };
+
+export type SnapshotGonePolicy = (readCount: number) => SnapshotGoneDisposition;
 
 export interface WorkerRunOnceOpts {
   readonly maxSteps?: number;
@@ -471,7 +502,12 @@ export interface WorkerRunResult {
 }
 
 export interface Worker {
+  // Settles ONLY when the configured abort signal fires. Queue and dispatch
+  // failures are logged and retried with backoff, never rethrown: a rejection
+  // here would stop all flow processing in a process that still looks healthy.
   run(): Promise<void>;
+  // Bounded drains, for tests and request/cron-scoped processing. These DO
+  // reject on queue failure — the caller is awaiting a result and can react.
   runOnce(opts?: WorkerRunOnceOpts): Promise<WorkerRunResult>;
   runUntilEmpty(opts?: WorkerRunUntilEmptyOpts): Promise<WorkerRunResult>;
 }
@@ -751,6 +787,15 @@ export interface QueueMessage {
   readonly stepId: StepId;
   readonly payload: Json;
   readonly attempt: AttemptNumber;
+  // Deliveries of this message including the current one (pgmq read_ct).
+  // Unlike `attempt` (stamped at enqueue), this counts every redelivery —
+  // nacks, lease expiries — so it is the poison-message signal.
+  readonly readCount: number;
+  // Flow that owns the run, stamped at enqueue. Drives the worker's per-flow
+  // concurrency cap. Optional ONLY for messages enqueued before the field
+  // existed (they must still dispatch after an upgrade) — absent means exempt
+  // from the cap, and every current enqueue path stamps it.
+  readonly flowId?: string;
 }
 
 export interface QueueDequeueOpts {
@@ -761,6 +806,18 @@ export interface QueueEnqueueOpts {
   readonly attempt?: AttemptNumber;
   readonly delayMs?: Millis;
   readonly payload?: Json;
+  readonly flowId?: string;
+}
+
+// Read-only snapshot of one queued message, for operator triage: a message
+// with visibleAt in the future is leased/delayed; a high readCount is a
+// redelivery loop; no entries at all for a non-terminal run means the run is
+// waiting on a signal/child — or was never scheduled (worker starvation).
+export interface QueueInspectEntry {
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
+  readonly readCount: number;
+  readonly visibleAt: Date;
 }
 
 export interface Queue {
@@ -772,6 +829,9 @@ export interface Queue {
   // Optional one-shot, idempotent schema provisioning. nagi() awaits it once at
   // construction (fail-fast). Adapters needing none omit it.
   ensureSchema?(): Promise<void>;
+  // Optional read-only triage view of a run's in-queue messages (see
+  // wf.inspectQueue). Optional because not every broker can query by run.
+  inspect?(runId: RunId): Promise<readonly QueueInspectEntry[]>;
 }
 
 export interface Clock {

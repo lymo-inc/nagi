@@ -33,6 +33,7 @@ describe("startHeartbeat", () => {
         receipt: "42",
         intervalMs: 100,
         leaseMs: 500,
+        holdWarnMs: 0,
         emitLog,
       });
 
@@ -45,6 +46,56 @@ describe("startHeartbeat", () => {
       hb.stop();
       await vi.advanceTimersByTimeAsync(500);
       expect(extend).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("warns on each holdWarnMs crossing while a step holds its slot (lease-hold watchdog)", async () => {
+    vi.useFakeTimers();
+    try {
+      const queue = {
+        extend: vi.fn().mockResolvedValue(undefined),
+      } as unknown as Queue;
+      const { store } = makeStore();
+      const emitLog = vi.fn();
+
+      const hb = startHeartbeat({
+        queue,
+        store,
+        runId: "r" as RunId,
+        stepId: "s",
+        attempt: 1,
+        receipt: "42",
+        intervalMs: 100,
+        leaseMs: 500,
+        holdWarnMs: 250,
+        emitLog,
+      });
+
+      const holdWarns = () =>
+        emitLog.mock.calls.filter(([e]) =>
+          String(e.msg).includes("holding a worker slot"),
+        );
+
+      // Below the threshold: beats happen, no watchdog warning.
+      await vi.advanceTimersByTimeAsync(200);
+      expect(holdWarns()).toHaveLength(0);
+
+      // First crossing (>=250ms held) warns once — not once per beat.
+      await vi.advanceTimersByTimeAsync(200);
+      expect(holdWarns()).toHaveLength(1);
+      expect(holdWarns()[0]?.[0]?.attrs).toMatchObject({
+        runId: "r",
+        stepId: "s",
+        attempt: 1,
+      });
+
+      // Second crossing (>=500ms) warns again.
+      await vi.advanceTimersByTimeAsync(200);
+      expect(holdWarns()).toHaveLength(2);
+
+      hb.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -70,6 +121,7 @@ describe("startHeartbeat", () => {
         receipt: "7",
         intervalMs: 50,
         leaseMs: 200,
+        holdWarnMs: 0,
         emitLog,
       });
 
@@ -106,6 +158,7 @@ describe("startHeartbeat", () => {
         receipt: "9",
         intervalMs: 50,
         leaseMs: 200,
+        holdWarnMs: 0,
         emitLog,
       });
 

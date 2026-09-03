@@ -12,6 +12,7 @@ function gatedFlow(opts: { id: string; timeoutMs?: number }) {
     input: emptySchema(),
     build: (b) => {
       const awaitAudio = b.signal({
+        timeoutMs: "unbounded" as const,
         names: ["audioReady", "recordingReady"],
         schema: passthroughSchema<{ ok: boolean }>(),
         ...(opts.timeoutMs != null ? { timeoutMs: opts.timeoutMs } : {}),

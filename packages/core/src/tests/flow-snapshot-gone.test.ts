@@ -119,7 +119,10 @@ describe("NagiFlowSnapshotGoneError", () => {
       id: "signal-flow",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
       }),
     });
     const wfA = await nagi({ flows: [fA], store, queue, clock });
@@ -130,7 +133,10 @@ describe("NagiFlowSnapshotGoneError", () => {
       id: "signal-flow",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
         extra: b.task({ run: async () => ({}) }),
       }),
     });
@@ -210,5 +216,126 @@ describe("NagiFlowSnapshotGoneError", () => {
     await expect(
       wfB.replay(runId, { mode: "continue" }),
     ).rejects.toBeInstanceOf(NagiSnapshotDriftError);
+  });
+});
+
+describe("snapshot-gone poison handling", () => {
+  it("acks the message of a run canceled after its snapshot went gone (no nack loop)", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    const fB = makeFlowB();
+    const wfB = await nagi({ flows: [fB], store, queue, clock });
+    await wfB.cancel(runId, { reason: "operator cleanup" });
+
+    // The policy must never be consulted: dispatchMessage acks terminal runs
+    // before the error ever reaches the worker.
+    const worker = wfB.worker({
+      timerSweepIntervalMs: 0,
+      snapshotGonePolicy: () => {
+        throw new Error("policy must not run for a terminal run");
+      },
+    });
+    const { processed } = await worker.runUntilEmpty();
+    expect(processed).toBe(1);
+
+    expect(await queue.dequeue({ count: 10 })).toHaveLength(0);
+    expect((await store.loadRunState(runId)).phase.tag).toBe("canceled");
+  });
+
+  it("retries with the policy's delay while budgeted, then terminally fails the run", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    const fB = makeFlowB();
+    const wfB = await nagi({ flows: [fB], store, queue, clock });
+
+    const seenReadCounts: number[] = [];
+    const worker = wfB.worker({
+      timerSweepIntervalMs: 0,
+      snapshotGonePolicy: (readCount) => {
+        seenReadCounts.push(readCount);
+        return readCount < 3
+          ? { action: "retry", delayMs: 0 }
+          : { action: "fail" };
+      },
+    });
+    await worker.runUntilEmpty();
+
+    // Redelivery count grew across nacks; the budget fired on the 3rd read.
+    expect(seenReadCounts).toEqual([1, 2, 3]);
+    expect(await queue.dequeue({ count: 10 })).toHaveLength(0);
+
+    const state = await store.loadRunState(runId);
+    expect(state.phase.tag).toBe("failed");
+    if (state.phase.tag === "failed") {
+      expect(state.phase.error.name).toBe("NagiFlowSnapshotGoneError");
+    }
+  });
+
+  it("defaultSnapshotGonePolicy: quadratic backoff capped at 5min, fails past 60 deliveries", async () => {
+    const { defaultSnapshotGonePolicy } = await import("../worker");
+    expect(defaultSnapshotGonePolicy(1)).toEqual({
+      action: "retry",
+      delayMs: 1_000,
+    });
+    expect(defaultSnapshotGonePolicy(10)).toEqual({
+      action: "retry",
+      delayMs: 100_000,
+    });
+    // Cap: 18² = 324s exceeds the 300s ceiling.
+    expect(defaultSnapshotGonePolicy(18)).toEqual({
+      action: "retry",
+      delayMs: 300_000,
+    });
+    expect(defaultSnapshotGonePolicy(60)).toEqual({
+      action: "retry",
+      delayMs: 300_000,
+    });
+    expect(defaultSnapshotGonePolicy(61)).toEqual({ action: "fail" });
+    // The whole window is ~4.2h — above the 4h signal-timeout house constant,
+    // below 6h stuck-run alerting. Pin it so a tweak is a conscious choice.
+    let totalMs = 0;
+    for (let readCount = 1; readCount <= 60; readCount++) {
+      const d = defaultSnapshotGonePolicy(readCount);
+      if (d.action === "retry") totalMs += d.delayMs;
+    }
+    expect(totalMs).toBeGreaterThan(4 * 3_600_000);
+    expect(totalMs).toBeLessThan(6 * 3_600_000);
+  });
+
+  it("a failing policy falls back to a delayed nack instead of crashing or tight-looping", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    const fB = makeFlowB();
+    const wfB = await nagi({ flows: [fB], store, queue, clock });
+    const worker = wfB.worker({
+      timerSweepIntervalMs: 0,
+      snapshotGonePolicy: () => {
+        throw new Error("broken policy");
+      },
+    });
+    await worker.runUntilEmpty();
+
+    // Message survived (delayed, not visible now) and the run is untouched —
+    // the fallback keeps redelivery bounded without inventing a disposition.
+    expect(await queue.dequeue({ count: 10 })).toHaveLength(0);
+    expect((await store.loadRunState(runId)).phase.tag).toBe("running");
   });
 });

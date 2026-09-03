@@ -26,6 +26,7 @@ import { foldRun, isTerminalRun, runStatusOf } from "./state";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_LEASE_MS,
+  DEFAULT_LEASE_HOLD_WARN_MS,
 } from "./step-exec";
 import type {
   CancelArgs,
@@ -46,6 +47,7 @@ import type {
   QueryRunsOpts,
   QueryRunsResult,
   Queue,
+  QueueInspectEntry,
   ReplayOpts,
   RetryPolicy,
   RunId,
@@ -77,6 +79,12 @@ export interface NagiConfig {
   // or a slow step's message is redelivered before the first lease extension.
   readonly heartbeatIntervalMs?: Millis;
   readonly heartbeatLeaseMs?: Millis;
+  // Warn each time a step body has held a worker slot for another multiple of
+  // this (default 5 min; 0 disables). A firing watchdog usually means an
+  // in-step wait on an external fact — model those as b.signal steps, which
+  // park WITHOUT holding a slot. Timeout-less in-step waits have starved
+  // entire worker pools in production.
+  readonly leaseHoldWarnMs?: Millis;
   // Lease-reaper sweep cadence. Default 30s — stay ≤ ½ the store lease TTL so
   // a crashed worker is reaped within one TTL. 0 disables the reaper (tests,
   // or external/cron-driven reaping).
@@ -155,6 +163,13 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
   // for an unknown runId (never throws). Parent/children are nested on the
   // returned RunView; the outer envelope is `{run, steps}` only.
   describe(runId: RunId): Promise<RunDescription>;
+
+  // Read-only triage view of the run's in-queue messages, complementing
+  // describe(): a non-terminal run with pending steps and NO queue entries was
+  // never scheduled (worker starvation); a future visibleAt is leased/delayed;
+  // a high readCount is a redelivery loop. Throws NagiRuntimeError when the
+  // queue adapter doesn't implement inspect().
+  inspectQueue(runId: RunId): Promise<readonly QueueInspectEntry[]>;
 
   subscribe<C = Json>(
     runId: RunId,
@@ -444,6 +459,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     heartbeat: {
       intervalMs: config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       leaseMs: config.heartbeatLeaseMs ?? DEFAULT_HEARTBEAT_LEASE_MS,
+      holdWarnMs: config.leaseHoldWarnMs ?? DEFAULT_LEASE_HOLD_WARN_MS,
     },
     ...compact({
       hooks: config.hooks,
@@ -581,7 +597,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         if (transition.kind === "dispatch") {
           const txQueue = bindQueueToTx(config.queue, opts.tx);
           for (const stepId of transition.runnable) {
-            await txQueue.enqueue(runId, stepId);
+            await txQueue.enqueue(runId, stepId, { flowId: flow.id });
           }
         }
       }
@@ -677,6 +693,15 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
     async describe(runId: RunId): Promise<RunDescription> {
       return config.store.describe(runId);
+    },
+
+    async inspectQueue(runId: RunId): Promise<readonly QueueInspectEntry[]> {
+      if (config.queue.inspect === undefined) {
+        throw new NagiRuntimeError(
+          "inspectQueue: the configured queue adapter does not implement inspect().",
+        );
+      }
+      return config.queue.inspect(runId);
     },
 
     async queryRuns(opts: QueryRunsOpts = {}): Promise<QueryRunsResult> {

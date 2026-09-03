@@ -77,7 +77,10 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
       id: "from-running",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<Record<string, never>>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<Record<string, never>>(),
+        }),
       }),
     });
     const h = await makeHarness(f);

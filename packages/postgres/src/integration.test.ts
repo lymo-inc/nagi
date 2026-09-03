@@ -878,7 +878,10 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         id: "pg-cancel-gc",
         input: passthroughSchema<Record<string, never>>(),
         build: (b) => ({
-          wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+          wait: b.signal({
+            timeoutMs: "unbounded" as const,
+            schema: passthroughSchema<{ ok: true }>(),
+          }),
         }),
         output: (s) => s.wait,
       });
@@ -939,6 +942,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         input: passthroughSchema<Record<string, never>>(),
         build: (b) => ({
           transcript: b.signal({
+            timeoutMs: "unbounded" as const,
             names: ["audioReady", "recordingReady"],
             schema: passthroughSchema<
               { audioUrl: string } | { transcript: string }

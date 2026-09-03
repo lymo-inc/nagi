@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
-import { InMemoryQueue, InMemoryStore } from "../memory";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
 import { stepStateOf, stepStatusOf } from "../state";
 import type { LogEntry, QueueDequeueOpts, QueueMessage, RunId } from "../types";
@@ -11,6 +11,16 @@ class CrashingQueue extends InMemoryQueue {
     _opts: QueueDequeueOpts,
   ): Promise<readonly QueueMessage[]> {
     throw new Error("queue connection lost");
+  }
+}
+
+// The worker absorbs queue failures now, so exercising the loop-crash log
+// takes a broken Clock — the one adapter call still outside a guard.
+class CrashingClock extends InMemoryClock {
+  armed = false;
+  override now(): Date {
+    if (this.armed) throw new Error("clock read failed");
+    return super.now();
   }
 }
 
@@ -41,6 +51,29 @@ describe("onLog — record shape & level routing", () => {
 
   it("worker-exited-unexpectedly: exactly one error entry with the exact msg", async () => {
     const { onLog, entries } = spyOnLog();
+    const clock = new CrashingClock();
+    const handle = await nagi.run({
+      flows: [echo],
+      store: new InMemoryStore(),
+      queue: new InMemoryQueue(),
+      clock,
+      worker: { pollIntervalMs: 5 },
+      onLog,
+    });
+    clock.armed = true;
+    await vi.waitFor(() =>
+      expect(entries.filter((e) => e.level === "error")).toHaveLength(1),
+    );
+    const crash = entries.find((e) => e.level === "error") as LogEntry;
+    expect(crash.msg).toBe("nagi.run: worker exited unexpectedly");
+    expect(crash.attrs).toMatchObject({
+      error: expect.stringContaining("clock read failed"),
+    });
+    await handle.stop();
+  });
+
+  it("worker.dequeue-failed: a queue outage logs backoff, never a loop exit", async () => {
+    const { onLog, entries } = spyOnLog();
     const handle = await nagi.run({
       flows: [echo],
       store: new InMemoryStore(),
@@ -49,13 +82,21 @@ describe("onLog — record shape & level routing", () => {
       onLog,
     });
     await vi.waitFor(() =>
-      expect(entries.filter((e) => e.level === "error")).toHaveLength(1),
+      expect(
+        entries.filter((e) => e.msg === "worker.dequeue failed; backing off"),
+      ).not.toHaveLength(0),
     );
-    const crash = entries.find((e) => e.level === "error") as LogEntry;
-    expect(crash.msg).toBe("nagi.run: worker exited unexpectedly");
-    expect(crash.attrs).toMatchObject({
+    const entry = entries.find(
+      (e) => e.msg === "worker.dequeue failed; backing off",
+    ) as LogEntry;
+    expect(entry.level).toBe("error");
+    expect(entry.attrs).toMatchObject({
       error: expect.stringContaining("queue connection lost"),
+      consecutiveFailures: 1,
     });
+    expect(
+      entries.filter((e) => e.msg === "nagi.run: worker exited unexpectedly"),
+    ).toHaveLength(0);
     await handle.stop();
   });
 
@@ -107,7 +148,10 @@ describe("onLog — record shape & level routing", () => {
       id: "sig-resolved",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: boolean }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        }),
       }),
     });
     const h = await makeHarness(f, { onLog });
@@ -168,7 +212,10 @@ describe("onLog — record shape & level routing", () => {
       id: "wake-child",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        gate: b.signal({ schema: passthroughSchema<{ ok: boolean }>() }),
+        gate: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        }),
       }),
       output: (steps) => steps.gate,
     });
@@ -213,7 +260,10 @@ describe("onLog — record shape & level routing", () => {
       id: "wake2-child",
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
-        gate: b.signal({ schema: passthroughSchema<{ ok: boolean }>() }),
+        gate: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        }),
       }),
       output: (steps) => steps.gate,
     });
@@ -222,7 +272,10 @@ describe("onLog — record shape & level routing", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => ({
         sub: b.subflow(child, { input: () => ({}) }),
-        keepalive: b.signal({ schema: passthroughSchema<{ done: boolean }>() }),
+        keepalive: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ done: boolean }>(),
+        }),
       }),
     });
     const h = await makeHarness([parent, child], { onLog });
@@ -515,13 +568,16 @@ describe("onLog — exactly-once & ordering", () => {
 
   it("a worker crash yields exactly one error entry", async () => {
     const { onLog, entries } = spyOnLog();
+    const clock = new CrashingClock();
     const handle = await nagi.run({
       flows: [echo],
       store: new InMemoryStore(),
-      queue: new CrashingQueue(),
+      queue: new InMemoryQueue(),
+      clock,
       worker: { pollIntervalMs: 5 },
       onLog,
     });
+    clock.armed = true;
     await vi.waitFor(() =>
       expect(entries.filter((e) => e.level === "error")).toHaveLength(1),
     );

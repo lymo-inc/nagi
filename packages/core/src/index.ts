@@ -19,6 +19,7 @@ export {
   NagiCanceledError,
   NagiConcurrencyConflictError,
   NagiFlowSnapshotGoneError,
+  NagiNonRetryableError,
   NagiRuntimeError,
   NagiSignalTimeoutError,
   NagiSnapshotDriftError,
@@ -148,6 +149,7 @@ export type {
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
+  QueueInspectEntry,
   QueueMessage,
   Register,
   ReplayMode,
@@ -165,6 +167,8 @@ export type {
   SignalReceivedFact,
   SignalSentEvent,
   SignalSentFact,
+  SnapshotGoneDisposition,
+  SnapshotGonePolicy,
   StandardSchemaV1,
   Step,
   StepAbortRequestedFact,
@@ -204,3 +208,4 @@ export type {
   WorkerRunResult,
   WorkerRunUntilEmptyOpts,
 } from "./types";
+export { defaultSnapshotGonePolicy } from "./worker";

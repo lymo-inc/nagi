@@ -21,7 +21,10 @@ describe("b.subflow — lease-reap does not self-supersede (prod-faithful)", () 
       // cancel the first — the prod child concurrency config.
       concurrency: { keyFn: () => "fixed", mode: "cancel-in-progress" },
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ ok: true }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
       }),
       output: (steps) => steps.wait,
     });
@@ -64,7 +67,10 @@ describe("b.subflow — lease-reap does not self-supersede (prod-faithful)", () 
       id: "child-parker",
       input: passthroughSchema<{ x: number }>(),
       build: (b) => ({
-        wait: b.signal({ schema: passthroughSchema<{ y: number }>() }),
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ y: number }>(),
+        }),
       }),
       output: (steps) => steps.wait,
     });

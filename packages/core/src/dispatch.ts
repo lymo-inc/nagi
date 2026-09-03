@@ -22,6 +22,7 @@ import type {
 export interface HeartbeatConfig {
   readonly intervalMs: Millis;
   readonly leaseMs: Millis;
+  readonly holdWarnMs: Millis;
 }
 
 export interface DispatchDeps {

@@ -1,5 +1,5 @@
 import type { DispatchDeps } from "../dispatch";
-import { serializeError } from "../errors";
+import { NagiFlowSnapshotGoneError, serializeError } from "../errors";
 import { Facts } from "../facts";
 import {
   asStepMapWithDefs,
@@ -79,7 +79,23 @@ export function makeMessage(
 
   async function dispatchMessage(message: QueueMessage): Promise<void> {
     const { queue } = deps;
-    const flow = await deps.flowFor(message.runId);
+    let flow: Flow;
+    try {
+      flow = await deps.flowFor(message.runId);
+    } catch (err) {
+      // A terminal run's message must not outlive it: without this, a run
+      // canceled AFTER its flow snapshot went gone (deploy replaced the flow
+      // mid-flight) would nack-loop forever, because the hash check fires
+      // before admit()'s canceled-phase check ever runs.
+      if (
+        err instanceof NagiFlowSnapshotGoneError &&
+        isTerminalRun(await deps.store.loadRunState(message.runId))
+      ) {
+        await queue.ack(message.receipt);
+        return;
+      }
+      throw err;
+    }
 
     const admission = await admit({ flow, message });
     if (admission.tag === "skip") {
@@ -103,6 +119,7 @@ export function makeMessage(
       receipt: message.receipt,
       intervalMs: deps.heartbeat.intervalMs,
       leaseMs: deps.heartbeat.leaseMs,
+      holdWarnMs: deps.heartbeat.holdWarnMs,
       emitLog: deps.emitLog,
     });
     let outcome: Dispatched;
@@ -177,8 +194,9 @@ export function makeMessage(
     // records, so the deadline is derived from a persisted fact (replay-safe),
     // never from a fresh clock read. upsertTimer keeps the earliest deadline, so
     // a lease-reap re-dispatch of a still-parked signal doesn't push it out.
-    // Steps without timeoutMs park forever as before.
-    if (def.kind === "signal" && def.timeoutMs != null) {
+    // timeoutMs: "unbounded" is the (explicit, config-level) opt-in to parking
+    // forever — the only way to get a timer-less wait.
+    if (def.kind === "signal" && typeof def.timeoutMs === "number") {
       await store.upsertTimer(
         runId,
         stepId,
@@ -601,6 +619,7 @@ export function makeMessage(
         await queue.enqueue(runId, stepId, {
           attempt: attempt + 1,
           delayMs: outcome.delayMs,
+          flowId: flow.id,
         });
         return { tag: "parked" };
       }

@@ -119,7 +119,10 @@ describe("flow()", () => {
       input: passthroughSchema<Record<string, never>>(),
       build: (b) => {
         const t = b.task({ run: async () => null });
-        const s = b.signal({ schema: passthroughSchema<{ ok: boolean }>() });
+        const s = b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: boolean }>(),
+        });
         return { t, s };
       },
     });

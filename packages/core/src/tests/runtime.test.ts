@@ -125,6 +125,7 @@ describe("e2e: signal full loop", () => {
           run: async ({ input }) => ({ subject: input.subject }),
         });
         const review = b.signal({
+          timeoutMs: "unbounded" as const,
           needs: { prep },
           schema: passthroughSchema<{ approved: boolean }>(),
         });

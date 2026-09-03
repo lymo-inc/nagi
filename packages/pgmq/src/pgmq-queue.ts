@@ -4,6 +4,7 @@ import type {
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
+  QueueInspectEntry,
   QueueMessage,
   RunId,
   StepId,
@@ -31,6 +32,8 @@ interface MessageEnvelope {
   readonly runId: string;
   readonly stepId: string;
   readonly attempt: number;
+  // Absent on messages enqueued before the field existed; see QueueMessage.
+  readonly flowId?: string;
 }
 
 interface QueueConfig {
@@ -98,6 +101,7 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
         runId,
         stepId,
         attempt: options?.attempt ?? 1,
+        ...(options?.flowId !== undefined ? { flowId: options.flowId } : {}),
       };
       const delaySeconds = Math.max(
         0,
@@ -113,11 +117,14 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
     }: QueueDequeueOpts): Promise<readonly QueueMessage[]> {
       const { rows } = await sql<{
         msg_id: string | number | bigint;
+        read_ct: number;
         message: unknown;
-      }>`SELECT msg_id, message FROM pgmq.read(${queueName}, ${vtSeconds}::int, ${count}::int)`.execute(
+      }>`SELECT msg_id, read_ct, message FROM pgmq.read(${queueName}, ${vtSeconds}::int, ${count}::int)`.execute(
         executor,
       );
-      return rows.map((row) => projectMessage(row.msg_id, row.message));
+      return rows.map((row) =>
+        projectMessage(row.msg_id, row.message, row.read_ct),
+      );
     },
 
     async ack(receipt: string): Promise<void> {
@@ -154,12 +161,33 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
         executor,
       );
     },
+
+    async inspect(runId: RunId): Promise<readonly QueueInspectEntry[]> {
+      // Direct table read (pgmq stores queue "x" as pgmq.q_x) — pgmq has no
+      // query-by-payload API. Read-only; safe alongside consuming workers.
+      const { rows } = await sql<{
+        read_ct: number;
+        vt: Date | string;
+        message: unknown;
+      }>`SELECT read_ct, vt, message FROM ${sql.raw(`pgmq.q_${queueName}`)}
+          WHERE message->>'runId' = ${runId}`.execute(executor);
+      return rows.map((row) => {
+        const m = projectMessage("0", row.message, row.read_ct);
+        return {
+          stepId: m.stepId,
+          attempt: m.attempt,
+          readCount: row.read_ct,
+          visibleAt: row.vt instanceof Date ? row.vt : new Date(row.vt),
+        };
+      });
+    },
   };
 }
 
 function projectMessage(
   rawMsgId: string | number | bigint,
   raw: unknown,
+  readCount: number,
 ): QueueMessage {
   if (
     raw === null ||
@@ -178,7 +206,9 @@ function projectMessage(
     runId: envelope.runId as RunId,
     stepId: envelope.stepId as StepId,
     attempt: envelope.attempt as AttemptNumber,
+    readCount,
     payload: null,
+    ...(envelope.flowId !== undefined ? { flowId: envelope.flowId } : {}),
   };
 }
 

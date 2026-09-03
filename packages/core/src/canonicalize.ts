@@ -121,10 +121,14 @@ async function canonicalizeStep(
 // Key insertion order is irrelevant to the flow hash: stableStringify sorts keys.
 async function applyGuardAndTimeout(
   out: Mutable<CanonicalStep>,
-  def: { readonly when?: Guard; readonly timeoutMs?: Millis },
+  def: { readonly when?: Guard; readonly timeoutMs?: Millis | "unbounded" },
 ): Promise<void> {
   if (def.when !== undefined) out.whenHash = await hashFnSource(def.when);
-  if (def.timeoutMs !== undefined) out.timeoutMs = def.timeoutMs;
+  // "unbounded" canonicalizes as omission: it is semantically identical to the
+  // pre-required-timeout absence, so flows keep their hashes (and their
+  // in-flight runs) across the API migration.
+  if (def.timeoutMs !== undefined && def.timeoutMs !== "unbounded")
+    out.timeoutMs = def.timeoutMs;
 }
 
 async function canonicalizeTask(

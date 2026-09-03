@@ -37,6 +37,7 @@ import type {
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
+  QueueInspectEntry,
   QueueMessage,
   RunId,
   RunState,
@@ -335,6 +336,7 @@ export class InMemoryStore implements Store, StreamTransport {
       await queue.enqueue(c.runId, c.stepId, {
         attempt: decision.nextAttempt,
         delayMs: decision.backoffMs,
+        ...(state?.flowId !== undefined ? { flowId: state.flowId } : {}),
       });
       reaped.push({
         runId: c.runId,
@@ -898,8 +900,10 @@ export class InMemoryQueue implements Queue {
       stepId,
       payload: opts?.payload ?? null,
       attempt: opts?.attempt ?? 1,
+      readCount: 0,
       enqueuedAt: now,
       visibleAt: now + (opts?.delayMs ?? 0),
+      ...(opts?.flowId !== undefined ? { flowId: opts.flowId } : {}),
     };
     this.pending.push(item);
   }
@@ -915,11 +919,15 @@ export class InMemoryQueue implements Queue {
       const item = this.pending[i];
       if (item === undefined) continue;
       if (item.visibleAt > now) continue;
-      const next: QueuedItem = { ...item, visibleAt: now + this.leaseMs };
+      const delivered: QueuedItem = {
+        ...item,
+        readCount: item.readCount + 1,
+        visibleAt: now + this.leaseMs,
+      };
       this.pending.splice(i, 1);
       i--;
-      this.leased.set(item.receipt, next);
-      claimed.push(item);
+      this.leased.set(item.receipt, delivered);
+      claimed.push(delivered);
     }
     return claimed;
   }
@@ -943,6 +951,18 @@ export class InMemoryQueue implements Queue {
     const item = this.leased.get(receipt);
     if (!item) return;
     this.leased.set(receipt, { ...item, visibleAt: Date.now() + leaseMs });
+  }
+
+  async inspect(runId: RunId): Promise<readonly QueueInspectEntry[]> {
+    const all = [...this.pending, ...this.leased.values()];
+    return all
+      .filter((m) => m.runId === runId)
+      .map((m) => ({
+        stepId: m.stepId,
+        attempt: m.attempt,
+        readCount: m.readCount,
+        visibleAt: new Date(m.visibleAt),
+      }));
   }
 }
 
