@@ -178,7 +178,8 @@ class WorkerImpl implements Worker {
   ): Promise<WorkerRunResult> {
     const deadline = opts?.deadline;
     return this.pump({
-      shouldContinue: () => deadline === undefined || Date.now() < deadline,
+      shouldContinue: () =>
+        deadline === undefined || this.deps.clock.now().getTime() < deadline,
       batchSize: () => this.concurrency,
     });
   }
