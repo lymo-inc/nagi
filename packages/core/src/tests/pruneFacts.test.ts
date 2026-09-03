@@ -175,7 +175,7 @@ describe("InMemoryStore.pruneFacts — selection", () => {
     expect(r).toEqual({ runsPruned: 0, factsPruned: 0 });
   });
 
-  it("batchSize parameter does not affect total drained per call", async () => {
+  it("batchSize < total: one call drains every eligible run, in batches (loop until empty)", async () => {
     const cases: SeedCase[] = [];
     for (let i = 0; i < 5; i++) {
       cases.push({
@@ -188,7 +188,9 @@ describe("InMemoryStore.pruneFacts — selection", () => {
     const r = await store.pruneFacts(
       defaults({ olderThan: new Date(10_000), batchSize: 2 }),
     );
-    expect(r.runsPruned).toBe(5);
+    expect(r).toEqual({ runsPruned: 5, factsPruned: 10 });
+    const kept = await store.queryRuns({ where: { status: ["completed"] } });
+    expect(kept.runs).toHaveLength(5);
   });
 });
 

@@ -6,6 +6,7 @@ import {
   type RunId,
   type Wf,
 } from "@nagi-js/core";
+import { passthroughSchema } from "@nagi-js/core/testing";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -161,9 +162,12 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(await store.claimStep(runId, "s1", 1)).not.toBeNull();
     await new Promise((r) => setTimeout(r, 80));
 
-    const reaped = await store.sweepLeases({ now: new Date(), queue });
+    // Shared schema: earlier cases leave expired leases behind, so look at
+    // this run's entry only.
+    const reaped = (await store.sweepLeases({ now: new Date(), queue })).filter(
+      (r) => r.runId === runId,
+    );
     expect(reaped).toHaveLength(1);
-    expect(reaped[0]?.runId).toBe(runId);
     expect(reaped[0]?.nextAttempt).toBe(2);
 
     // Re-claim at the new attempt succeeds (lease row was deleted by sweep)
@@ -588,17 +592,17 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
 
     it("status filter accepts single value and array", async () => {
       const wf = await makeNagi();
-      await seed("f", {});
-      await seed("f", {}, "completed");
-      await seed("f", {}, "failed");
+      await seed("f-status", {});
+      await seed("f-status", {}, "completed");
+      await seed("f-status", {}, "failed");
 
       const completed = await wf.queryRuns({
-        where: { status: ["completed"] },
+        where: { flowId: "f-status", status: ["completed"] },
       });
       expect(completed.runs).toHaveLength(1);
 
       const both = await wf.queryRuns({
-        where: { status: ["completed", "failed"] },
+        where: { flowId: "f-status", status: ["completed", "failed"] },
       });
       expect(both.runs).toHaveLength(2);
     });
@@ -1321,16 +1325,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     });
   });
 });
-
-function passthroughSchema<T>() {
-  return {
-    "~standard": {
-      version: 1 as const,
-      vendor: "nagi-test",
-      validate: (value: unknown) => ({ value: value as T }),
-    },
-  };
-}
 
 async function loadStatus(
   db: Kysely<unknown>,

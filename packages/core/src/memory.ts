@@ -17,6 +17,18 @@ import {
   stepStateOf,
   stepStatusOf,
 } from "./state";
+import {
+  clampQueryLimit,
+  compareRunOrder,
+  DEFAULT_SWEEP_LIMIT,
+  decodeRunCursor,
+  encodeRunCursor,
+  factEffects,
+  isPastCursor,
+  jsonContains,
+  selectExpired,
+  selectPruneBatch,
+} from "./store-policy";
 import { InMemoryStreamHub } from "./stream-hub";
 import type {
   AttemptNumber,
@@ -29,7 +41,6 @@ import type {
   GlobalFact,
   Json,
   Millis,
-  PrunableStatus,
   PruneOpts,
   PruneResult,
   QueryRunsOpts,
@@ -56,8 +67,25 @@ import type {
 } from "./types";
 
 interface MemoryLease {
+  readonly runId: RunId;
+  readonly stepId: StepId;
+  readonly attempt: AttemptNumber;
   readonly token: ClaimToken;
   readonly expiresAt: number;
+}
+
+interface MemoryTimer {
+  readonly runId: RunId;
+  readonly stepId: StepId;
+  readonly fireAt: Date;
+}
+
+function leaseKey(runId: RunId, stepId: StepId, attempt: AttemptNumber) {
+  return `${runId}::${stepId}::${attempt}`;
+}
+
+function timerKey(runId: RunId, stepId: StepId) {
+  return `${runId}::${stepId}`;
 }
 
 export interface InMemoryStoreOpts {
@@ -81,10 +109,9 @@ export class InMemoryStore implements Store, StreamTransport {
   private readonly childrenByParent = new Map<RunId, Set<RunId>>();
   private readonly summaries = new Map<RunId, RunSummary>();
   private readonly streamHub = new InMemoryStreamHub();
-  // Durable signal-timeout deadlines, keyed `${runId}::${stepId}` → fire_at.
-  // The Postgres analogue is the nagi.timer table; this is its in-memory twin
-  // (distinct from the InMemoryClock's setTimeout-based scheduler timers).
-  private readonly signalTimers = new Map<string, Date>();
+  // Durable signal-timeout deadlines (the Postgres `timer` table), distinct
+  // from InMemoryClock's setTimeout-based scheduler.
+  private readonly signalTimers = new Map<string, MemoryTimer>();
   private readonly leaseMs: Millis;
 
   constructor(opts: InMemoryStoreOpts = {}) {
@@ -123,25 +150,34 @@ export class InMemoryStore implements Store, StreamTransport {
         this.streamHub.closeRun(runId);
         break;
     }
-    if (
-      fact.kind === "flow.completed" ||
-      fact.kind === "flow.failed" ||
-      fact.kind === "flow.canceled"
-    ) {
-      const slot = this.keyByActiveRun.get(runId);
-      if (slot !== undefined) {
+    // Every fact write applies the release table, so settle paths only append.
+    const effects = factEffects(fact);
+    switch (effects.tag) {
+      case "none":
+        return;
+      case "release-step":
+        this.releaseLeases(runId, effects.stepId);
+        if (effects.timer) {
+          this.signalTimers.delete(timerKey(runId, effects.stepId));
+        }
+        return;
+      case "release-run": {
+        const slot = this.keyByActiveRun.get(runId);
+        if (slot === undefined) return;
         this.keyByActiveRun.delete(runId);
         if (this.activeByKey.get(slot) === runId) {
           this.activeByKey.delete(slot);
         }
+        return;
       }
     }
-    if (fact.kind === "step.reset") {
-      const leasePrefix = `${runId}::${fact.stepId}::`;
-      for (const key of this.leases.keys()) {
-        if (key.startsWith(leasePrefix)) this.leases.delete(key);
+  }
+
+  private releaseLeases(runId: RunId, stepId: StepId): void {
+    for (const [key, lease] of this.leases) {
+      if (lease.runId === runId && lease.stepId === stepId) {
+        this.leases.delete(key);
       }
-      this.signalTimers.delete(`${runId}::${fact.stepId}`);
     }
   }
 
@@ -248,14 +284,20 @@ export class InMemoryStore implements Store, StreamTransport {
     stepId: StepId,
     attempt: AttemptNumber,
   ): Promise<ClaimToken | null> {
-    const key = `${runId}::${stepId}::${attempt}`;
+    const key = leaseKey(runId, stepId, attempt);
     const now = Date.now();
     const existing = this.leases.get(key);
     if (existing && existing.expiresAt > now) {
       return null;
     }
     const token = `lease-${crypto.randomUUID()}` as ClaimToken;
-    this.leases.set(key, { token, expiresAt: now + this.leaseMs });
+    this.leases.set(key, {
+      runId,
+      stepId,
+      attempt,
+      token,
+      expiresAt: now + this.leaseMs,
+    });
     return token;
   }
 
@@ -265,13 +307,10 @@ export class InMemoryStore implements Store, StreamTransport {
     attempt: AttemptNumber,
     leaseMs: Millis,
   ): Promise<void> {
-    const key = `${runId}::${stepId}::${attempt}`;
+    const key = leaseKey(runId, stepId, attempt);
     const existing = this.leases.get(key);
     if (existing === undefined) return; // idempotent: settled/reaped → no-op
-    this.leases.set(key, {
-      token: existing.token,
-      expiresAt: Date.now() + leaseMs,
-    });
+    this.leases.set(key, { ...existing, expiresAt: Date.now() + leaseMs });
   }
 
   async sweepLeases(args: {
@@ -279,69 +318,49 @@ export class InMemoryStore implements Store, StreamTransport {
     readonly queue: Queue;
     readonly limit?: number;
   }): Promise<readonly ReapedLease[]> {
-    const { now, queue, limit = 100 } = args;
+    const { now, queue, limit = DEFAULT_SWEEP_LIMIT } = args;
     const reaped: ReapedLease[] = [];
 
-    const candidates: Array<{
-      key: string;
-      runId: RunId;
-      stepId: StepId;
-      attempt: AttemptNumber;
-      expiresAt: Date;
-    }> = [];
-    for (const [key, lease] of this.leases) {
-      if (candidates.length >= limit) break;
-      const parts = key.split("::");
-      if (parts.length !== 3) continue;
-      const [runId, stepId, attemptStr] = parts as [string, string, string];
-      candidates.push({
-        key,
-        runId: runId as RunId,
-        stepId,
-        attempt: Number(attemptStr) as AttemptNumber,
-        expiresAt: new Date(lease.expiresAt),
-      });
-    }
+    const candidates = selectExpired(this.leases.values(), {
+      now,
+      limit,
+      deadline: (l) => new Date(l.expiresAt),
+    });
 
-    for (const c of candidates) {
-      const factList = this.facts.get(c.runId);
-      const state = factList ? foldRun(c.runId, factList) : null;
-      const ss = state ? stepStateOf(state, c.stepId) : null;
-      const stepStatus: StepRunStatus =
-        ss === null ? "pending" : stepStatusOf(ss);
+    for (const lease of candidates) {
+      const { runId, stepId, attempt } = lease;
+      const factList = this.facts.get(runId);
+      const state = factList ? foldRun(runId, factList) : null;
+      const stepStatus: StepRunStatus = state
+        ? stepStatusOf(stepStateOf(state, stepId))
+        : "pending";
       const decision = decideExpiredLeaseAction({
         lease: {
-          runId: c.runId,
-          stepId: c.stepId,
-          attempt: c.attempt,
-          expiresAt: c.expiresAt,
+          runId,
+          stepId,
+          attempt,
+          expiresAt: new Date(lease.expiresAt),
         },
         stepStatus,
-        childActive: this.hasActiveChild(c.runId, c.stepId),
+        childActive: this.hasActiveChild(runId, stepId),
         now,
       });
       if (decision.tag === "skip") continue;
 
-      this.leases.delete(c.key);
+      this.leases.delete(leaseKey(runId, stepId, attempt));
       await this.appendFact(
-        c.runId,
-        Facts.leaseReaped({
-          runId: c.runId,
-          stepId: c.stepId,
-          attempt: c.attempt,
-          at: now,
-          reapedAt: now,
-        }),
+        runId,
+        Facts.leaseReaped({ runId, stepId, attempt, at: now, reapedAt: now }),
       );
-      await queue.enqueue(c.runId, c.stepId, {
+      await queue.enqueue(runId, stepId, {
         attempt: decision.nextAttempt,
         delayMs: decision.backoffMs,
         ...(state?.flowId !== undefined ? { flowId: state.flowId } : {}),
       });
       reaped.push({
-        runId: c.runId,
-        stepId: c.stepId,
-        attempt: c.attempt,
+        runId,
+        stepId,
+        attempt,
         nextAttempt: decision.nextAttempt,
       });
     }
@@ -381,56 +400,42 @@ export class InMemoryStore implements Store, StreamTransport {
       case "deliver":
         await this.appendFact(runId, decision.received);
         await this.appendFact(runId, decision.completed);
-        // The step resolved by delivery; drop its timeout so the next sweep
-        // doesn't fold a now-completed step just to no-op (Postgres parity).
-        this.signalTimers.delete(`${runId}::${stepId}`);
         return decision.result;
     }
   }
 
   async upsertTimer(runId: RunId, stepId: StepId, fireAt: Date): Promise<void> {
-    // Keep the earliest deadline (Postgres parity: ON CONFLICT DO NOTHING) so a
-    // lease-reap re-dispatch of a still-parked signal can't push the deadline
-    // out. A genuine restart deletes the row first (step.reset).
-    const key = `${runId}::${stepId}`;
-    if (!this.signalTimers.has(key)) this.signalTimers.set(key, fireAt);
+    // Insert-if-absent (Postgres: ON CONFLICT DO NOTHING) so a lease-reap
+    // re-dispatch of a still-parked signal can't push the deadline out. A
+    // genuine restart deletes the row first (step.reset).
+    const key = timerKey(runId, stepId);
+    if (!this.signalTimers.has(key)) {
+      this.signalTimers.set(key, { runId, stepId, fireAt });
+    }
   }
 
   async sweepSignalTimeouts(args: {
     readonly now: Date;
     readonly limit?: number;
   }): Promise<readonly TimedOutSignal[]> {
-    const { now, limit = 100 } = args;
+    const { now, limit = DEFAULT_SWEEP_LIMIT } = args;
     const timedOut: TimedOutSignal[] = [];
 
-    const due: Array<{ key: string; runId: RunId; stepId: StepId }> = [];
-    for (const [key, fireAt] of this.signalTimers) {
-      if (due.length >= limit) break;
-      if (fireAt > now) continue;
-      const sep = key.indexOf("::");
-      due.push({
-        key,
-        runId: key.slice(0, sep) as RunId,
-        stepId: key.slice(sep + 2),
-      });
-    }
+    const due = selectExpired(this.signalTimers.values(), {
+      now,
+      limit,
+      deadline: (t) => t.fireAt,
+    });
 
     // Single process, single thread: fold → decide → append runs with no
     // interleaving await, the same atomicity argument settleSignal relies on.
-    for (const { key, runId, stepId } of due) {
-      const fireAt = this.signalTimers.get(key);
-      if (fireAt === undefined) continue;
+    for (const { runId, stepId, fireAt } of due) {
       const runState = foldRun(runId, this.facts.get(runId) ?? []);
       const decision = decideTimeout({ runState, stepId, fireAt, at: now });
-      this.signalTimers.delete(key);
+      // Fired once: consumed whether or not the step was still awaiting.
+      this.signalTimers.delete(timerKey(runId, stepId));
       if (decision.kind === "noop") continue;
       await this.appendFact(runId, decision.fact);
-      // Drop the parked step's stale lease, mirroring settleSignal's deliver
-      // path (and the Postgres timeout path).
-      const leasePrefix = `${runId}::${stepId}::`;
-      for (const k of this.leases.keys()) {
-        if (k.startsWith(leasePrefix)) this.leases.delete(k);
-      }
       timedOut.push({ runId, stepId, attempt: decision.attempt, fireAt });
     }
 
@@ -443,7 +448,8 @@ export class InMemoryStore implements Store, StreamTransport {
     scope: string,
     value: Json,
   ): Promise<void> {
-    this.onces.set(`${runId}::${stepId}::${scope}`, value);
+    const key = `${runId}::${stepId}::${scope}`;
+    if (!this.onces.has(key)) this.onces.set(key, value);
   }
 
   async getOnce(
@@ -506,7 +512,7 @@ export class InMemoryStore implements Store, StreamTransport {
     const matches = (summary: RunSummary): boolean =>
       (where.flowId === undefined || summary.flowId === where.flowId) &&
       (!wanted || wanted.has(summary.status)) &&
-      (where.input === undefined || containsJson(summary.input, where.input));
+      (where.input === undefined || jsonContains(summary.input, where.input));
 
     const summaries: RunSummary[] = [];
     for (const [runId, factList] of this.facts) {
@@ -517,42 +523,33 @@ export class InMemoryStore implements Store, StreamTransport {
     for (const summary of this.summaries.values()) {
       if (matches(summary)) summaries.push(summary);
     }
-
-    summaries.sort((a, b) => {
-      const t = b.startedAt.getTime() - a.startedAt.getTime();
-      if (t !== 0) return t;
-      return a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0;
-    });
+    summaries.sort(compareRunOrder);
 
     if (opts.latest === true) {
       return { runs: summaries.slice(0, 1), cursor: null };
     }
 
-    const limit = clampLimit(opts.limit);
-    let start = 0;
-    if (opts.cursor !== undefined) {
-      const c = decodeCursor(opts.cursor);
-      start = summaries.findIndex(
-        (s) =>
-          s.startedAt.getTime() < c.t ||
-          (s.startedAt.getTime() === c.t && s.runId < c.r),
-      );
-      if (start === -1) start = summaries.length;
-    }
-
-    const page = summaries.slice(start, start + limit);
-    const hasMore = start + limit < summaries.length;
-    const last = page[page.length - 1];
+    const limit = clampQueryLimit(opts.limit);
     const cursor =
-      hasMore && last !== undefined
-        ? encodeCursor({ t: last.startedAt.getTime(), r: last.runId })
+      opts.cursor === undefined ? null : decodeRunCursor(opts.cursor);
+    const rest =
+      cursor === null
+        ? summaries
+        : summaries.filter((s) => isPastCursor(s, cursor));
+    const page = rest.slice(0, limit);
+    const last = page[page.length - 1];
+    const next =
+      rest.length > limit && last !== undefined
+        ? encodeRunCursor({ startedAt: last.startedAt, runId: last.runId })
         : null;
-    return { runs: page, cursor };
+    return { runs: page, cursor: next };
   }
 
   async describe(runId: RunId): Promise<RunDescription> {
     const factList = this.facts.get(runId);
-    if (factList === undefined || factList.length === 0) return null;
+    if (factList === undefined || factList.length === 0) {
+      return this.describeSummary(runId);
+    }
     const first = factList[0];
     if (first === undefined || first.kind !== "flow.started") return null;
 
@@ -645,12 +642,12 @@ export class InMemoryStore implements Store, StreamTransport {
       const startedAt = startedAtByStep.get(stepId);
       const completedAt = completedAtByStep.get(stepId);
       let lease: { readonly expiresAt: Date } | undefined;
-      const leasePrefix = `${runId}::${stepId}::`;
       let bestExpiry = 0;
-      for (const [key, l] of this.leases) {
-        if (!key.startsWith(leasePrefix)) continue;
-        if (l.expiresAt > now && l.expiresAt > bestExpiry)
+      for (const l of this.leases.values()) {
+        if (l.runId !== runId || l.stepId !== stepId) continue;
+        if (l.expiresAt > now && l.expiresAt > bestExpiry) {
           bestExpiry = l.expiresAt;
+        }
       }
       if (bestExpiry > 0) lease = { expiresAt: new Date(bestExpiry) };
       steps.push({
@@ -674,60 +671,72 @@ export class InMemoryStore implements Store, StreamTransport {
     return { run, steps };
   }
 
-  async pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult> {
-    const olderThanMs = opts.olderThan.getTime();
-    const statusSet = new Set<PrunableStatus>(opts.statuses);
+  // A run pruned with keepSummary keeps its row in Postgres; the summary is
+  // the in-memory equivalent, so describe() stays non-null for it.
+  private describeSummary(runId: RunId): RunDescription {
+    const s = this.summaries.get(runId);
+    if (s === undefined) return null;
+    const childSet = this.childrenByParent.get(runId);
+    return {
+      run: {
+        runId,
+        flowId: s.flowId,
+        flowHash: "",
+        status: s.status,
+        startedAt: s.startedAt,
+        input: s.input,
+        children: childSet ? Array.from(childSet) : [],
+        ...(s.completedAt !== null ? { completedAt: s.completedAt } : {}),
+      },
+      steps: [],
+    };
+  }
 
-    interface Victim {
-      readonly runId: RunId;
-      readonly summary: RunSummary;
-      readonly factCount: number;
-      readonly parentRunId: RunId | undefined;
+  async pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult> {
+    let runsPruned = 0;
+    let factsPruned = 0;
+    for (;;) {
+      const batch = selectPruneBatch(this.pruneCandidates(), opts);
+      if (batch.length === 0) break;
+      for (const { factCount, parentRunId, ...summary } of batch) {
+        const runId = summary.runId;
+        this.facts.delete(runId);
+        deleteByRunPrefix(this.onces, runId);
+        deleteByRunPrefix(this.leases, runId);
+        deleteByRunPrefix(this.signalTimers, runId);
+        this.childrenByParent.delete(runId);
+        if (parentRunId !== undefined) {
+          const siblings = this.childrenByParent.get(parentRunId);
+          if (siblings !== undefined) {
+            siblings.delete(runId);
+            if (siblings.size === 0) this.childrenByParent.delete(parentRunId);
+          }
+        }
+        if (opts.keepSummary) {
+          this.summaries.set(runId, summary);
+        } else {
+          this.summaries.delete(runId);
+        }
+        runsPruned += 1;
+        factsPruned += factCount;
+      }
     }
-    const victims: Victim[] = [];
+    return { runsPruned, factsPruned };
+  }
+
+  private pruneCandidates(): PruneVictim[] {
+    const out: PruneVictim[] = [];
     for (const [runId, factList] of this.facts) {
       const summary = summarize(runId as RunId, factList);
       if (summary === null) continue;
-      if (summary.completedAt === null) continue;
-      if (!statusSet.has(summary.status as PrunableStatus)) continue;
-      if (summary.completedAt.getTime() >= olderThanMs) continue;
       const first = factList[0];
       const parentRunId =
         first !== undefined && first.kind === "flow.started"
           ? first.parent?.runId
           : undefined;
-      victims.push({
-        runId: runId as RunId,
-        summary,
-        factCount: factList.length,
-        parentRunId,
-      });
+      out.push({ ...summary, factCount: factList.length, parentRunId });
     }
-
-    let runsPruned = 0;
-    let factsPruned = 0;
-    for (const v of victims) {
-      this.facts.delete(v.runId);
-      deleteByRunPrefix(this.onces, v.runId);
-      deleteByRunPrefix(this.leases, v.runId);
-      this.childrenByParent.delete(v.runId);
-      if (v.parentRunId !== undefined) {
-        const siblings = this.childrenByParent.get(v.parentRunId);
-        if (siblings !== undefined) {
-          siblings.delete(v.runId);
-          if (siblings.size === 0) this.childrenByParent.delete(v.parentRunId);
-        }
-      }
-      if (opts.keepSummary) {
-        this.summaries.set(v.runId, v.summary);
-      } else {
-        this.summaries.delete(v.runId);
-      }
-      runsPruned += 1;
-      factsPruned += v.factCount;
-    }
-
-    return { runsPruned, factsPruned };
+    return out;
   }
 
   subscribeStream(
@@ -756,6 +765,11 @@ export class InMemoryStore implements Store, StreamTransport {
   publishChunk(runId: RunId, stepId: StepId, chunk: Json): void {
     this.streamHub.publishChunk(runId, stepId, chunk);
   }
+}
+
+interface PruneVictim extends RunSummary {
+  readonly factCount: number;
+  readonly parentRunId: RunId | undefined;
 }
 
 const EMPTY_CLOSED_STREAM: AsyncIterable<StreamEvent<Json>> = {
@@ -796,74 +810,6 @@ function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
     completedAt,
     input: first.input,
   };
-}
-
-const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 500;
-
-function clampLimit(limit: number | undefined): number {
-  if (limit === undefined) return DEFAULT_LIMIT;
-  if (!Number.isInteger(limit) || limit < 1) return DEFAULT_LIMIT;
-  return Math.min(limit, MAX_LIMIT);
-}
-
-interface DecodedCursor {
-  readonly t: number;
-  readonly r: string;
-}
-
-function encodeCursor(c: DecodedCursor): string {
-  const bytes = new TextEncoder().encode(JSON.stringify(c));
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i] as number);
-  }
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-function decodeCursor(s: string): DecodedCursor {
-  try {
-    const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      typeof (parsed as DecodedCursor).t === "number" &&
-      typeof (parsed as DecodedCursor).r === "string"
-    ) {
-      return parsed as DecodedCursor;
-    }
-    throw new Error("malformed cursor body");
-  } catch (err) {
-    throw new Error(
-      `queryRuns: invalid cursor — ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-function containsJson(haystack: Json, needle: Json): boolean {
-  if (Array.isArray(needle)) {
-    if (!Array.isArray(haystack)) return false;
-    return needle.every((n) => haystack.some((h) => containsJson(h, n)));
-  }
-  if (needle !== null && typeof needle === "object") {
-    if (
-      haystack === null ||
-      Array.isArray(haystack) ||
-      typeof haystack !== "object"
-    )
-      return false;
-    return Object.entries(needle).every(
-      ([k, v]) => k in haystack && containsJson(haystack[k] as Json, v as Json),
-    );
-  }
-  return haystack === needle;
 }
 
 export { foldRun as projectRunState } from "./state";
