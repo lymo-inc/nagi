@@ -21,6 +21,28 @@ const q = await wf.inspectQueue(runId); // in-queue messages for the run
 | running, no lease, no entries     | —                              | Advance was lost — `operator().retry(runId, stepId)` re-drives   |
 | any status                        | entry with high `readCount`    | Redelivery loop — see poison messages below                      |
 
+## Nothing is being consumed (fleet-wide stall)
+
+Every flow stuck at once, `inspectQueue` entries all at `readCount: 0`, no live
+leases: the worker loop itself is not polling. `worker.run()` settles **only**
+via its abort signal — queue failures are logged as
+`worker.dequeue failed; backing off` and retried (exponential from
+`pollIntervalMs`, capped at 30s, reset on success), so a database blip can no
+longer end it.
+
+If the loop does exit, something outside that guard threw. `nagi.run()` logs
+`nagi.run: worker exited unexpectedly`; it does **not** restart the loop, so
+supervise it:
+
+- Page on `nagi.run: worker exited unexpectedly` (or restart `worker.run()` in
+  a loop if you drive the worker yourself).
+- Alert on oldest-unread-message age in the queue. That catches any
+  consumption stall, whatever the cause — including ones no log line covers.
+
+Sustained `worker.dequeue failed; backing off` at `error` level means the queue
+is unreachable, not that runs are broken; the loop resumes on its own once the
+queue comes back.
+
 ## Poison messages / snapshot-gone (deploy replaced an in-flight flow)
 
 Self-healing since the snapshot-gone policy: the worker retries with backoff

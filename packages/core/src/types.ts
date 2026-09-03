@@ -502,7 +502,12 @@ export interface WorkerRunResult {
 }
 
 export interface Worker {
+  // Settles ONLY when the configured abort signal fires. Queue and dispatch
+  // failures are logged and retried with backoff, never rethrown: a rejection
+  // here would stop all flow processing in a process that still looks healthy.
   run(): Promise<void>;
+  // Bounded drains, for tests and request/cron-scoped processing. These DO
+  // reject on queue failure — the caller is awaiting a result and can react.
   runOnce(opts?: WorkerRunOnceOpts): Promise<WorkerRunResult>;
   runUntilEmpty(opts?: WorkerRunUntilEmptyOpts): Promise<WorkerRunResult>;
 }

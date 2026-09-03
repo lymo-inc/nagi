@@ -17,6 +17,8 @@ const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_POLL_INTERVAL_MS: Millis = 1_000;
 const DEFAULT_TIMER_SWEEP_INTERVAL_MS: Millis = 30_000;
 const SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS: Millis = 30_000;
+const MAX_DEQUEUE_BACKOFF_MS: Millis = 30_000;
+const MIN_DEQUEUE_BACKOFF_MS: Millis = 50;
 
 // Bounds redelivery of a message whose run is pinned to a flow snapshot no
 // longer in any live registry. "retry" exists ONLY for the rolling-deploy
@@ -113,7 +115,13 @@ class WorkerImpl implements Worker {
     } catch {}
   }
 
+  // MUST settle only via the abort signal. A rejection escaping this loop
+  // silently ends ALL flow processing in a process that otherwise looks
+  // healthy — observed in prod as one transient `pgmq.read` connection
+  // timeout killing the loop, then 37h of fleet-wide stuck runs because
+  // nothing restarts it. Every await below is therefore guarded.
   async run(): Promise<void> {
+    let dequeueFailures = 0;
     while (!this.aborted()) {
       // Time-based, not idle-gated: a worker pinned at full concurrency still
       // reaches this each iteration (the slots-full branch loops every ~50ms),
@@ -125,7 +133,25 @@ class WorkerImpl implements Worker {
         continue;
       }
 
-      const messages = await this.dequeue(slots);
+      let messages: readonly QueueMessage[];
+      try {
+        messages = await this.dequeue(slots);
+      } catch (err) {
+        dequeueFailures++;
+        this.deps.emitLog({
+          level: "error",
+          msg: "worker.dequeue failed; backing off",
+          attrs: {
+            error: String(err),
+            consecutiveFailures: dequeueFailures,
+            backoffMs: this.dequeueBackoffMs(dequeueFailures),
+          },
+        });
+        await this.sleep(this.dequeueBackoffMs(dequeueFailures));
+        continue;
+      }
+      dequeueFailures = 0;
+
       if (messages.length === 0) {
         await this.sleep(this.pollIntervalMs);
         continue;
@@ -157,6 +183,12 @@ class WorkerImpl implements Worker {
     });
   }
 
+  // Unlike run(), a dequeue failure here PROPAGATES. These are bounded calls
+  // that hand a result back to an awaiting caller, so a rejection is observed,
+  // not silent — the outage shape run() guards against cannot happen. The
+  // alternatives are both worse: retrying would let runUntilEmpty() hang for
+  // the length of a database outage, and swallowing would report an
+  // unreachable queue as a drained one.
   private async pump(opts: {
     shouldContinue: (processed: number) => boolean;
     batchSize: (processed: number) => number;
@@ -192,6 +224,19 @@ class WorkerImpl implements Worker {
 
   private async dequeue(count: number): Promise<readonly QueueMessage[]> {
     return this.deps.queue.dequeue({ count: Math.max(1, count) });
+  }
+
+  // Exponential, capped, reset on the first success: a one-off blip costs one
+  // poll interval, a real outage settles to a 30s cadence instead of hammering
+  // a down database and flooding logs. Anchored on pollIntervalMs (default 1s,
+  // so the default curve is 1s -> 30s) and floored so a 0/near-0 poll interval
+  // cannot turn a persistent failure into a tight loop.
+  private dequeueBackoffMs(consecutiveFailures: number): Millis {
+    const base = Math.max(this.pollIntervalMs, MIN_DEQUEUE_BACKOFF_MS);
+    return Math.min(
+      base * 2 ** (consecutiveFailures - 1),
+      MAX_DEQUEUE_BACKOFF_MS,
+    );
   }
 
   private fire(msg: QueueMessage): void {

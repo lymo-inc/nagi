@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
-import { InMemoryQueue, InMemoryStore } from "../memory";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
 import type { LogEntry, QueueDequeueOpts, QueueMessage } from "../types";
 import { passthroughSchema } from "./test-helpers";
@@ -31,6 +31,16 @@ class CrashingQueue extends InMemoryQueue {
     _opts: QueueDequeueOpts,
   ): Promise<readonly QueueMessage[]> {
     throw new Error("queue connection lost");
+  }
+}
+
+// A queue failure no longer reaches nagi.run — the worker absorbs it. Crashing
+// the loop now takes a broken Clock, the one adapter call left outside a guard.
+class CrashingClock extends InMemoryClock {
+  armed = false;
+  override now(): Date {
+    if (this.armed) throw new Error("clock read failed");
+    return super.now();
   }
 }
 
@@ -143,6 +153,27 @@ describe("nagi.run — graceful vs crash", () => {
 
   it("a true loop crash emits exactly one error entry; stop() still resolves", async () => {
     const { onLog, errors } = captureOnLog();
+    const clock = new CrashingClock();
+    const handle = await nagi.run({
+      flows: [echo],
+      store: new InMemoryStore(),
+      queue: new InMemoryQueue(),
+      clock,
+      worker: { pollIntervalMs: 5 },
+      onLog,
+    });
+    clock.armed = true;
+    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+    const crash = errors()[0];
+    expect(crash?.msg).toBe("nagi.run: worker exited unexpectedly");
+    expect(crash?.attrs).toMatchObject({
+      error: expect.stringContaining("clock read failed"),
+    });
+    await expect(handle.stop()).resolves.toBeUndefined();
+  });
+
+  it("a crashing queue does NOT exit the loop — it backs off and retries", async () => {
+    const { onLog, errors } = captureOnLog();
     const handle = await nagi.run({
       flows: [echo],
       store: new InMemoryStore(),
@@ -150,12 +181,14 @@ describe("nagi.run — graceful vs crash", () => {
       worker: { pollIntervalMs: 5 },
       onLog,
     });
-    await vi.waitFor(() => expect(errors()).toHaveLength(1));
-    const crash = errors()[0];
-    expect(crash?.msg).toBe("nagi.run: worker exited unexpectedly");
-    expect(crash?.attrs).toMatchObject({
-      error: expect.stringContaining("queue connection lost"),
-    });
+    await vi.waitFor(() =>
+      expect(
+        errors().filter((e) => e.msg === "worker.dequeue failed; backing off"),
+      ).not.toHaveLength(0),
+    );
+    expect(
+      errors().filter((e) => e.msg === "nagi.run: worker exited unexpectedly"),
+    ).toHaveLength(0);
     await expect(handle.stop()).resolves.toBeUndefined();
   });
 });
