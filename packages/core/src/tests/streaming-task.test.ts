@@ -401,8 +401,8 @@ describe("streamingTask — INVARIANT GUARDS", () => {
       input: null,
       at: new Date(),
     });
-    const collected = collect(store.subscribeStream(runId, stepId));
-    store.publishChunk(runId, stepId, "live-chunk");
+    const collected = collect(store.stream.subscribeStream(runId, stepId));
+    store.stream.publishChunk(runId, stepId, "live-chunk");
 
     await store.appendFact(runId, {
       kind: "flow.completed",
@@ -418,7 +418,7 @@ describe("streamingTask — INVARIANT GUARDS", () => {
 });
 
 describe("streamingTask — capability gating (D4)", () => {
-  it("registering a streaming flow against a store without subscribeStream throws at nagi()", async () => {
+  it("registering a streaming flow against a store without `stream` throws at nagi()", async () => {
     const f = flow({
       id: "stream-capability",
       input: passthroughSchema<Record<string, never>>(),
@@ -433,8 +433,7 @@ describe("streamingTask — capability gating (D4)", () => {
     const store = new InMemoryStore();
     const crippled = new Proxy(store, {
       get(target, prop, receiver) {
-        if (prop === "subscribeStream" || prop === "publishChunk")
-          return undefined;
+        if (prop === "stream") return undefined;
         return Reflect.get(target, prop, receiver);
       },
     });
@@ -448,7 +447,7 @@ describe("streamingTask — capability gating (D4)", () => {
     ).rejects.toThrow(NagiRuntimeError);
   });
 
-  it("a non-streaming flow against a store without subscribeStream registers fine", async () => {
+  it("a non-streaming flow against a store without `stream` registers fine", async () => {
     const f = flow({
       id: "no-stream-capability",
       input: passthroughSchema<Record<string, never>>(),
@@ -461,8 +460,7 @@ describe("streamingTask — capability gating (D4)", () => {
     const store = new InMemoryStore();
     const crippled = new Proxy(store, {
       get(target, prop, receiver) {
-        if (prop === "subscribeStream" || prop === "publishChunk")
-          return undefined;
+        if (prop === "stream") return undefined;
         return Reflect.get(target, prop, receiver);
       },
     });

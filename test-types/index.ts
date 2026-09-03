@@ -11,3 +11,20 @@ export type ResolvedExports = {
   pgmq: typeof pgmq;
   postgres: typeof postgres;
 };
+
+// Deliberate public removals (#42): tsc fails here if one comes back.
+// Type-only removals (Trigger, PostgresTriggerOpts, ListenClient,
+// NotificationMessage) cannot be asserted absent; see the changeset.
+type Removed<T, K extends string> = K extends keyof T
+  ? ["still exported", K]
+  : true;
+export type RemovedSurface = [
+  Removed<typeof core, "InMemoryTrigger">,
+  Removed<core.Clock, "schedule">,
+  Removed<core.InMemoryClock, "dispose">,
+  Removed<core.NagiConfig, "trigger">,
+  Removed<core.NagiConfig, "streamTransport">,
+  Removed<typeof postgres, "postgresTrigger">,
+];
+export const removedSurfaceOk: RemovedSurface extends true[] ? true : never =
+  true;
