@@ -1,8 +1,4 @@
-import {
-  canonicalize,
-  fingerprintFlows,
-  sha256Canonical,
-} from "./canonicalize";
+import { fingerprintFlows } from "./canonicalize";
 import { type DispatchDeps, makeDispatcher } from "./dispatch";
 import {
   NagiCanceledError,
@@ -12,7 +8,7 @@ import {
 } from "./errors";
 import { makeHooks } from "./exec/hooks";
 import { Facts } from "./facts";
-import { makeFlowRegistry } from "./flow-registry";
+import { type FlowResolution, registerFlows } from "./flows";
 import { asStepMapWithDefs, compact, getDef, makeEmit } from "./internal";
 import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
 import { InMemoryClock } from "./memory";
@@ -189,8 +185,6 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   const emitLog = makeEmit(config.onLog);
   await config.queue.ensureSchema?.();
 
-  const registry = makeFlowRegistry(config.flows);
-
   // Falls back to the store when it also implements StreamTransport (the
   // in-memory reference does); real deployments inject a dedicated transport.
   const streamTransport =
@@ -199,7 +193,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   // Streaming steps publish ephemeral chunks out-of-band, so without a transport
   // they cannot be carried. Only scanned on the failure path.
   if (streamTransport === undefined) {
-    for (const f of registry.all) {
+    for (const f of config.flows) {
       for (const [stepId, step] of Object.entries(asStepMapWithDefs(f.steps))) {
         if (getDef(step).kind !== "streaming") continue;
         throw new NagiRuntimeError(
@@ -212,45 +206,17 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     }
   }
 
-  const flowHashById = new Map<string, string>();
-  for (const f of registry.all) {
-    const dag = await canonicalize(f);
-    const flowHash = await sha256Canonical(dag);
-    flowHashById.set(f.id, flowHash);
-    await config.store.upsertSnapshot({
-      flowHash,
-      flowId: f.id,
-      dag: dag as unknown as Json,
-    });
-
-    const previousHash = await config.store.getRef(f.id);
-    if (previousHash !== flowHash) {
-      await config.store.setRef(f.id, flowHash);
-      await config.store.appendGlobalFact(
-        Facts.flowRefUpdated({
-          flowId: f.id,
-          from: previousHash,
-          to: flowHash,
-          at: clock.now(),
-        }),
-      );
-    }
-  }
+  const registry = await registerFlows({
+    flows: config.flows,
+    store: config.store,
+    clock,
+  });
 
   const codeVersion =
     config.codeVersion ?? (await fingerprintFlows(config.flows));
 
-  // dispatch path: when the run was pinned to a flowHash, fail loud if the
-  // registry no longer matches (NagiFlowSnapshotGoneError). Legacy runs with
-  // no pinned hash continue to resolve by flowId.
-  async function flowFor(runId: RunId): Promise<Flow> {
-    const runState = await config.store.loadRunState(runId);
-    return registry.requireForRun(
-      runState.flowId,
-      runId,
-      runState.flowHash,
-      (id) => flowHashById.get(id),
-    );
+  async function resolveFlow(runId: RunId): Promise<FlowResolution> {
+    return registry.resolve(await config.store.loadRunState(runId));
   }
 
   function lookupFlow(flowId: string): Flow | undefined {
@@ -269,7 +235,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     readonly parent?: ParentRef;
   }): Promise<{ readonly started: boolean }> {
     const startedAt = clock.now();
-    const flowHash = flowHashById.get(flow.id);
+    const flowHash = registry.hashOf(flow.id);
 
     const fact = Facts.flowStarted({
       runId,
@@ -447,7 +413,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   }
 
   const dispatchDeps: DispatchDeps = {
-    flowFor,
+    resolveFlow,
     lookupFlow,
     startChildRun,
     store: config.store,
@@ -481,11 +447,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     emitLog,
     ...compact({ flowHooks: config.hooks }),
   });
-  const replayer = makeReplay({
-    ...dispatchDeps,
-    registry,
-    hashFor: (id) => flowHashById.get(id),
-  });
+  const replayer = makeReplay({ ...dispatchDeps, registry });
 
   const wf: Wf = {
     async start<F extends Flow>(
@@ -555,7 +517,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
       const validated = (await validate(flow.input, input)) as Json;
       const startedAt = clock.now();
-      const flowHash = flowHashById.get(flow.id);
+      const flowHash = registry.hashOf(flow.id);
       const fact: FlowStartedFact = Facts.flowStarted({
         runId,
         flowId: flow.id,

@@ -1,7 +1,12 @@
-import { NagiSignalTimeoutError, serializeError } from "./errors";
+import {
+  type NagiFlowSnapshotGoneError,
+  NagiSignalTimeoutError,
+  serializeError,
+} from "./errors";
 import { makeHooks } from "./exec/hooks";
 import { makeMessage } from "./exec/message";
 import { makeProgression } from "./exec/progression";
+import { type FlowResolution, requireCurrent } from "./flows";
 import type { EmitLog } from "./internal";
 import type {
   Clock,
@@ -26,7 +31,7 @@ export interface HeartbeatConfig {
 }
 
 export interface DispatchDeps {
-  readonly flowFor: (runId: RunId) => Promise<Flow>;
+  readonly resolveFlow: (runId: RunId) => Promise<FlowResolution>;
   readonly lookupFlow: (flowId: string) => Flow | undefined;
   readonly startChildRun: (args: {
     readonly child: Flow;
@@ -51,8 +56,18 @@ export type SubflowChildOutcome =
   | { readonly kind: "failed"; readonly error: SerializedError }
   | { readonly kind: "canceled"; readonly error: SerializedError };
 
+// "snapshot-gone" is a live run pinned to a flowHash this process did not
+// register: the message is left unsettled for the worker's policy. A terminal
+// run's gone message is acked inside dispatchMessage and reports "done".
+export type DispatchResult =
+  | { readonly kind: "done" }
+  | {
+      readonly kind: "snapshot-gone";
+      readonly error: NagiFlowSnapshotGoneError;
+    };
+
 export interface Dispatcher {
-  dispatchMessage(message: QueueMessage): Promise<void>;
+  dispatchMessage(message: QueueMessage): Promise<DispatchResult>;
   advance(runId: RunId): Promise<void>;
   propagateToParent(
     childRunId: RunId,
@@ -77,7 +92,7 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
       // other failure path uses (handleStepError, markStepSettled) — so a
       // consumer's per-step error handling sees signal timeouts too.
       if (deps.hooks?.onStepError) {
-        const flow = await deps.flowFor(runId);
+        const flow = requireCurrent(await deps.resolveFlow(runId));
         await hooks.fireHook(
           deps.hooks.onStepError,
           {
