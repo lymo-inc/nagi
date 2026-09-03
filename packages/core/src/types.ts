@@ -1,6 +1,17 @@
+import type {
+  Fact,
+  FlowCanceledByConcurrencyFact,
+  FlowStartedFact,
+  GlobalFact,
+  StepCanceledFact,
+  StepCompletedFact,
+  StepFailedFact,
+} from "./facts";
 import type { ReapedLease } from "./lease-reaper";
 import type { RunDescription } from "./run-view";
 import type { Resolved, RunState, StepState } from "./state";
+
+export type * from "./facts";
 
 export type Json =
   | string
@@ -437,10 +448,6 @@ export interface StepRetryEvent extends StepEvent {
   readonly nextAttemptAt: Date;
 }
 
-export interface SignalSentEvent extends StepEvent {
-  readonly payload: Json;
-}
-
 export interface SignalReceivedEvent extends StepEvent {
   readonly payload: Json;
 }
@@ -453,7 +460,6 @@ export interface FlowHooks {
   readonly onStepComplete?: (event: StepCompleteEvent) => void | Promise<void>;
   readonly onStepError?: (event: StepErrorEvent) => void | Promise<void>;
   readonly onStepRetry?: (event: StepRetryEvent) => void | Promise<void>;
-  readonly onSignalSent?: (event: SignalSentEvent) => void | Promise<void>;
   readonly onSignalReceived?: (
     event: SignalReceivedEvent,
   ) => void | Promise<void>;
@@ -843,228 +849,6 @@ export interface Clock {
 export interface Trigger {
   subscribe(handler: (runId: RunId) => void): () => void;
 }
-
-export type FactKind =
-  | "flow.started"
-  | "flow.completed"
-  | "flow.failed"
-  | "flow.canceled"
-  | "step.started"
-  | "step.completed"
-  | "step.failed"
-  | "step.canceled"
-  | "step.retried"
-  | "step.skipped"
-  | "step.reset"
-  | "step.abort-requested"
-  | "signal.sent"
-  | "signal.received"
-  | "signal.buffered"
-  | "once.recorded"
-  | "match.arm-selected"
-  | "lease.reaped";
-
-interface FactBase {
-  readonly runId: RunId;
-  readonly at: Date;
-}
-
-export interface FlowStartedFact extends FactBase {
-  readonly kind: "flow.started";
-  readonly flowId: string;
-  readonly input: Json;
-  readonly flowHash?: string;
-  readonly codeVersion?: string;
-  readonly parent?: ParentLink;
-}
-
-export interface FlowRefUpdatedFact {
-  readonly kind: "flow_ref.updated";
-  readonly flowId: string;
-  readonly from: string | null;
-  readonly to: string;
-  readonly at: Date;
-}
-
-export type GlobalFact = FlowRefUpdatedFact;
-
-export interface FlowCompletedFact extends FactBase {
-  readonly kind: "flow.completed";
-  readonly output: Json;
-}
-
-export interface FlowFailedFact extends FactBase {
-  readonly kind: "flow.failed";
-  readonly error: SerializedError;
-}
-
-export interface FlowCanceledByConcurrencyFact extends FactBase {
-  readonly kind: "flow.canceled";
-  readonly cause: "concurrency";
-  readonly canceledByRunId: RunId;
-  readonly concurrencyKey: string;
-}
-
-export interface FlowCanceledExplicitlyFact extends FactBase {
-  readonly kind: "flow.canceled";
-  readonly cause: "explicit";
-  readonly reason: string;
-  readonly note?: string;
-}
-
-export interface FlowCanceledByOperatorFact extends FactBase {
-  readonly kind: "flow.canceled";
-  readonly cause: "operator";
-  readonly actor: string;
-  readonly reason: string;
-  readonly note?: string;
-}
-
-export type FlowCanceledFact =
-  | FlowCanceledByConcurrencyFact
-  | FlowCanceledExplicitlyFact
-  | FlowCanceledByOperatorFact;
-
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
-  ? Omit<T, K>
-  : never;
-
-// Derived from the fact types so cancel intent can't drift from the recorded
-// fact. Concurrency cancellation is system-internal and intentionally excluded.
-export type CancelArgs = DistributiveOmit<
-  FlowCanceledExplicitlyFact | FlowCanceledByOperatorFact,
-  "kind" | "runId" | "at"
->;
-
-export interface StepStartedFact extends FactBase {
-  readonly kind: "step.started";
-  readonly stepId: StepId;
-  readonly attempt: AttemptNumber;
-  // Lets the projection fold a started step without the flow def.
-  readonly stepKind: StepKind;
-}
-
-export interface StepCompletedFact extends FactBase {
-  readonly kind: "step.completed";
-  readonly stepId: StepId;
-  readonly attempt: AttemptNumber;
-  readonly output: Json;
-}
-
-export interface StepFailedFact extends FactBase {
-  readonly kind: "step.failed";
-  readonly stepId: StepId;
-  readonly attempt: AttemptNumber;
-  readonly error: SerializedError;
-}
-
-export interface StepCanceledFact extends FactBase {
-  readonly kind: "step.canceled";
-  readonly stepId: StepId;
-  readonly attempt: AttemptNumber;
-  readonly error?: SerializedError;
-}
-
-export interface StepRetriedFact extends FactBase {
-  readonly kind: "step.retried";
-  readonly stepId: StepId;
-  readonly attempt: AttemptNumber;
-  readonly nextAttemptAt: Date;
-  readonly error: SerializedError;
-}
-
-export interface StepSkippedFact extends FactBase {
-  readonly kind: "step.skipped";
-  readonly stepId: StepId;
-  readonly reason: "when-false" | "transitive" | "manual";
-  readonly actor?: string;
-  readonly note?: string;
-}
-
-export interface SignalSentFact extends FactBase {
-  readonly kind: "signal.sent";
-  readonly stepId: StepId;
-  readonly payload: Json;
-}
-
-export interface SignalReceivedFact extends FactBase {
-  readonly kind: "signal.received";
-  readonly stepId: StepId;
-  readonly payload: Json;
-  readonly signalName?: string;
-}
-
-// A signal that arrived before its target step entered awaitingSignal (the
-// start/await race). Parked in the fact log and applied the moment the worker
-// claims the step. See Store.settleSignal.
-export interface SignalBufferedFact extends FactBase {
-  readonly kind: "signal.buffered";
-  readonly stepId: StepId;
-  readonly payload: Json;
-  readonly signalName?: string;
-}
-
-export interface OnceRecordedFact extends FactBase {
-  readonly kind: "once.recorded";
-  readonly stepId: StepId;
-  readonly scope: string;
-  readonly value: Json;
-}
-
-export interface MatchArmSelectedFact extends FactBase {
-  readonly kind: "match.arm-selected";
-  readonly stepId: StepId;
-  readonly arm: string;
-}
-
-// Written by the lease reaper when an expired lease on a non-terminal step is
-// reclaimed. Audit hook: surfaces the otherwise-invisible "worker died, lease
-// timed out, step re-dispatched" event that is the load-bearing crash recovery
-// path. attempt is the lease's original attempt; the new dispatch carries
-// attempt+1.
-export interface LeaseReapedFact extends FactBase {
-  readonly kind: "lease.reaped";
-  readonly stepId: StepId;
-  readonly attempt: AttemptNumber;
-  readonly reapedAt: Date;
-  readonly reason: "expired";
-}
-
-export interface StepResetFact extends FactBase {
-  readonly kind: "step.reset";
-  readonly stepId: StepId;
-  readonly cascadedFrom?: StepId;
-  readonly actor?: string;
-  readonly note?: string;
-}
-
-export interface StepAbortRequestedFact extends FactBase {
-  readonly kind: "step.abort-requested";
-  readonly stepId: StepId;
-  readonly attempt: AttemptNumber;
-  readonly actor: string;
-  readonly note?: string;
-}
-
-export type Fact =
-  | FlowStartedFact
-  | FlowCompletedFact
-  | FlowFailedFact
-  | FlowCanceledFact
-  | StepStartedFact
-  | StepCompletedFact
-  | StepFailedFact
-  | StepCanceledFact
-  | StepRetriedFact
-  | StepSkippedFact
-  | StepResetFact
-  | StepAbortRequestedFact
-  | SignalSentFact
-  | SignalReceivedFact
-  | SignalBufferedFact
-  | OnceRecordedFact
-  | MatchArmSelectedFact
-  | LeaseReapedFact;
 
 export type RunStatus =
   | "pending"

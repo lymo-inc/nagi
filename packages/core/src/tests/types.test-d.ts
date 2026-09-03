@@ -301,7 +301,6 @@ describe("Fact discriminated union", () => {
       case "step.skipped":
         expectTypeOf(factEx.stepId).toBeString();
         break;
-      case "signal.sent":
       case "signal.received":
         expectTypeOf(factEx.payload).toEqualTypeOf<Json>();
         break;

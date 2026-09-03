@@ -4,7 +4,6 @@ import type {
   FlowHooks,
   FlowStartEvent,
   SignalReceivedEvent,
-  SignalSentEvent,
   StepCompleteEvent,
   StepErrorEvent,
   StepRetryEvent,
@@ -20,7 +19,6 @@ export function composeHooks(...hooks: readonly FlowHooks[]): FlowHooks {
     onStepComplete?: (event: StepCompleteEvent) => Promise<void>;
     onStepError?: (event: StepErrorEvent) => Promise<void>;
     onStepRetry?: (event: StepRetryEvent) => Promise<void>;
-    onSignalSent?: (event: SignalSentEvent) => Promise<void>;
     onSignalReceived?: (event: SignalReceivedEvent) => Promise<void>;
   } = {};
 
@@ -44,9 +42,6 @@ export function composeHooks(...hooks: readonly FlowHooks[]): FlowHooks {
 
   const sr = pick(hooks, "onStepRetry");
   if (sr.length > 0) result.onStepRetry = fanout("onStepRetry", sr);
-
-  const sigS = pick(hooks, "onSignalSent");
-  if (sigS.length > 0) result.onSignalSent = fanout("onSignalSent", sigS);
 
   const sigR = pick(hooks, "onSignalReceived");
   if (sigR.length > 0)
