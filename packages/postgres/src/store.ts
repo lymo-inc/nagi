@@ -471,7 +471,7 @@ class PostgresStore<DB = unknown> implements Store {
       // Bind to the same tx so the delete + fact insert + queue enqueue all
       // commit atomically; a tx rollback (e.g. on enqueue error) leaves the
       // lease intact for the next sweep, never a half-reaped state.
-      const txQueue = bindQueueToTx(queue, trx);
+      const txQueue = queue.withTx?.(trx as unknown as Tx) ?? queue;
       const reaped: ReapedLease[] = [];
 
       for (const row of rows.rows) {
@@ -1303,16 +1303,4 @@ function isUniqueViolation(err: unknown): boolean {
     if (typeof c === "string" && c === "23505") return true;
   }
   return false;
-}
-
-// Adapters that expose `withTx` (pgmq) join the supplied tx so enqueue commits
-// atomically with the surrounding lease delete + fact insert. Plain queues
-// (in-memory) ignore the tx — there is no atomicity to inherit anyway.
-interface QueueWithTx extends Queue {
-  withTx(tx: Tx): Queue;
-}
-function bindQueueToTx(queue: Queue, tx: unknown): Queue {
-  const q = queue as Partial<QueueWithTx>;
-  if (typeof q.withTx === "function") return q.withTx(tx as Tx);
-  return queue;
 }

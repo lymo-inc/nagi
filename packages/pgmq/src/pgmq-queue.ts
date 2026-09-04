@@ -23,6 +23,7 @@ export interface PgmqQueueOpts<DB = unknown> {
   readonly archiveOnAck?: boolean;
 }
 
+// Narrows the optional core capabilities to required: pgmq always provides both.
 export interface PgmqQueue extends Queue {
   ensureSchema(): Promise<void>;
   withTx(tx: Tx): Queue;

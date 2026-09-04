@@ -35,7 +35,6 @@ export {
   InMemoryClock,
   InMemoryQueue,
   InMemoryStore,
-  InMemoryTrigger,
   projectRunState,
 } from "./memory";
 export { RunId } from "./run-id";
@@ -200,7 +199,6 @@ export type {
   SubflowStepOutput,
   TaskConfig,
   TimedOutSignal,
-  Trigger,
   Tx,
   Worker,
   WorkerConfig,
