@@ -1,4 +1,5 @@
 import {
+  type AttemptNumber,
   flow,
   InMemoryClock,
   InMemoryQueue,
@@ -755,7 +756,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(children.length).toBe(1);
     }, 20_000);
 
-    it("re-spawning a subflow step re-attaches via PG (idempotent, no self-supersede)", async () => {
+    it("re-delivering a subflow step re-attaches via PG (idempotent, no self-supersede)", async () => {
       // Child has cancel-in-progress on a fixed key: if a re-delivery minted a
       // second child with a different id, the real SQL tryStartRun would cancel
       // the first. Deterministic ids make the existence check fire first, so the
@@ -774,53 +775,38 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       const parent = flow({
         id: "pg-idem-parent",
         input: passthroughSchema<Record<string, never>>(),
-        build: (b) => ({ noop: b.task({ run: async () => ({ ok: true }) }) }),
+        build: (b) => ({
+          sub: b.subflow(child, { input: () => ({ x: 5 }) }),
+        }),
       });
 
-      const wf = await makeNagi(parent, child);
+      const queue = new InMemoryQueue();
+      const wf = await nagi({
+        store: postgresStore({ db, schema }),
+        queue,
+        clock: new InMemoryClock(),
+        flows: [parent, child],
+      });
       const parentRunId = await wf.start(parent, {});
-      await runToEnd(wf, parentRunId);
-
-      const startChildRun = (
-        wf as unknown as {
-          __dispatchDeps: {
-            startChildRun: (a: {
-              readonly child: typeof child;
-              readonly childInput: unknown;
-              readonly parent: {
-                runId: RunId;
-                stepId: string;
-                attempt: number;
-              };
-              readonly generation: number;
-            }) => Promise<RunId>;
-          };
-        }
-      ).__dispatchDeps.startChildRun;
-
-      const parentRef = { runId: parentRunId, stepId: "sub", attempt: 1 };
-      const first = await startChildRun({
-        child,
-        childInput: { x: 5 },
-        parent: parentRef,
-        generation: 0,
+      // At-least-once: the spawn message arrives a second time at a higher
+      // attempt (what a lease-reap enqueues) but the SAME generation, so it
+      // must re-attach. Queued ahead of the child's own work so the
+      // re-dispatch meets an in-flight child; concurrency 1 keeps that order.
+      await queue.enqueue(parentRunId, "sub", {
+        attempt: 2 as AttemptNumber,
+        flowId: parent.id,
       });
-      // A lease-reap re-dispatch is a higher attempt but the SAME generation, so
-      // it must re-attach — not mint a second child that self-supersedes.
-      const second = await startChildRun({
-        child,
-        childInput: { x: 5 },
-        parent: { ...parentRef, attempt: 2 },
-        generation: 0,
-      });
-      expect(second).toBe(first);
+      await wf
+        .worker({ concurrency: 1, timerSweepIntervalMs: 0 })
+        .runUntilEmpty();
 
       const rows = await sql<{ run_id: string; status: string }>`
         SELECT run_id, status FROM ${sql.raw(`${schema}.workflow_run`)}
          WHERE parent_run_id = ${parentRunId}
       `.execute(db);
       expect(rows.rows.length).toBe(1);
-      expect(rows.rows[0]?.status).not.toBe("canceled");
+      expect(rows.rows[0]?.status).toBe("completed");
+      expect(await loadStatus(db, schema, parentRunId)).toBe("completed");
     }, 20_000);
 
     it("sweepLeases skips a subflow step while its child is active, reaps once terminal (child_active SQL)", async () => {

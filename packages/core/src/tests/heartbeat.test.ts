@@ -4,24 +4,14 @@ import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
 import { isTerminalRun } from "../state";
 import { startHeartbeat } from "../step-exec";
-import type { Queue, RunId, Store } from "../types";
-import { passthroughSchema } from "./test-helpers";
-
-function makeStore(extendLease = vi.fn().mockResolvedValue(undefined)): {
-  store: Store;
-  extendLease: ReturnType<typeof vi.fn>;
-} {
-  const store = { extendLease } as unknown as Store;
-  return { store, extendLease };
-}
+import type { RunId } from "../types";
+import { leasePorts, passthroughSchema } from "./test-helpers";
 
 describe("startHeartbeat", () => {
   it("extends the lease every interval until stopped", async () => {
     vi.useFakeTimers();
     try {
-      const extend = vi.fn().mockResolvedValue(undefined);
-      const queue = { extend } as unknown as Queue;
-      const { store, extendLease } = makeStore();
+      const { queue, store, extend, extendLease } = leasePorts();
       const emitLog = vi.fn();
 
       const hb = startHeartbeat({
@@ -54,10 +44,7 @@ describe("startHeartbeat", () => {
   it("warns on each holdWarnMs crossing while a step holds its slot (lease-hold watchdog)", async () => {
     vi.useFakeTimers();
     try {
-      const queue = {
-        extend: vi.fn().mockResolvedValue(undefined),
-      } as unknown as Queue;
-      const { store } = makeStore();
+      const { queue, store } = leasePorts();
       const emitLog = vi.fn();
 
       const hb = startHeartbeat({
@@ -104,12 +91,8 @@ describe("startHeartbeat", () => {
   it("keeps beating and logs a warning when an extension fails", async () => {
     vi.useFakeTimers();
     try {
-      const extend = vi
-        .fn()
-        .mockRejectedValueOnce(new Error("boom"))
-        .mockResolvedValue(undefined);
-      const queue = { extend } as unknown as Queue;
-      const { store } = makeStore();
+      const { queue, store, extend } = leasePorts();
+      extend.mockRejectedValueOnce(new Error("boom"));
       const emitLog = vi.fn();
 
       const hb = startHeartbeat({
@@ -140,13 +123,8 @@ describe("startHeartbeat", () => {
   it("logs a warning but keeps beating when store.extendLease fails", async () => {
     vi.useFakeTimers();
     try {
-      const extend = vi.fn().mockResolvedValue(undefined);
-      const queue = { extend } as unknown as Queue;
-      const extendLease = vi
-        .fn()
-        .mockRejectedValueOnce(new Error("store boom"))
-        .mockResolvedValue(undefined);
-      const { store } = makeStore(extendLease);
+      const { queue, store, extendLease } = leasePorts();
+      extendLease.mockRejectedValueOnce(new Error("store boom"));
       const emitLog = vi.fn();
 
       const hb = startHeartbeat({

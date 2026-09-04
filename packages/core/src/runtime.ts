@@ -775,12 +775,6 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       });
     },
   };
-  Object.defineProperty(wf, "__dispatchDeps", {
-    value: dispatchDeps,
-    enumerable: false,
-    writable: false,
-    configurable: false,
-  });
   // Trust boundary: persisted flow_id values were registered flow ids at write
   // time, so assert the erased string back to the registered union here.
   return wf as unknown as Wf<TFlows>;

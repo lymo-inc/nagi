@@ -211,7 +211,6 @@ describe("wf.operator().retry()", () => {
       }),
     });
     const h = await makeHarness(f);
-    (h.deps as { cancelPollIntervalMs?: number }).cancelPollIntervalMs = 20;
     const runId = await h.wf.start(f, {});
     const worker = h.startWorker({ pollIntervalMs: 5 });
     try {
