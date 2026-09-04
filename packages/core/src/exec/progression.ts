@@ -1,5 +1,6 @@
 import type { DispatchDeps, SubflowChildOutcome } from "../dispatch";
 import { Facts } from "../facts";
+import { requireCurrent } from "../flows";
 import {
   type MatchPromotion,
   nextTransition,
@@ -93,7 +94,7 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
 
   async function advance(runId: RunId): Promise<void> {
     const { store, queue } = deps;
-    const flow = await deps.flowFor(runId);
+    const flow = requireCurrent(await deps.resolveFlow(runId));
 
     for (let iter = 0; iter < MAX_ADVANCE_ITERS; iter++) {
       const runState = await store.loadRunState(runId);
@@ -280,7 +281,7 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
     }
     const attempt = parentStep.attempt;
 
-    const parentFlow = await deps.flowFor(parentRunId);
+    const parentFlow = requireCurrent(await deps.resolveFlow(parentRunId));
 
     await markStepSettled({
       flow: parentFlow,

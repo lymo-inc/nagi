@@ -6,7 +6,7 @@ import {
 } from "./errors";
 import type { Hooks } from "./exec/hooks";
 import { Facts } from "./facts";
-import type { FlowRegistry } from "./flow-registry";
+import type { FlowRegistry } from "./flows";
 import {
   asStepMapWithDefs,
   compact,
@@ -180,7 +180,7 @@ export function makeSignals(deps: SignalsDeps): {
     payload: unknown,
   ): Promise<void> {
     const runState = await store.loadRunState(runId);
-    const flow = registry.requireForRun(runState.flowId, runId);
+    const flow = registry.require(runState.flowId);
     const resolved = resolveSignalStep(flow, signalName);
     if (resolved === null) {
       throw new NagiRuntimeError(

@@ -1,4 +1,3 @@
-import type { CanonicalDag } from "./canonicalize";
 import { type DispatchDeps, type Dispatcher, makeDispatcher } from "./dispatch";
 import {
   NagiRuntimeError,
@@ -6,27 +5,32 @@ import {
   validationError,
 } from "./errors";
 import { Facts } from "./facts";
-import type { FlowRegistry } from "./flow-registry";
-import { synthesizeReplayFlow } from "./replay-synth";
+import type { FlowRegistry } from "./flows";
 import { descendantsOf } from "./scheduler";
 import type { Flow, Queue, ReplayOpts, RunId } from "./types";
 
 export interface ReplayDeps extends DispatchDeps {
   readonly registry: FlowRegistry;
-  readonly hashFor: (flowId: string) => string | undefined;
 }
 
 export function makeReplay(deps: ReplayDeps): {
   replay(runId: RunId, opts?: ReplayOpts): Promise<void>;
 } {
-  const { registry, hashFor, store, queue, clock } = deps;
+  const { registry, store, queue, clock } = deps;
 
   async function replay(
     runId: RunId,
     opts: ReplayOpts = { mode: "continue" },
   ): Promise<void> {
     const runState = await store.loadRunState(runId);
-    const liveFlow = registry.requireForRun(runState.flowId, runId);
+    const resolution = registry.resolve(runState);
+    const liveFlow =
+      resolution.kind === "current" ? resolution.flow : resolution.live;
+    if (liveFlow === undefined) {
+      throw new NagiRuntimeError(
+        `Run ${runId} references flow "${runState.flowId}" which is not registered with nagi().`,
+      );
+    }
     if (runState.phase.tag === "canceled") {
       throw new NagiRuntimeError(
         `Run ${runId} was canceled (superseded by a newer run with the same concurrency key). ` +
@@ -42,31 +46,20 @@ export function makeReplay(deps: ReplayDeps): {
 
     let replayDeps = baseDeps;
     let effectiveFlow: Flow = liveFlow;
-    const pinned = runState.flowHash;
-    if (pinned !== undefined) {
-      const liveHash = hashFor(liveFlow.id);
-      if (liveHash !== undefined && liveHash !== pinned) {
-        if (!opts.allowDrift) {
-          throw new NagiSnapshotDriftError({
-            runId,
-            expected: pinned,
-            actual: liveHash,
-          });
-        }
-        const snapshot = await store.loadSnapshot(pinned);
-        if (snapshot === null) {
-          throw new NagiRuntimeError(
-            `Run ${runId} pinned to flow hash ${pinned.slice(0, 12)}… but ` +
-              `no snapshot with that hash was found. Cannot replay with allowDrift.`,
-          );
-        }
-        const synthesized = synthesizeReplayFlow(
-          snapshot.dag as unknown as CanonicalDag,
-          liveFlow,
-        );
-        replayDeps = { ...baseDeps, flowFor: async () => synthesized };
-        effectiveFlow = synthesized;
+    if (resolution.kind !== "current") {
+      if (!opts.allowDrift) {
+        throw new NagiSnapshotDriftError({
+          runId,
+          expected: resolution.error.pinnedHash,
+          actual: registry.hashOf(liveFlow.id),
+        });
       }
+      const synthesized = await registry.synthesize(resolution);
+      replayDeps = {
+        ...baseDeps,
+        resolveFlow: async () => ({ kind: "current", flow: synthesized }),
+      };
+      effectiveFlow = synthesized;
     }
 
     if (opts.from !== undefined) {
@@ -109,6 +102,9 @@ async function drainInline(
   for (let i = 0; i < MAX_REPLAY_DISPATCHES; i++) {
     const messages = await queue.dequeue({ count: 1 });
     if (messages.length === 0) return;
-    for (const msg of messages) await dispatcher.dispatchMessage(msg);
+    for (const msg of messages) {
+      const result = await dispatcher.dispatchMessage(msg);
+      if (result.kind === "snapshot-gone") throw result.error;
+    }
   }
 }

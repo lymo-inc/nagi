@@ -1,5 +1,5 @@
-import type { DispatchDeps } from "../dispatch";
-import { NagiFlowSnapshotGoneError, serializeError } from "../errors";
+import type { DispatchDeps, DispatchResult } from "../dispatch";
+import { serializeError } from "../errors";
 import { Facts } from "../facts";
 import {
   asStepMapWithDefs,
@@ -54,7 +54,7 @@ interface ExecuteTaskResult {
 }
 
 export interface MessageHandler {
-  dispatchMessage(message: QueueMessage): Promise<void>;
+  dispatchMessage(message: QueueMessage): Promise<DispatchResult>;
 }
 
 // Replay generation for a subflow step: the count of step.reset facts for it.
@@ -77,30 +77,30 @@ export function makeMessage(
   const { fireHook, fireStepLifecycle } = hooks;
   const { advance } = progression;
 
-  async function dispatchMessage(message: QueueMessage): Promise<void> {
+  async function dispatchMessage(
+    message: QueueMessage,
+  ): Promise<DispatchResult> {
     const { queue } = deps;
+    const resolution = await deps.resolveFlow(message.runId);
     let flow: Flow;
-    try {
-      flow = await deps.flowFor(message.runId);
-    } catch (err) {
-      // A terminal run's message must not outlive it: without this, a run
-      // canceled AFTER its flow snapshot went gone (deploy replaced the flow
-      // mid-flight) would nack-loop forever, because the hash check fires
-      // before admit()'s canceled-phase check ever runs.
-      if (
-        err instanceof NagiFlowSnapshotGoneError &&
-        isTerminalRun(await deps.store.loadRunState(message.runId))
-      ) {
+    switch (resolution.kind) {
+      case "current":
+        flow = resolution.flow;
+        break;
+      // A terminal run's message must not outlive it: a run canceled AFTER
+      // its snapshot went gone would otherwise nack-loop forever, since the
+      // hash check fires before admit()'s canceled-phase check ever runs.
+      case "gone-terminal":
         await queue.ack(message.receipt);
-        return;
-      }
-      throw err;
+        return { kind: "done" };
+      case "gone-live":
+        return { kind: "snapshot-gone", error: resolution.error };
     }
 
     const admission = await admit({ flow, message });
     if (admission.tag === "skip") {
       await queue.ack(message.receipt);
-      return;
+      return { kind: "done" };
     }
     const { def, state } = admission;
 
@@ -133,6 +133,7 @@ export function makeMessage(
 
     await queue.ack(message.receipt);
     await interpret({ flow, message, def, startedAt, outcome });
+    return { kind: "done" };
   }
 
   async function admit(args: {
