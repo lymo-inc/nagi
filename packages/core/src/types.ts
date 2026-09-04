@@ -542,7 +542,15 @@ export interface TimedOutSignal {
   readonly fireAt: Date;
 }
 
+// Every MUST below is a case in `storeContract` (@nagi-js/core/testing); run it
+// against any new adapter. Decisions an adapter must not re-make are core pure
+// functions: decideSignal / decideTimeout / decideExpiredLeaseAction,
+// factEffects, the queryRuns cursor codec, selectExpired, selectPruneBatch.
 export interface Store {
+  // Persist a fact and apply factEffects (the leases / timers / concurrency
+  // slot it releases). Terminal step facts arrive through runStep / settleStep
+  // / settleSignal / sweepSignalTimeouts, which MUST apply the same table
+  // inside their own tx.
   appendFact(runId: RunId, fact: Fact): Promise<void>;
   loadRunState(runId: RunId): Promise<RunState>;
 
@@ -622,11 +630,12 @@ export interface Store {
   ): Promise<void>;
 
   // Periodic lease-reaper sweep. The adapter SELECTs expired leases (with row
-  // locking against concurrent reapers), feeds each through
-  // decideExpiredLeaseAction, and on "reap" atomically deletes the lease,
-  // writes a lease.reaped fact, and re-enqueues at attempt+1 via the supplied
-  // queue — all inside one tx so a crash mid-sweep leaves no half-reaped state.
-  // Returns the lease identifiers that actually re-dispatched.
+  // locking against concurrent reapers) — MUST filter on expiry BEFORE
+  // applying `limit` (selectExpired), so a live lease never occupies a slot —
+  // feeds each through decideExpiredLeaseAction, and on "reap" atomically
+  // deletes the lease, writes a lease.reaped fact, and re-enqueues at
+  // attempt+1 via the supplied queue — all inside one tx so a crash mid-sweep
+  // leaves no half-reaped state. Returns the leases that re-dispatched.
   sweepLeases(args: {
     readonly now: Date;
     readonly queue: Queue;
@@ -661,6 +670,8 @@ export interface Store {
     fact: StepCompletedFact | StepFailedFact,
   ): Promise<void>;
 
+  // MUST be first-write-wins per (runId, stepId, scope); a later value is
+  // ignored, never overwritten.
   recordOnce(
     runId: RunId,
     stepId: StepId,
@@ -699,18 +710,23 @@ export interface Store {
 
   appendGlobalFact(fact: GlobalFact): Promise<void>;
 
-  // MUST order by (startedAt DESC, runId DESC) for stable cursor pagination,
-  // and treat opts.where.input as JSONB containment (Postgres `@>` semantics).
+  // MUST order by (startedAt DESC, runId DESC) with cursors from
+  // encodeRunCursor / decodeRunCursor and limits from clampQueryLimit, and
+  // treat opts.where.input as JSONB containment (Postgres `@>`; jsonContains
+  // is the reference).
   queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult>;
 
   // MUST return null (never throw) for an unknown runId. The view reflects
-  // facts visible at call time; parent/children come from the parent_run_id
-  // column + a reverse lookup, not from a separate child registry.
+  // facts visible at call time (a run pruned with keepSummary keeps its
+  // summary and no steps); parent/children come from the parent_run_id column
+  // + a reverse lookup, not from a separate child registry.
   describe(runId: RunId): Promise<RunDescription>;
 
   listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>>;
 
-  // MUST never prune non-terminal runs; delete in batches of opts.batchSize.
+  // MUST never prune non-terminal runs. One call drains every eligible run,
+  // deleting in batches of opts.batchSize (selectPruneBatch until empty), each
+  // batch its own atomic unit.
   pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult>;
 }
 

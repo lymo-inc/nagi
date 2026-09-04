@@ -34,9 +34,14 @@ import type {
   Tx,
 } from "@nagi-js/core";
 import {
+  clampQueryLimit,
+  DEFAULT_SWEEP_LIMIT,
   decideExpiredLeaseAction,
   decideSignal,
   decideTimeout,
+  decodeRunCursor,
+  encodeRunCursor,
+  factEffects,
   NagiConcurrencyConflictError,
   projectRunState,
 } from "@nagi-js/core";
@@ -86,6 +91,7 @@ class PostgresStore<DB = unknown> implements Store {
     await this.db.transaction().execute(async (trx) => {
       await this.insertFact(trx, runId, fact);
       await this.applyFactToMaterialized(trx, runId, fact);
+      await this.applyFactEffects(trx, runId, fact);
     });
     await this.maybeNotify(runId);
   }
@@ -378,10 +384,7 @@ class PostgresStore<DB = unknown> implements Store {
               decision.completed.output,
             );
             await this.insertFact(trx, runId, decision.completed);
-            await this.deleteLease(trx, runId, stepId);
-            // Resolved by delivery; drop any armed timeout so the next sweep
-            // doesn't fold a completed step just to no-op.
-            await this.deleteTimer(trx, runId, stepId);
+            await this.applyFactEffects(trx, runId, decision.completed);
             return decision.result;
         }
       });
@@ -431,7 +434,7 @@ class PostgresStore<DB = unknown> implements Store {
     readonly queue: Queue;
     readonly limit?: number;
   }): Promise<readonly ReapedLease[]> {
-    const { now, queue, limit = 100 } = args;
+    const { now, queue, limit = DEFAULT_SWEEP_LIMIT } = args;
     return this.db.transaction().execute(async (trx) => {
       // FOR UPDATE OF l SKIP LOCKED so concurrent reapers split the batch
       // without retry; the LEFT JOIN surfaces the step status that
@@ -544,7 +547,7 @@ class PostgresStore<DB = unknown> implements Store {
     readonly now: Date;
     readonly limit?: number;
   }): Promise<readonly TimedOutSignal[]> {
-    const { now, limit = 100 } = args;
+    const { now, limit = DEFAULT_SWEEP_LIMIT } = args;
 
     // Read due timers WITHOUT a row lock, then resolve each in its OWN
     // transaction under one per-run advisory lock — exactly settleSignal's
@@ -599,9 +602,7 @@ class PostgresStore<DB = unknown> implements Store {
           decision.fact.error,
         );
         await this.insertFact(trx, runId, decision.fact);
-        // Drop the parked step's stale lease in the same tx, as every other
-        // terminal step settlement (settleSignal/settleStep) does.
-        await this.deleteLease(trx, runId, stepId);
+        await this.applyFactEffects(trx, runId, decision.fact);
         return decision.attempt;
       });
 
@@ -636,7 +637,7 @@ class PostgresStore<DB = unknown> implements Store {
         );
       }
       await this.insertFact(trx, runId, fact);
-      await this.deleteLease(trx, runId, stepId);
+      await this.applyFactEffects(trx, runId, fact);
     });
     await this.maybeNotify(runId);
   }
@@ -704,7 +705,7 @@ class PostgresStore<DB = unknown> implements Store {
         );
       }
       await this.insertFact(trx, runId, result.fact);
-      await this.deleteLease(trx, runId, stepId);
+      await this.applyFactEffects(trx, runId, result.fact);
       return result.output;
     });
 
@@ -784,8 +785,6 @@ class PostgresStore<DB = unknown> implements Store {
           DELETE FROM ${sql.raw(this.t("step_run"))}
            WHERE run_id = ${runId} AND step_id = ${fact.stepId}
         `.execute(trx);
-        await this.deleteLease(trx, runId, fact.stepId);
-        await this.deleteTimer(trx, runId, fact.stepId);
         return;
       case "once.recorded":
         await sql`
@@ -802,7 +801,6 @@ class PostgresStore<DB = unknown> implements Store {
           fact.attempt,
           fact.error,
         );
-        await this.deleteLease(trx, runId, fact.stepId);
         return;
       case "step.completed":
       case "step.failed":
@@ -892,6 +890,20 @@ class PostgresStore<DB = unknown> implements Store {
     `.execute(trx);
   }
 
+  // The adapter's whole share of the release table: lease / timer rows. The
+  // concurrency slot needs no write — the partial unique index keys on status,
+  // which the materializer already set.
+  private async applyFactEffects(
+    trx: Kysely<DB>,
+    runId: RunId,
+    fact: Fact,
+  ): Promise<void> {
+    const effects = factEffects(fact);
+    if (effects.tag !== "release-step") return;
+    await this.deleteLease(trx, runId, effects.stepId);
+    if (effects.timer) await this.deleteTimer(trx, runId, effects.stepId);
+  }
+
   private async maybeNotify(runId: RunId): Promise<void> {
     if (!this.notifyChannel) return;
     await sql`SELECT pg_notify(${this.notifyChannel}, ${runId})`.execute(
@@ -952,12 +964,16 @@ class PostgresStore<DB = unknown> implements Store {
     const where = opts.where ?? {};
     const flowId = where.flowId;
     const statuses = where.status ? Array.from(where.status) : undefined;
-    const inputFilter = where.input;
+    // Typed null: an untyped `$n IS NULL` cannot be planned.
+    const inputJson =
+      where.input === undefined ? null : JSON.stringify(where.input);
 
     const isLatest = opts.latest === true;
-    const limit = isLatest ? 1 : clampLimit(opts.limit);
+    const limit = isLatest ? 1 : clampQueryLimit(opts.limit);
     const cursor =
-      !isLatest && opts.cursor !== undefined ? decodeCursor(opts.cursor) : null;
+      !isLatest && opts.cursor !== undefined
+        ? decodeRunCursor(opts.cursor)
+        : null;
 
     const fetchLimit = isLatest ? 1 : limit + 1;
 
@@ -974,12 +990,11 @@ class PostgresStore<DB = unknown> implements Store {
        WHERE (${flowId ?? null}::text IS NULL OR flow_id = ${flowId ?? null})
          AND (${statuses === undefined ? null : statuses}::text[] IS NULL
               OR status = ANY(${statuses === undefined ? null : statuses}::text[]))
-         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)} IS NULL
-              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)})
-         AND (${cursor === null ? null : new Date(cursor.t)}::timestamptz IS NULL
+         AND (${inputJson}::jsonb IS NULL OR input @> ${inputJson}::jsonb)
+         AND (${cursor === null ? null : cursor.startedAt}::timestamptz IS NULL
               OR (started_at, run_id) <
-                 (${cursor === null ? null : new Date(cursor.t)}::timestamptz,
-                  ${cursor === null ? null : cursor.r}::text))
+                 (${cursor === null ? null : cursor.startedAt}::timestamptz,
+                  ${cursor === null ? null : cursor.runId}::text))
        ORDER BY started_at DESC, run_id DESC
        LIMIT ${fetchLimit}
     `.execute(this.db);
@@ -1008,7 +1023,7 @@ class PostgresStore<DB = unknown> implements Store {
     const last = page[page.length - 1];
     const nextCursor =
       hasMore && last !== undefined
-        ? encodeCursor({ t: last.startedAt.getTime(), r: last.runId })
+        ? encodeRunCursor({ startedAt: last.startedAt, runId: last.runId })
         : null;
     return { runs: page, cursor: nextCursor };
   }
@@ -1215,55 +1230,6 @@ class PostgresStore<DB = unknown> implements Store {
     }
 
     return { runsPruned, factsPruned };
-  }
-}
-
-const DEFAULT_LIMIT = 50;
-const MAX_LIMIT = 500;
-
-function clampLimit(limit: number | undefined): number {
-  if (limit === undefined) return DEFAULT_LIMIT;
-  if (!Number.isInteger(limit) || limit < 1) return DEFAULT_LIMIT;
-  return Math.min(limit, MAX_LIMIT);
-}
-
-interface DecodedCursor {
-  readonly t: number;
-  readonly r: string;
-}
-
-function encodeCursor(c: DecodedCursor): string {
-  const bytes = new TextEncoder().encode(JSON.stringify(c));
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i] as number);
-  }
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-function decodeCursor(s: string): DecodedCursor {
-  try {
-    const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      typeof (parsed as DecodedCursor).t === "number" &&
-      typeof (parsed as DecodedCursor).r === "string"
-    ) {
-      return parsed as DecodedCursor;
-    }
-    throw new Error("malformed cursor body");
-  } catch (err) {
-    throw new Error(
-      `queryRuns: invalid cursor — ${err instanceof Error ? err.message : String(err)}`,
-    );
   }
 }
 
