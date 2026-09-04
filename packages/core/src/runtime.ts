@@ -4,12 +4,7 @@ import {
   sha256Canonical,
 } from "./canonicalize";
 import { type DispatchDeps, makeDispatcher } from "./dispatch";
-import {
-  NagiCanceledError,
-  NagiRuntimeError,
-  serializeError,
-  validationError,
-} from "./errors";
+import { NagiRuntimeError, validationError } from "./errors";
 import { makeHooks } from "./exec/hooks";
 import { Facts } from "./facts";
 import { makeFlowRegistry } from "./flow-registry";
@@ -18,29 +13,24 @@ import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
 import { InMemoryClock } from "./memory";
 import { makeOperator } from "./operator";
 import { makeReplay } from "./replay";
-import { deriveChildRunId } from "./run-id";
+import { makeRunLifecycle } from "./run-lifecycle";
 import type { RunDescription } from "./run-view";
-import { nextTransition } from "./scheduler";
 import { makeSignals } from "./signals";
-import { foldRun, isTerminalRun, runStatusOf } from "./state";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_LEASE_MS,
   DEFAULT_LEASE_HOLD_WARN_MS,
 } from "./step-exec";
 import type {
-  CancelArgs,
   Clock,
   Flow,
   FlowHooks,
   FlowIdOf,
   FlowInput,
-  FlowStartedFact,
   Json,
   LogEntry,
   Millis,
   Operator,
-  ParentRef,
   PrunableStatus,
   PruneOpts,
   PruneResult,
@@ -51,7 +41,6 @@ import type {
   ReplayOpts,
   RetryPolicy,
   RunId,
-  SerializedError,
   StepId,
   Store,
   StreamEvent,
@@ -61,7 +50,6 @@ import type {
   Worker,
   WorkerConfig,
 } from "./types";
-import { validate } from "./validate";
 import { makeWorker } from "./worker";
 
 export interface NagiConfig {
@@ -257,199 +245,10 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     return registry.get(flowId);
   }
 
-  async function startRunInternal({
-    flow,
-    validatedInput,
-    runId,
-    parent,
-  }: {
-    readonly flow: Flow;
-    readonly validatedInput: Json;
-    readonly runId: RunId;
-    readonly parent?: ParentRef;
-  }): Promise<{ readonly started: boolean }> {
-    const startedAt = clock.now();
-    const flowHash = flowHashById.get(flow.id);
-
-    const fact = Facts.flowStarted({
-      runId,
-      flowId: flow.id,
-      input: validatedInput,
-      at: startedAt,
-      codeVersion,
-      ...compact({
-        flowHash,
-        parent:
-          parent !== undefined
-            ? { runId: parent.runId, stepId: parent.stepId }
-            : undefined,
-      }),
-    });
-
-    let concurrencyArg:
-      | { readonly key: string; readonly mode: "cancel-in-progress" }
-      | undefined;
-    if (flow.concurrency !== undefined) {
-      const derived = flow.concurrency.keyFn(validatedInput);
-      if (typeof derived !== "string" || derived.length === 0) {
-        throw validationError(
-          `flow.concurrency.keyFn must return a non-empty string (got ${typeof derived === "string" ? '""' : typeof derived})`,
-          ["concurrency", "keyFn"],
-        );
-      }
-      concurrencyArg = { key: derived, mode: flow.concurrency.mode };
-    }
-
-    const { started, canceled } = await config.store.tryStartRun(
-      runId,
-      fact,
-      concurrencyArg,
-    );
-    if (!started) return { started: false };
-
-    for (const c of canceled) {
-      const cancelError = new NagiCanceledError({
-        runId: c.runId,
-        canceledByRunId: runId,
-        concurrencyKey: c.fact.concurrencyKey,
-      });
-      const serialized: SerializedError = {
-        ...serializeError(cancelError),
-        cause: {
-          canceledByRunId: runId,
-          concurrencyKey: c.fact.concurrencyKey,
-        },
-      };
-      const errorEvent = {
-        runId: c.runId,
-        flowId: flow.id,
-        error: serialized,
-        at: c.fact.at,
-      };
-      await hooks.fireHook(flow.onError, errorEvent, "flow.onError");
-      await hooks.fireHook(
-        config.hooks?.onFlowError,
-        errorEvent,
-        "onFlowError",
-      );
-      await dispatcher.propagateToParent(c.runId, {
-        kind: "canceled",
-        error: serialized,
-      });
-    }
-
-    const startEvent =
-      parent !== undefined
-        ? {
-            runId,
-            flowId: flow.id,
-            input: validatedInput,
-            at: startedAt,
-            parent,
-          }
-        : {
-            runId,
-            flowId: flow.id,
-            input: validatedInput,
-            at: startedAt,
-          };
-    await hooks.fireHook(flow.onStart, startEvent, "flow.onStart");
-    await hooks.fireHook(config.hooks?.onFlowStart, startEvent, "onFlowStart");
-
-    await dispatcher.advance(runId);
-    return { started: true };
-  }
-
-  async function startChildRun(args: {
-    readonly child: Flow;
-    readonly childInput: unknown;
-    readonly parent: ParentRef;
-    readonly generation: number;
-  }): Promise<RunId> {
-    const { child, childInput, parent, generation } = args;
-    if (!registry.has(child.id)) {
-      throw new NagiRuntimeError(
-        `Subflow child "${child.id}" not registered with nagi(). Pass it to flows[].`,
-      );
-    }
-    const validated = (await validate(child.input, childInput)) as Json;
-    // Deterministic per (parentRunId, stepId, generation) — INVARIANT under
-    // attempt — so any at-least-once re-dispatch of this subflow step (redelivery,
-    // lease-reap at attempt+1, durable child-wake) re-attaches to the existing
-    // child instead of spawning a duplicate that cancel-in-progress would then
-    // self-supersede (failing the parent). A replay (new generation) gets a
-    // fresh child. See deriveChildRunId.
-    const childRunId = await deriveChildRunId({
-      runId: parent.runId,
-      stepId: parent.stepId,
-      generation,
-    });
-    // started === false ⇒ this (parentRunId, stepId, generation) already spawned
-    // the child on a prior dispatch. tryStartRun checks run existence before its
-    // concurrency-cancel pass, so re-attaching cancels nothing and leaves the
-    // original child (and its parent link) intact. Idempotent.
-    await startRunInternal({
-      flow: child,
-      validatedInput: validated,
-      runId: childRunId,
-      parent,
-    });
-    return childRunId;
-  }
-
-  async function cancelRunRecursive(
-    runId: RunId,
-    args: CancelArgs,
-  ): Promise<void> {
-    const state = await config.store.loadRunState(runId);
-    if (isTerminalRun(state)) {
-      emitLog({
-        level: "info",
-        msg: "nagi: cancel skipped — run already terminal",
-        attrs: { runId, status: runStatusOf(state) },
-      });
-      return;
-    }
-    const flow = registry.get(state.flowId);
-    const canceledFact = Facts.flowCanceled(runId, args, clock.now());
-    await config.store.appendFact(runId, canceledFact);
-    const cancelError: SerializedError = {
-      name: "NagiCanceledError",
-      message: `Run ${runId} was canceled: ${args.reason}`,
-    };
-    if (flow !== undefined) {
-      const event = {
-        runId,
-        flowId: flow.id,
-        error: cancelError,
-        at: clock.now(),
-      };
-      await hooks.fireHook(flow.onError, event, "flow.onError");
-      await hooks.fireHook(config.hooks?.onFlowError, event, "onFlowError");
-    }
-
-    const children = await config.store.listChildren(runId);
-    for (const childId of children) {
-      await cancelRunRecursive(childId, {
-        cause: "explicit",
-        reason: `parent ${runId} canceled: ${args.reason}`,
-        note:
-          args.cause === "operator"
-            ? `cascade from operator ${args.actor} aborting parent ${runId}`
-            : `cascade from parent ${runId}`,
-      });
-    }
-
-    await dispatcher.propagateToParent(runId, {
-      kind: "canceled",
-      error: cancelError,
-    });
-  }
-
   const dispatchDeps: DispatchDeps = {
     flowFor,
     lookupFlow,
-    startChildRun,
+    startChildRun: (args) => lifecycle.startChildRun(args),
     store: config.store,
     queue: config.queue,
     clock,
@@ -471,6 +270,19 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   // Runtime fires flow-level hooks directly (concurrency-cancel on start, and
   // cancelRunRecursive) — outside the dispatch path, so it owns its own Hooks.
   const hooks = makeHooks(dispatchDeps);
+  const lifecycle = makeRunLifecycle({
+    store: config.store,
+    queue: config.queue,
+    clock,
+    registry,
+    codeVersion,
+    hashFor: (id) => flowHashById.get(id),
+    queueForTx: (tx) => bindQueueToTx(config.queue, tx),
+    hooks,
+    flowHooks: config.hooks,
+    dispatcher,
+    emitLog,
+  });
 
   const signals = makeSignals({
     dispatcher,
@@ -501,22 +313,14 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       input: unknown,
       opts?: StartOpts,
     ): Promise<RunId> {
-      const flow = registry.require(flowId);
-
-      let runId: RunId;
-      if (opts?.runId !== undefined) {
-        if (typeof opts.runId !== "string" || opts.runId.length === 0) {
-          throw validationError("opts.runId must be a non-empty string", [
-            "runId",
-          ]);
-        }
-        runId = opts.runId;
-      } else {
-        runId = mintRunId();
-      }
-
-      const validated = (await validate(flow.input, input)) as Json;
-      await startRunInternal({ flow, validatedInput: validated, runId });
+      const { runId, staged } = await lifecycle.start({
+        flowId,
+        input,
+        runId: opts?.runId,
+        boundary: { kind: "own" },
+      });
+      if (staged.kind === "started")
+        await lifecycle.applyEffects(staged.effects);
       return runId;
     },
 
@@ -539,131 +343,29 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
           ["tx"],
         );
       }
-      const flow = registry.require(flowId);
-
-      let runId: RunId;
-      if (opts.runId !== undefined) {
-        if (typeof opts.runId !== "string" || opts.runId.length === 0) {
-          throw validationError("opts.runId must be a non-empty string", [
-            "runId",
-          ]);
-        }
-        runId = opts.runId;
-      } else {
-        runId = mintRunId();
-      }
-
-      const validated = (await validate(flow.input, input)) as Json;
-      const startedAt = clock.now();
-      const flowHash = flowHashById.get(flow.id);
-      const fact: FlowStartedFact = Facts.flowStarted({
-        runId,
-        flowId: flow.id,
-        input: validated,
-        at: startedAt,
-        codeVersion,
-        ...compact({ flowHash }),
+      const { runId, staged } = await lifecycle.start({
+        flowId,
+        input,
+        runId: opts.runId,
+        boundary: { kind: "caller", tx: opts.tx },
       });
-
-      let concurrencyArg:
-        | { readonly key: string; readonly mode: "cancel-in-progress" }
-        | undefined;
-      if (flow.concurrency !== undefined) {
-        const derived = flow.concurrency.keyFn(validated);
-        if (typeof derived !== "string" || derived.length === 0) {
-          throw validationError(
-            `flow.concurrency.keyFn must return a non-empty string (got ${typeof derived === "string" ? '""' : typeof derived})`,
-            ["concurrency", "keyFn"],
-          );
-        }
-        concurrencyArg = { key: derived, mode: flow.concurrency.mode };
+      if (staged.kind === "exists") {
+        return { runId, started: false, canceled: [], applyOnCommit: noop };
       }
-
-      const { started, canceled } = await config.store.tryStartRunOnTx(
-        opts.tx,
-        runId,
-        fact,
-        concurrencyArg,
-      );
-
-      if (started) {
-        // Pre-compute the initial transition off just the flow.started fact so
-        // the entrypoint enqueue can ride the caller's tx. The fresh run
-        // hasn't committed yet, so loadRunState would be invisible from
-        // outside this tx; folding the in-memory [fact] gives the same answer
-        // the dispatcher would have computed post-commit.
-        const seedState = foldRun(runId, [fact]);
-        const transition = nextTransition(flow, seedState);
-        if (transition.kind === "dispatch") {
-          const txQueue = bindQueueToTx(config.queue, opts.tx);
-          for (const stepId of transition.runnable) {
-            await txQueue.enqueue(runId, stepId, { flowId: flow.id });
-          }
-        }
-      }
-
-      let fired = false;
-      const applyOnCommit = async (): Promise<void> => {
-        if (fired) return;
-        fired = true;
-        if (!started) return;
-        for (const c of canceled) {
-          const cancelError = new NagiCanceledError({
-            runId: c.runId,
-            canceledByRunId: runId,
-            concurrencyKey: c.fact.concurrencyKey,
-          });
-          const serialized: SerializedError = {
-            ...serializeError(cancelError),
-            cause: {
-              canceledByRunId: runId,
-              concurrencyKey: c.fact.concurrencyKey,
-            },
-          };
-          const errorEvent = {
-            runId: c.runId,
-            flowId: flow.id,
-            error: serialized,
-            at: c.fact.at,
-          };
-          await hooks.fireHook(flow.onError, errorEvent, "flow.onError");
-          await hooks.fireHook(
-            config.hooks?.onFlowError,
-            errorEvent,
-            "onFlowError",
-          );
-          await dispatcher.propagateToParent(c.runId, {
-            kind: "canceled",
-            error: serialized,
-          });
-        }
-
-        const startEvent = {
-          runId,
-          flowId: flow.id,
-          input: validated,
-          at: startedAt,
-        };
-        await hooks.fireHook(flow.onStart, startEvent, "flow.onStart");
-        await hooks.fireHook(
-          config.hooks?.onFlowStart,
-          startEvent,
-          "onFlowStart",
-        );
-      };
-
+      let applied: Promise<void> | undefined;
       return {
         runId,
-        started,
-        canceled: canceled.map((c) => c.runId),
-        applyOnCommit,
+        started: true,
+        canceled: staged.effects.superseded.map((e) => e.runId),
+        applyOnCommit: () =>
+          (applied ??= lifecycle.applyEffects(staged.effects)),
       };
     },
 
     signal: signals.signal,
 
     async cancel(runId: RunId, opts?: CancelOpts): Promise<void> {
-      await cancelRunRecursive(runId, {
+      await lifecycle.cancelRunRecursive(runId, {
         cause: "explicit",
         reason: opts?.reason ?? "explicit wf.cancel()",
       });
@@ -675,7 +377,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         store: config.store,
         clock,
         registry,
-        cancelRunRecursive,
+        cancelRunRecursive: lifecycle.cancelRunRecursive,
         emitLog,
       });
     },
@@ -881,9 +583,7 @@ export const nagi: typeof nagiImpl & { run: typeof nagiRun } = Object.assign(
   { run: nagiRun },
 );
 
-function mintRunId(): RunId {
-  return `run-${crypto.randomUUID()}` as RunId;
-}
+async function noop(): Promise<void> {}
 
 function asStreamTransport(store: Store): StreamTransport | undefined {
   const s = store as Partial<StreamTransport>;
