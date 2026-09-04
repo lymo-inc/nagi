@@ -276,6 +276,14 @@ information hiding — at the door; that trade was accepted.)
    physically splitting `types.ts` are both deferred — higher churn, lower
    marginal value under the accepted single-door model.
 
+> **Partially reopened by #38 (2026-09-04).** The fact-log slice of `types.ts`
+> did get a physical home: `packages/core/src/facts/` owns each kind's shape,
+> constructor, fold arm, and read-model row delta, grouped by lifecycle. The
+> single-door decision (Q1) stands — `types.ts` re-exports the fact types and
+> `index.ts` remains the only entry. The driver was not door hygiene but the
+> fourth interpreter in `@nagi-js/postgres`, which now consumes `rowDeltaOf`
+> instead of re-deriving fact semantics.
+
 ## Implementation plan (Part B)
 
 1. Enumerate the current public surface: everything `export type * from "./types"`

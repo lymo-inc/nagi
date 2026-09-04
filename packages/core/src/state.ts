@@ -1,22 +1,12 @@
-import { compact } from "./internal";
 import type {
   AttemptNumber,
   Fact,
-  FlowCanceledFact,
   Json,
   ParentLink,
   RunId,
   RunStatus,
   SerializedError,
-  StepAbortRequestedFact,
-  StepCanceledFact,
-  StepCompletedFact,
-  StepFailedFact,
   StepId,
-  StepKind,
-  StepRetriedFact,
-  StepSkippedFact,
-  StepStartedFact,
   StepStatus,
 } from "./types";
 
@@ -83,13 +73,6 @@ export type RunPhase =
   | { readonly tag: "failed"; readonly error: SerializedError }
   | { readonly tag: "canceled"; readonly cause: RunCancelCause };
 
-export interface Anomaly {
-  readonly at: Date;
-  readonly stepId?: StepId;
-  readonly from: string;
-  readonly fact: Fact["kind"];
-}
-
 export interface RunState {
   readonly runId: RunId;
   readonly flowId: string;
@@ -100,7 +83,6 @@ export interface RunState {
   readonly bufferedSignals: Readonly<
     Record<StepId, { readonly payload: Json; readonly signalName?: string }>
   >;
-  readonly anomalies: readonly Anomaly[];
   // The source log this projection folded from, kept for introspection and
   // test/debug assertions; the engine reads the projection above, never this.
   readonly facts: readonly Fact[];
@@ -109,7 +91,7 @@ export interface RunState {
   readonly codeVersion?: string;
 }
 
-const PENDING: StepState = { tag: "pending" };
+export const PENDING: StepState = { tag: "pending" };
 
 export function stepStateOf(runState: RunState, stepId: StepId): StepState {
   return runState.steps[stepId] ?? PENDING;
@@ -204,232 +186,4 @@ export function isStepTerminal(s: StepState): boolean {
     s.tag === "skipped" ||
     s.tag === "canceled"
   );
-}
-
-type StepScopedFact =
-  | StepStartedFact
-  | StepCompletedFact
-  | StepFailedFact
-  | StepCanceledFact
-  | StepRetriedFact
-  | StepSkippedFact
-  | StepAbortRequestedFact;
-
-interface StepTransition {
-  readonly next: StepState;
-  readonly anomaly: boolean;
-}
-
-function keep(prev: StepState): StepTransition {
-  return { next: prev, anomaly: true };
-}
-
-function startTarget(stepKind: StepKind, attempt: AttemptNumber): StepState {
-  switch (stepKind) {
-    case "signal":
-      return { tag: "awaitingSignal", attempt };
-    case "subflow":
-      return { tag: "awaitingChild", attempt };
-    case "task":
-    case "activity":
-    case "streaming":
-    case "match":
-      return { tag: "running", attempt };
-  }
-}
-
-// Total: any pair that isn't a real transition keeps the prior state and is
-// flagged anomalous, so the fold never throws.
-function stepTransition(prev: StepState, fact: StepScopedFact): StepTransition {
-  switch (fact.kind) {
-    case "step.started":
-      if (prev.tag === "pending" || prev.tag === "backoff")
-        return {
-          next: startTarget(fact.stepKind, fact.attempt),
-          anomaly: false,
-        };
-      return keep(prev);
-
-    // Terminal facts carry authoritative outcomes, so they settle a step from
-    // any non-terminal state; only a terminal→terminal contradiction is flagged.
-    case "step.completed":
-      if (isStepTerminal(prev)) return keep(prev);
-      return {
-        next: { tag: "completed", attempt: fact.attempt, output: fact.output },
-        anomaly: false,
-      };
-
-    case "step.failed":
-      if (isStepTerminal(prev)) return keep(prev);
-      return {
-        next: { tag: "failed", attempt: fact.attempt, error: fact.error },
-        anomaly: false,
-      };
-
-    case "step.canceled": {
-      if (isStepTerminal(prev)) return keep(prev);
-      const cause: StepCancelCause =
-        prev.tag === "aborting"
-          ? { kind: "aborted", ...compact({ error: fact.error }) }
-          : { kind: "run-canceled" };
-      return { next: { tag: "canceled", cause }, anomaly: false };
-    }
-
-    case "step.retried":
-      if (prev.tag === "running")
-        return {
-          next: {
-            tag: "backoff",
-            failedAttempt: fact.attempt,
-            retryAt: fact.nextAttemptAt,
-            error: fact.error,
-          },
-          anomaly: false,
-        };
-      return keep(prev);
-
-    case "step.skipped":
-      // An operator may skip an in-flight step, not just a pending one; only a
-      // skip of an already-terminal step is anomalous.
-      if (!isStepTerminal(prev))
-        return {
-          next: {
-            tag: "skipped",
-            reason: fact.reason,
-          },
-          anomaly: false,
-        };
-      return keep(prev);
-
-    case "step.abort-requested":
-      if (
-        prev.tag === "running" ||
-        prev.tag === "awaitingSignal" ||
-        prev.tag === "awaitingChild"
-      )
-        return {
-          next: { tag: "aborting", attempt: fact.attempt },
-          anomaly: false,
-        };
-      return keep(prev);
-  }
-}
-
-function runCancelCause(fact: FlowCanceledFact): RunCancelCause {
-  switch (fact.cause) {
-    case "concurrency":
-      return {
-        kind: "concurrency",
-        canceledByRunId: fact.canceledByRunId,
-        concurrencyKey: fact.concurrencyKey,
-      };
-    case "explicit":
-      return {
-        kind: "explicit",
-        reason: fact.reason,
-        ...compact({ note: fact.note }),
-      };
-    case "operator":
-      return {
-        kind: "operator",
-        actor: fact.actor,
-        reason: fact.reason,
-        ...compact({ note: fact.note }),
-      };
-  }
-}
-
-export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
-  let flowId = "";
-  let input: Json = null;
-  let phase: RunPhase = { tag: "pending" };
-  let parent: ParentLink | undefined;
-  let flowHash: string | undefined;
-  let codeVersion: string | undefined;
-  const steps: Record<StepId, StepState> = {};
-  const selectedArms: Record<StepId, string> = {};
-  const bufferedSignals: Record<
-    StepId,
-    { readonly payload: Json; readonly signalName?: string }
-  > = {};
-  const anomalies: Anomaly[] = [];
-
-  for (const fact of facts) {
-    switch (fact.kind) {
-      case "flow.started":
-        flowId = fact.flowId;
-        input = fact.input;
-        phase = { tag: "running" };
-        parent = fact.parent;
-        flowHash = fact.flowHash;
-        codeVersion = fact.codeVersion;
-        break;
-      case "flow.completed":
-        phase = { tag: "completed", output: fact.output };
-        break;
-      case "flow.failed":
-        phase = { tag: "failed", error: fact.error };
-        break;
-      case "flow.canceled":
-        phase = { tag: "canceled", cause: runCancelCause(fact) };
-        break;
-      case "match.arm-selected":
-        selectedArms[fact.stepId] = fact.arm;
-        break;
-      case "step.reset":
-        steps[fact.stepId] = PENDING;
-        delete selectedArms[fact.stepId];
-        break;
-      case "step.started":
-      case "step.completed":
-      case "step.failed":
-      case "step.canceled":
-      case "step.retried":
-      case "step.skipped":
-      case "step.abort-requested": {
-        const prev = steps[fact.stepId] ?? PENDING;
-        const t = stepTransition(prev, fact);
-        if (t.anomaly) {
-          anomalies.push({
-            at: fact.at,
-            stepId: fact.stepId,
-            from: prev.tag,
-            fact: fact.kind,
-          });
-        }
-        steps[fact.stepId] = t.next;
-        break;
-      }
-      case "signal.buffered":
-        // First buffered signal per step wins, mirroring the happy path where
-        // the first delivered signal completes the step and later ones no-op.
-        if (!(fact.stepId in bufferedSignals)) {
-          bufferedSignals[fact.stepId] = {
-            payload: fact.payload,
-            ...compact({ signalName: fact.signalName }),
-          };
-        }
-        break;
-      case "signal.sent":
-      case "signal.received":
-      case "once.recorded":
-      case "lease.reaped":
-        // Audit-only: the reaper re-enqueues at attempt+1; the projection
-        // updates when the next attempt writes its step.started/step.failed.
-        break;
-    }
-  }
-
-  return {
-    runId,
-    flowId,
-    input,
-    phase,
-    steps,
-    selectedArms,
-    bufferedSignals,
-    anomalies,
-    facts,
-    ...compact({ parent, flowHash, codeVersion }),
-  };
 }

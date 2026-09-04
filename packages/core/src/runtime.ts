@@ -11,7 +11,7 @@ import {
   validationError,
 } from "./errors";
 import { makeHooks } from "./exec/hooks";
-import { Facts } from "./facts";
+import { Facts, foldRun } from "./facts";
 import { makeFlowRegistry } from "./flow-registry";
 import { asStepMapWithDefs, compact, getDef, makeEmit } from "./internal";
 import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
@@ -22,7 +22,7 @@ import { deriveChildRunId } from "./run-id";
 import type { RunDescription } from "./run-view";
 import { nextTransition } from "./scheduler";
 import { makeSignals } from "./signals";
-import { foldRun, isTerminalRun, runStatusOf } from "./state";
+import { isTerminalRun, runStatusOf } from "./state";
 import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_HEARTBEAT_LEASE_MS,
