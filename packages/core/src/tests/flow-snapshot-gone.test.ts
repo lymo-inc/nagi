@@ -284,7 +284,7 @@ describe("snapshot-gone poison handling", () => {
   });
 
   it("defaultSnapshotGonePolicy: quadratic backoff capped at 5min, fails past 60 deliveries", async () => {
-    const { defaultSnapshotGonePolicy } = await import("../worker");
+    const { defaultSnapshotGonePolicy } = await import("../retry");
     expect(defaultSnapshotGonePolicy(1)).toEqual({
       action: "retry",
       delayMs: 1_000,

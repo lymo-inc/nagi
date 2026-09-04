@@ -14,13 +14,13 @@ import {
   selectArm,
   type TaskDef,
 } from "../internal";
+import { resolveRetry } from "../retry";
 import { deriveChildRunId } from "../run-id";
 import { stepStateOf } from "../scheduler";
 import { isAbortRequested, isTerminalRun, resolvedOf } from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
   classifyFailure,
-  DEFAULT_RETRY,
   makeActivityCtx,
   makeStepCtx,
   resolveExecutionFact,
@@ -578,7 +578,7 @@ export function makeMessage(
     const handler = handlerDef(def);
 
     const postState = await store.loadRunState(runId);
-    const policy = handler?.retry ?? deps.defaultRetry ?? DEFAULT_RETRY;
+    const policy = resolveRetry(handler?.retry, deps.defaultRetry);
     const outcome = classifyFailure({
       attempt,
       policy,

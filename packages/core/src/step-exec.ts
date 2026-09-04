@@ -2,6 +2,7 @@ import { NagiCanceledError, NagiNonRetryableError } from "./errors";
 import { Facts } from "./facts";
 import { makeIdempotencyKey, makeOnce } from "./idempotency";
 import type { EmitLog } from "./internal";
+import { stepBackoff } from "./retry";
 import { isAbortRequested, isTerminalRun, stepStateOf } from "./state";
 import type {
   ActivityCtx,
@@ -21,13 +22,6 @@ import type {
   Store,
   Tx,
 } from "./types";
-
-export const DEFAULT_RETRY: RetryPolicy = {
-  maxAttempts: 3,
-  backoff: "exponential",
-  initialDelayMs: 1_000,
-  maxDelayMs: 60_000,
-};
 
 export const CANCEL_POLL_INTERVAL_MS = 250;
 
@@ -281,7 +275,7 @@ export function classifyFailure(args: {
     return { tag: "failed" };
   }
   if (attempt < policy.maxAttempts && retryAllows(policy, err)) {
-    return { tag: "retry", delayMs: computeBackoff(policy, attempt) };
+    return { tag: "retry", delayMs: stepBackoff(policy)(attempt) };
   }
   return { tag: "failed" };
 }
@@ -301,19 +295,6 @@ function findInCauseChain<T extends Error>(
     cursor = (cursor as { cause?: unknown }).cause;
   }
   return undefined;
-}
-
-export function computeBackoff(policy: RetryPolicy, attempt: number): Millis {
-  const initial = policy.initialDelayMs ?? 1_000;
-  const max = policy.maxDelayMs ?? 60_000;
-  switch (policy.backoff) {
-    case "exponential":
-      return Math.min(initial * 2 ** Math.max(0, attempt - 1), max);
-    case "linear":
-      return Math.min(initial * Math.max(1, attempt), max);
-    case "fixed":
-      return Math.min(initial, max);
-  }
 }
 
 function retryAllows(policy: RetryPolicy, err: unknown): boolean {
