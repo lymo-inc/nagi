@@ -10,8 +10,12 @@ import { Facts } from "./facts";
 import type { FlowRegistry } from "./flow-registry";
 import { compact, type EmitLog } from "./internal";
 import { deriveChildRunId } from "./run-id";
-import { nextTransition } from "./scheduler";
-import { foldRun, isTerminalRun, runStatusOf } from "./state";
+import {
+  nextTransition,
+  type SkipDecision,
+  type Transition,
+} from "./scheduler";
+import { foldRun, isTerminalRun, runStatusOf, stepStateOf } from "./state";
 import type {
   CancelArgs,
   Clock,
@@ -54,14 +58,20 @@ export type TxBoundary =
   | { readonly kind: "own" }
   | { readonly kind: "caller"; readonly tx: Tx };
 
-// How the initial step dispatch is settled. "enqueue" is still owed (own tx:
-// fired after the start hooks, matching onFlowStart-before-onStepStart);
-// "enqueued" already rode the caller's tx; "advance" means the seed state was
-// not a plain dispatch (when-false roots, empty flow) and needs the
-// store-driven progression loop once the row is committed.
+// How the initial step dispatch is settled. "enqueue" is still owed (own tx,
+// plain seed: fired after the start hooks, keeping onFlowStart before
+// onStepStart). "enqueued" already rode the caller's tx; only the when-false
+// siblings remain to be recorded post-commit. "advance" hands the seed to the
+// store-driven progression loop once the row is committed: own tx with
+// when-false siblings (advance records the skips, then enqueues — once), or no
+// runnable root at all on either boundary.
 export type InitialDispatch =
   | { readonly kind: "enqueue"; readonly steps: readonly StepId[] }
-  | { readonly kind: "enqueued"; readonly steps: readonly StepId[] }
+  | {
+      readonly kind: "enqueued";
+      readonly steps: readonly StepId[];
+      readonly skip: readonly SkipDecision[];
+    }
   | { readonly kind: "advance" };
 
 // Post-commit effects of a started run, as data: applied exactly once by
@@ -103,6 +113,7 @@ export interface RunLifecycle {
 }
 
 type Concurrency = { readonly key: string; readonly mode: ConcurrencyMode };
+type DispatchTransition = Extract<Transition, { kind: "dispatch" }>;
 type TryStartResult = Awaited<ReturnType<Store["tryStartRun"]>>;
 
 const EXISTS: StagedStart = { kind: "exists" };
@@ -120,7 +131,7 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
     seed(
       runId: RunId,
       flowId: string,
-      steps: readonly StepId[],
+      t: DispatchTransition,
     ): Promise<InitialDispatch>;
   } {
     switch (boundary.kind) {
@@ -128,18 +139,21 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
         return {
           tryStart: (runId, fact, concurrency) =>
             store.tryStartRun(runId, fact, concurrency),
-          seed: async (_runId, _flowId, steps) => ({ kind: "enqueue", steps }),
+          seed: async (_runId, _flowId, t) =>
+            t.skip.length > 0
+              ? ADVANCE
+              : { kind: "enqueue", steps: t.runnable },
         };
       case "caller":
         return {
           tryStart: (runId, fact, concurrency) =>
             store.tryStartRunOnTx(boundary.tx, runId, fact, concurrency),
-          seed: async (runId, flowId, steps) => {
+          seed: async (runId, flowId, t) => {
             const txQueue = deps.queueForTx(boundary.tx);
-            for (const stepId of steps) {
+            for (const stepId of t.runnable) {
               await txQueue.enqueue(runId, stepId, { flowId });
             }
-            return { kind: "enqueued", steps };
+            return { kind: "enqueued", steps: t.runnable, skip: t.skip };
           },
         };
     }
@@ -174,9 +188,7 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
     // dispatcher would fold post-commit.
     const t = nextTransition(flow, foldRun(runId, [fact]));
     const dispatch =
-      t.kind === "dispatch" && t.skip.length === 0
-        ? await seed(runId, flow.id, t.runnable)
-        : ADVANCE;
+      t.kind === "dispatch" ? await seed(runId, flow.id, t) : ADVANCE;
 
     return {
       kind: "started",
@@ -217,10 +229,29 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
         }
         return;
       case "enqueued":
+        await recordSkips(started.runId, dispatch.skip);
         return;
       case "advance":
         await dispatcher.advance(started.runId);
         return;
+    }
+  }
+
+  // The runnable roots were visible to workers from the caller's commit, so a
+  // worker may already have advanced the run and recorded these skips; append
+  // only for steps still pending.
+  async function recordSkips(
+    runId: RunId,
+    skip: readonly SkipDecision[],
+  ): Promise<void> {
+    if (skip.length === 0) return;
+    const state = await store.loadRunState(runId);
+    for (const { stepId, reason } of skip) {
+      if (stepStateOf(state, stepId).tag !== "pending") continue;
+      await store.appendFact(
+        runId,
+        Facts.stepSkipped({ runId, stepId, reason, at: clock.now() }),
+      );
     }
   }
 

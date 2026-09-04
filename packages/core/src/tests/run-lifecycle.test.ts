@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import type { Hooks } from "../exec/hooks";
+import { Facts } from "../facts";
 import { makeFlowRegistry } from "../flow-registry";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import {
@@ -41,12 +42,21 @@ const concurrentFlow = flow({
   }),
 });
 
-const gatedFlow = flow({
-  id: "lc-gated",
+const mixedFlow = flow({
+  id: "lc-mixed",
   input: passthroughSchema<VideoInput>(),
   build: (b) => ({
     maybe: b.task({ when: () => false, run: async () => ({}) }),
     always: b.task({ run: async () => ({}) }),
+  }),
+});
+
+const allGatedFlow = flow({
+  id: "lc-all-gated",
+  input: passthroughSchema<VideoInput>(),
+  build: (b) => ({
+    a: b.task({ when: () => false, run: async () => ({}) }),
+    b: b.task({ when: () => false, run: async () => ({}) }),
   }),
 });
 
@@ -135,6 +145,9 @@ interface Scenario {
   readonly expectDispatch: (runId: RunId) => unknown;
   readonly expectSuperseded: (prior: RunId | undefined) => unknown;
   readonly expectTxEnqueued: number;
+  // step.skipped facts applyEffects itself records (own-tx skips are recorded
+  // by the real advance, which is a stub here).
+  readonly expectSkippedAfterApply?: readonly StepId[];
 }
 
 const scenarios: readonly Scenario[] = [
@@ -177,7 +190,7 @@ const scenarios: readonly Scenario[] = [
     name: "staged, no supersede",
     flow: plainFlow,
     boundary: CALLER,
-    expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"] }),
+    expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"], skip: [] }),
     expectSuperseded: () => [],
     expectTxEnqueued: 1,
   },
@@ -186,23 +199,44 @@ const scenarios: readonly Scenario[] = [
     flow: concurrentFlow,
     boundary: CALLER,
     prior: true,
-    expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"] }),
+    expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"], skip: [] }),
     expectSuperseded: (prior) => [
       expect.objectContaining({ runId: prior, flowId: "lc-concurrent" }),
     ],
     expectTxEnqueued: 1,
   },
   {
-    name: "when-false root defers to advance (own)",
-    flow: gatedFlow,
+    name: "mixed roots (own): advance records the skip then enqueues once",
+    flow: mixedFlow,
     boundary: OWN,
     expectDispatch: () => ({ kind: "advance" }),
     expectSuperseded: () => [],
     expectTxEnqueued: 0,
   },
   {
-    name: "when-false root defers to advance (staged)",
-    flow: gatedFlow,
+    name: "mixed roots (staged): runnable root rides the tx, skip recorded post-commit",
+    flow: mixedFlow,
+    boundary: CALLER,
+    expectDispatch: () => ({
+      kind: "enqueued",
+      steps: ["always"],
+      skip: [{ stepId: "maybe", reason: "when-false" }],
+    }),
+    expectSuperseded: () => [],
+    expectTxEnqueued: 1,
+    expectSkippedAfterApply: ["maybe" as StepId],
+  },
+  {
+    name: "all-gated roots (own) defer to advance",
+    flow: allGatedFlow,
+    boundary: OWN,
+    expectDispatch: () => ({ kind: "advance" }),
+    expectSuperseded: () => [],
+    expectTxEnqueued: 0,
+  },
+  {
+    name: "all-gated roots (staged) defer to advance",
+    flow: allGatedFlow,
     boundary: CALLER,
     expectDispatch: () => ({ kind: "advance" }),
     expectSuperseded: () => [],
@@ -246,6 +280,7 @@ describe("run lifecycle — start scenarios", () => {
       const state = await fx.store.loadRunState(runId);
       expect(state.flowId).toBe(s.flow.id);
       expect(state.flowHash).toBe(`hash-${s.flow.id}`);
+      expect(state.facts.map((f) => f.kind)).toEqual(["flow.started"]);
       expect(effects.started).toEqual({
         runId,
         flowId: s.flow.id,
@@ -299,8 +334,43 @@ describe("run lifecycle — start scenarios", () => {
       expect(queuedAfterApply.map((m) => m.stepId)).toEqual(
         effects.dispatch.kind === "enqueue" ? effects.dispatch.steps : [],
       );
+      const after = await fx.store.loadRunState(runId);
+      expect(
+        after.facts.flatMap((f) =>
+          f.kind === "step.skipped" ? [f.stepId] : [],
+        ),
+      ).toEqual(s.expectSkippedAfterApply ?? []);
     });
   }
+
+  it("post-commit skip recording yields to a worker that already advanced", async () => {
+    const fx = makeFixture([mixedFlow]);
+    const runId = "raced" as RunId;
+    const staged = await fx.lifecycle.stage({
+      flow: mixedFlow,
+      validatedInput: { videoId: "v1" },
+      runId,
+      parent: undefined,
+      boundary: CALLER,
+    });
+    // A worker dequeued `always` off the caller's commit and advanced the run
+    // before applyOnCommit ran.
+    await fx.store.appendFact(
+      runId,
+      Facts.stepSkipped({
+        runId,
+        stepId: "maybe" as StepId,
+        reason: "when-false",
+        at: fx.clock.now(),
+      }),
+    );
+    await fx.lifecycle.applyEffects(started(staged));
+    const state = await fx.store.loadRunState(runId);
+    expect(state.facts.filter((f) => f.kind === "step.skipped")).toHaveLength(
+      1,
+    );
+    expect(state.steps["maybe"]?.tag).toBe("skipped");
+  });
 
   it("re-staging an existing runId yields `exists` on either boundary", async () => {
     const fx = makeFixture([plainFlow]);
