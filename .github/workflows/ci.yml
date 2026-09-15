@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        # No `version:` — pnpm/action-setup reads package.json#packageManager.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      # Adapters resolve @nagi-js/core through its dist/ — build before typecheck.
+      - run: pnpm -r build
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm verify:publint
+      - run: pnpm verify:types
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nagi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nagi_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      NAGI_POSTGRES_TEST_URL: postgres://postgres:postgres@localhost:5432/nagi_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -F @nagi-js/core build
+      - run: pnpm -F @nagi-js/postgres test

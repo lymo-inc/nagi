@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { makeDispatcher } from "../dispatch";
-import { emptySchema, makeHarness, passthroughSchema } from "./test-helpers";
+import {
+  emptySchema,
+  makeHarness,
+  passthroughSchema,
+  spyOnLog,
+} from "./test-helpers";
 
 // A signal gate with a downstream task that needs it — the awaitAudio shape from
 // lymo's videoAnalysis. timeoutMs omitted ⇒ the signal parks forever (today's
@@ -137,7 +142,7 @@ describe("b.signal timeout", () => {
     });
     const dispatcher = makeDispatcher(h.deps);
 
-    const runId = await h.wf.start(f, {});
+    await h.wf.start(f, {});
     await h.drain();
     await dispatcher.sweepTimers(FAR_FUTURE());
 
@@ -187,5 +192,46 @@ describe("b.signal timeout", () => {
       ac.abort();
       await done;
     }
+  });
+
+  it("advances the remaining runs when one run's advance throws", async () => {
+    const f = gatedFlow({ id: "to-isolated", timeoutMs: 1_000 });
+    const { onLog, entries } = spyOnLog();
+    const h = await makeHarness(f, { onLog });
+
+    const runA = await h.wf.start(f, {});
+    const runB = await h.wf.start(f, {});
+    await h.drain();
+
+    // Simulate a store blip while resolving run A's flow: resolveFlow rejects
+    // for A only, so A's advance throws and B must still be finalized.
+    const dispatcher = makeDispatcher({
+      ...h.deps,
+      resolveFlow: async (id) => {
+        if (id === runA) throw new Error("store blip (simulated)");
+        return h.deps.resolveFlow(id);
+      },
+    });
+
+    // Both timers fire; the store fails both steps regardless.
+    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(2);
+
+    // B finalized despite A throwing.
+    const b = await h.result(runB);
+    expect(b.status).toBe("failed");
+    expect(b.factCount("flow.failed")).toBe(1);
+
+    // A: step failed by the store, run not advanced, and an error log names it.
+    const a = await h.result(runA);
+    expect(a.stepStatus("awaitAudio")).toBe("failed");
+    expect(a.status).toBe("running");
+    expect(
+      entries.some(
+        (e) =>
+          e.level === "error" &&
+          e.attrs?.["runId"] === runA &&
+          String(e.msg).includes("signal timeout fired"),
+      ),
+    ).toBe(true);
   });
 });

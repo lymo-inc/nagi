@@ -88,28 +88,39 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
   async function sweepTimers(now: Date): Promise<number> {
     const timedOut = await deps.store.sweepSignalTimeouts({ now });
     for (const { runId, stepId, attempt, fireAt } of timedOut) {
-      // Fire onStepError before finalizing the flow, the same ordering every
-      // other failure path uses (handleStepError, markStepSettled) — so a
-      // consumer's per-step error handling sees signal timeouts too.
-      if (deps.hooks?.onStepError) {
-        const flow = requireCurrent(await deps.resolveFlow(runId));
-        await hooks.fireHook(
-          deps.hooks.onStepError,
-          {
-            runId,
-            flowId: flow.id,
-            stepId,
-            attempt,
-            kind: "signal",
-            error: serializeError(
-              new NagiSignalTimeoutError({ runId, stepId, fireAt }),
-            ),
-            at: now,
-          },
-          "onStepError",
-        );
+      try {
+        // Fire onStepError before finalizing the flow, the same ordering every
+        // other failure path uses (handleStepError, markStepSettled) — so a
+        // consumer's per-step error handling sees signal timeouts too.
+        if (deps.hooks?.onStepError) {
+          const flow = requireCurrent(await deps.resolveFlow(runId));
+          await hooks.fireHook(
+            deps.hooks.onStepError,
+            {
+              runId,
+              flowId: flow.id,
+              stepId,
+              attempt,
+              kind: "signal",
+              error: serializeError(
+                new NagiSignalTimeoutError({ runId, stepId, fireAt }),
+              ),
+              at: now,
+            },
+            "onStepError",
+          );
+        }
+        await progression.advance(runId);
+      } catch (err) {
+        // The store already failed the step and dropped its timer; this run
+        // will not be re-swept. Log and keep going — the rest of the batch
+        // must not be stranded behind one gone snapshot or store blip.
+        deps.emitLog({
+          level: "error",
+          msg: "nagi: signal timeout fired but the run could not be advanced — re-drive with operator.retry",
+          attrs: { runId, stepId, attempt, error: String(err) },
+        });
       }
-      await progression.advance(runId);
     }
     return timedOut.length;
   }
