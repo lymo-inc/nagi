@@ -395,11 +395,12 @@ class PostgresStore<DB = unknown> implements Store {
     attempt: AttemptNumber,
   ): Promise<ClaimToken | null> {
     const token = `lease-${crypto.randomUUID()}`;
-    const expiresAt = new Date(Date.now() + this.leaseMs);
 
+    // Expiry on the database clock, like extendLease and the ON CONFLICT guard
+    // below — an app clock a few seconds fast must not grant a second claim.
     const result = await sql<{ token: string }>`
       INSERT INTO ${sql.raw(this.t("lease"))} (run_id, step_id, attempt, token, expires_at)
-      VALUES (${runId}, ${stepId}, ${attempt}, ${token}, ${expiresAt})
+      VALUES (${runId}, ${stepId}, ${attempt}, ${token}, now() + (${this.leaseMs}::int * interval '1 ms'))
       ON CONFLICT (run_id, step_id, attempt) DO UPDATE
         SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at
         WHERE ${sql.raw(this.t("lease"))}.expires_at < now()
