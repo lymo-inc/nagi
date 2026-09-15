@@ -46,6 +46,10 @@ type Dispatched =
 
 type Admission =
   | { readonly tag: "skip" }
+  // Step already settled but the run is still live: the advance that should
+  // have followed the settle may have been lost (crash between settle and
+  // enqueue). Re-drive instead of dropping the redelivery.
+  | { readonly tag: "recover" }
   | { readonly tag: "run"; readonly def: StepDef; readonly state: RunState };
 
 interface ExecuteTaskResult {
@@ -102,6 +106,11 @@ export function makeMessage(
       await queue.ack(message.receipt);
       return;
     }
+    if (admission.tag === "recover") {
+      await advance(message.runId);
+      await queue.ack(message.receipt);
+      return;
+    }
     const { def, state } = admission;
 
     await recordStarted({ flow, message, def, state });
@@ -131,8 +140,10 @@ export function makeMessage(
       heartbeat.stop();
     }
 
-    await queue.ack(message.receipt);
     await interpret({ flow, message, def, startedAt, outcome });
+    // Ack last: if interpret's advance throws, dispatchSafely nacks and the
+    // redelivery takes the recover path above.
+    await queue.ack(message.receipt);
   }
 
   async function admit(args: {
@@ -161,7 +172,10 @@ export function makeMessage(
       preStep.tag === "failed" ||
       preStep.tag === "skipped"
     ) {
-      return { tag: "skip" };
+      // Settled step on a live run: re-drive. On a settled run there is nothing
+      // to drive — but do NOT skip non-terminal steps of a completed/failed run:
+      // operator.retry / replay reset steps on such runs and re-dispatch them.
+      return isTerminalRun(preState) ? { tag: "skip" } : { tag: "recover" };
     }
 
     const claim = await store.claimStep(runId, stepId, attempt);

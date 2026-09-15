@@ -55,6 +55,19 @@ describe("pgmqQueue.dequeue", () => {
     expect(query?.parameters).toEqual(["nagi", 45, 5]);
   });
 
+  it("defaults the visibility timeout above core's 40s heartbeat interval", async () => {
+    const fake = createCapturingDb();
+    fake.enqueueRows([]);
+    const q = pgmqQueue({ db: fake.db });
+
+    await q.dequeue({ count: 1 });
+
+    const query = fake.queries[0];
+    expect(query?.sql).toContain("pgmq.read");
+    // 120s: > DEFAULT_HEARTBEAT_INTERVAL_MS (40s), = DEFAULT_HEARTBEAT_LEASE_MS.
+    expect(query?.parameters).toEqual(["nagi", 120, 1]);
+  });
+
   it("projects rows to QueueMessage with receipt = String(msg_id)", async () => {
     const fake = createCapturingDb();
     fake.enqueueRows([
