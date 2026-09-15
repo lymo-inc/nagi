@@ -1,5 +1,5 @@
 import { NagiConcurrencyConflictError } from "./errors";
-import { Facts } from "./facts";
+import { Facts, foldRun } from "./facts";
 import { decideExpiredLeaseAction, type ReapedLease } from "./lease-reaper";
 import type {
   RunDescription,
@@ -11,7 +11,6 @@ import { decideSignal, decideTimeout } from "./signals";
 import {
   attemptOf,
   errorOf,
-  foldRun,
   isTerminalRun,
   outputOf,
   runStatusOf,
@@ -891,7 +890,7 @@ function containsJson(haystack: Json, needle: Json): boolean {
   return haystack === needle;
 }
 
-export { foldRun as projectRunState } from "./state";
+export { foldRun as projectRunState } from "./facts";
 
 interface QueuedItem extends QueueMessage {
   readonly enqueuedAt: number;

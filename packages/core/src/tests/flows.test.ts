@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { NagiFlowSnapshotGoneError, NagiRuntimeError } from "../errors";
-import { Facts } from "../facts";
+import { Facts, foldRun } from "../facts";
 import {
   type FlowGone,
   type FlowResolution,
@@ -10,7 +10,6 @@ import {
 } from "../flows";
 import { asStepMapWithDefs, getDef } from "../internal";
 import { InMemoryClock, InMemoryStore } from "../memory";
-import { foldRun } from "../state";
 import type { Fact, Flow, RunId } from "../types";
 import { passthroughSchema } from "./test-helpers";
 

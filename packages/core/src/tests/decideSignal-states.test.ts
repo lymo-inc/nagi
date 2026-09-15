@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { Facts } from "../facts";
+import { Facts, foldRun } from "../facts";
 import { decideSignal } from "../signals";
-import { foldRun } from "../state";
 import type {
   Fact,
   RunId,
