@@ -1,51 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { computeBackoff } from "../step-exec";
 import type {
   FlowCompleteEvent,
   FlowErrorEvent,
   FlowStartEvent,
   LogEntry,
-  RetryPolicy,
   StepErrorEvent,
   StepRetryEvent,
   StepStartEvent,
 } from "../types";
 import { makeHarness, passthroughSchema, spyOnLog } from "./test-helpers";
-
-describe("computeBackoff", () => {
-  const exp: RetryPolicy = {
-    maxAttempts: 99,
-    backoff: "exponential",
-    initialDelayMs: 100,
-    maxDelayMs: 10_000,
-  };
-  const lin: RetryPolicy = {
-    maxAttempts: 99,
-    backoff: "linear",
-    initialDelayMs: 100,
-    maxDelayMs: 10_000,
-  };
-  const fix: RetryPolicy = {
-    maxAttempts: 99,
-    backoff: "fixed",
-    initialDelayMs: 250,
-  };
-
-  it.each([
-    ["exponential, attempt 1", exp, 1, 100],
-    ["exponential, attempt 2", exp, 2, 200],
-    ["exponential, attempt 4", exp, 4, 800],
-    ["exponential, attempt 8 (capped)", { ...exp, maxDelayMs: 500 }, 8, 500],
-    ["linear, attempt 1", lin, 1, 100],
-    ["linear, attempt 5", lin, 5, 500],
-    ["linear, attempt 200 (capped)", lin, 200, 10_000],
-    ["fixed, any attempt", fix, 99, 250],
-    ["fixed, capped by maxDelay", { ...fix, maxDelayMs: 100 }, 1, 100],
-  ] as const)("%s → %d ms", (_label, policy, attempt, expected) => {
-    expect(computeBackoff(policy, attempt)).toBe(expected);
-  });
-});
 
 describe("dispatchMessage — driver", () => {
   it("happy path: completes a single task and finalizes the flow", async () => {

@@ -12,6 +12,7 @@ import {
   type SubflowDef,
   type TaskDef,
 } from "./internal";
+import { DEFAULT_RETRY } from "./retry";
 import type {
   BackoffStrategy,
   Flow,
@@ -61,13 +62,6 @@ export interface CanonicalDag {
   readonly inputSchema: CanonicalSchema;
   readonly steps: readonly CanonicalStep[];
 }
-
-const DEFAULT_RETRY: CanonicalRetryPolicy = {
-  maxAttempts: 3,
-  backoff: "exponential",
-  initialDelayMs: 1_000,
-  maxDelayMs: 60_000,
-};
 
 let warnedAboutSourceHash = false;
 function warnSourceHashOnce(): void {
