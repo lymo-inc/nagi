@@ -5,6 +5,7 @@ import {
   type Harness,
   makeHarness,
   passthroughSchema,
+  spyOnLog,
 } from "./test-helpers";
 
 // A signal gate with a downstream task that needs it — the awaitAudio shape from
@@ -196,5 +197,44 @@ describe("b.signal timeout", () => {
       ac.abort();
       await done;
     }
+  });
+
+  it("advances the remaining runs when one run's advance throws", async () => {
+    const f = gatedFlow({ id: "to-isolated", timeoutMs: 5 });
+    const { onLog, entries } = spyOnLog();
+    const h = await makeHarness(f, { onLog });
+
+    const runA = await h.wf.start(f, {});
+    const runB = await h.wf.start(f, {});
+    await h.drain();
+
+    // Simulate a store blip on run A only: every read of A's state rejects, so
+    // A's advance throws inside the sweep while B must still be finalized.
+    const loadRunState = h.store.loadRunState.bind(h.store);
+    h.store.loadRunState = async (id) => {
+      if (id === runA) throw new Error("store blip (simulated)");
+      return loadRunState(id);
+    };
+    try {
+      // Both timers fire; the store fails both steps regardless.
+      const b = await whileSweeping(h, () => h.waitForEnd(runB));
+      expect(b.status).toBe("failed");
+      expect(b.factCount("flow.failed")).toBe(1);
+    } finally {
+      h.store.loadRunState = loadRunState;
+    }
+
+    // A: step failed by the store, run not advanced, and an error log names it.
+    const a = await h.result(runA);
+    expect(a.stepStatus("awaitAudio")).toBe("failed");
+    expect(a.status).toBe("running");
+    expect(
+      entries.some(
+        (e) =>
+          e.level === "error" &&
+          e.attrs?.["runId"] === runA &&
+          String(e.msg).includes("signal timeout fired"),
+      ),
+    ).toBe(true);
   });
 });

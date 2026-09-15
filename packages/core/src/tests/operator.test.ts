@@ -178,6 +178,8 @@ describe("wf.operator().retry()", () => {
     expect(bAttempts).toBe(2);
     const result = await h.result(runId);
     expect(result.stepStatus("b")).toBe("completed");
+    expect(result.status).toBe("completed");
+    expect(result.factCount("flow.completed")).toBe(1);
     const resets = result.factsOf("step.reset") as StepResetFact[];
     const named = resets.find((r) => r.stepId === "b");
     expect(named?.actor).toBe("ops@nagi");
