@@ -137,6 +137,21 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(await store.claimStep(runId, "step", 1)).not.toBeNull();
   });
 
+  it("claimStep expiry is computed on the database clock, not the app clock", async () => {
+    const store = postgresStore({ db, schema, leaseMs: 30_000 });
+    const runId = `run-${uuidv7()}` as RunId;
+    const realNow = Date.now;
+    // Skew the app clock 10 minutes into the past: a JS-computed expires_at
+    // would already be "expired" by DB time and let a second claim through.
+    Date.now = () => realNow() - 600_000;
+    try {
+      expect(await store.claimStep(runId, "step", 1)).not.toBeNull();
+      expect(await store.claimStep(runId, "step", 1)).toBeNull();
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   it("sweepLeases reaps expired lease, writes audit fact, re-enqueues at attempt+1", async () => {
     const store = postgresStore({ db, schema, leaseMs: 50 });
     const queue = new InMemoryQueue();
