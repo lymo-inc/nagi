@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { Facts } from "../facts";
-import { foldRun } from "../state";
+import { Facts, foldRun } from "../facts";
 import type { AttemptNumber, RunId } from "../types";
 import { emptySchema, makeHarness, passthroughSchema } from "./test-helpers";
 

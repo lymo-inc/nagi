@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { type DispatchDeps, makeDispatcher } from "../dispatch";
 import { InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
 import { passthroughSchema, runFlow } from "./test-helpers";
@@ -33,20 +32,14 @@ describe("nagi() — auto queue-schema bootstrap", () => {
     expect(queue.ensureSchemaCalls).toBe(1);
   });
 
-  it("does not call ensureSchema again on wf.start, wf.worker, or dispatch", async () => {
+  it("does not call ensureSchema again on wf.start, wf.worker, or the worker drain", async () => {
     const queue = new SpyQueue();
     const store = new InMemoryStore();
     const wf = await nagi({ flows: [echo], store, queue });
     expect(queue.ensureSchemaCalls).toBe(1);
 
-    const deps = (wf as unknown as { __dispatchDeps: DispatchDeps })
-      .__dispatchDeps;
-    const dispatcher = makeDispatcher(deps);
     const runId = await wf.start(echo, { x: 1 });
-    wf.worker({ pollIntervalMs: 5 });
-    for (const msg of await queue.dequeue({ count: 32 })) {
-      await dispatcher.dispatchMessage(msg);
-    }
+    await wf.worker({ timerSweepIntervalMs: 0 }).runUntilEmpty();
     expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
     expect(queue.ensureSchemaCalls).toBe(1);
   });

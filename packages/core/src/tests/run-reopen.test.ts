@@ -1,8 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { NagiConcurrencyConflictError } from "../errors";
-import { Facts } from "../facts";
-import { foldRun } from "../state";
+import { Facts, foldRun } from "../facts";
 import type { AttemptNumber, RunId, SerializedError } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 

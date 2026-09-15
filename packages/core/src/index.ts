@@ -25,6 +25,7 @@ export {
   NagiSnapshotDriftError,
   NagiValidationError,
 } from "./errors";
+export { type RowDelta, rowDeltaOf } from "./facts";
 export {
   DEFAULT_REAPER_INTERVAL_MS,
   decideExpiredLeaseAction,
@@ -35,7 +36,6 @@ export {
   InMemoryClock,
   InMemoryQueue,
   InMemoryStore,
-  InMemoryTrigger,
   projectRunState,
 } from "./memory";
 export { RunId } from "./run-id";
@@ -62,7 +62,6 @@ export {
   type TimeoutDecision,
 } from "./signals";
 export type {
-  Anomaly,
   Resolved,
   RunCancelCause,
   RunPhase,
@@ -182,8 +181,6 @@ export type {
   SignalConfig,
   SignalReceivedEvent,
   SignalReceivedFact,
-  SignalSentEvent,
-  SignalSentFact,
   SnapshotGoneDisposition,
   SnapshotGonePolicy,
   StandardSchemaV1,
@@ -217,7 +214,6 @@ export type {
   SubflowStepOutput,
   TaskConfig,
   TimedOutSignal,
-  Trigger,
   Tx,
   Worker,
   WorkerConfig,

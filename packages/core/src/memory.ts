@@ -1,5 +1,5 @@
 import { NagiConcurrencyConflictError } from "./errors";
-import { Facts } from "./facts";
+import { Facts, foldRun } from "./facts";
 import { decideExpiredLeaseAction, type ReapedLease } from "./lease-reaper";
 import type {
   RunDescription,
@@ -11,7 +11,6 @@ import { decideSignal, decideTimeout } from "./signals";
 import {
   attemptOf,
   errorOf,
-  foldRun,
   isTerminalRun,
   outputOf,
   runStatusOf,
@@ -63,7 +62,6 @@ import type {
   StreamEvent,
   StreamTransport,
   TimedOutSignal,
-  Trigger,
   Tx,
 } from "./types";
 
@@ -95,7 +93,7 @@ export interface InMemoryStoreOpts {
 
 const DEFAULT_STORE_LEASE_MS: Millis = 60_000;
 
-export class InMemoryStore implements Store, StreamTransport {
+export class InMemoryStore implements Store {
   private readonly facts = new Map<string, Fact[]>();
   private readonly onces = new Map<string, Json>();
   private readonly leases = new Map<string, MemoryLease>();
@@ -764,32 +762,34 @@ export class InMemoryStore implements Store, StreamTransport {
     return out;
   }
 
-  subscribeStream(
-    runId: RunId,
-    stepId: StepId,
-    opts?: { readonly replayBuffered?: boolean },
-  ): AsyncIterable<StreamEvent<Json>> {
-    // Durable facts decide whether the stream is over, not the hub (which may
-    // never have held a channel for this step). Delegating to a terminal step
-    // would open a channel that hangs, so hand back an empty iterable instead.
-    const state = foldRun(runId, this.facts.get(runId) ?? []);
-    const stepStatus = stepStatusOf(stepStateOf(state, stepId));
-    const runIsTerminal = isTerminalRun(state);
-    if (
-      runIsTerminal ||
-      stepStatus === "completed" ||
-      stepStatus === "failed" ||
-      stepStatus === "canceled" ||
-      stepStatus === "skipped"
-    ) {
-      return EMPTY_CLOSED_STREAM;
-    }
-    return this.streamHub.subscribeStream(runId, stepId, opts);
-  }
+  readonly stream: StreamTransport = {
+    subscribeStream: (
+      runId: RunId,
+      stepId: StepId,
+      opts?: { readonly replayBuffered?: boolean },
+    ): AsyncIterable<StreamEvent<Json>> => {
+      // Durable facts decide whether the stream is over, not the hub (which may
+      // never have held a channel for this step). Delegating to a terminal step
+      // would open a channel that hangs, so hand back an empty iterable instead.
+      const state = foldRun(runId, this.facts.get(runId) ?? []);
+      const stepStatus = stepStatusOf(stepStateOf(state, stepId));
+      const runIsTerminal = isTerminalRun(state);
+      if (
+        runIsTerminal ||
+        stepStatus === "completed" ||
+        stepStatus === "failed" ||
+        stepStatus === "canceled" ||
+        stepStatus === "skipped"
+      ) {
+        return EMPTY_CLOSED_STREAM;
+      }
+      return this.streamHub.subscribeStream(runId, stepId, opts);
+    },
 
-  publishChunk(runId: RunId, stepId: StepId, chunk: Json): void {
-    this.streamHub.publishChunk(runId, stepId, chunk);
-  }
+    publishChunk: (runId: RunId, stepId: StepId, chunk: Json): void => {
+      this.streamHub.publishChunk(runId, stepId, chunk);
+    },
+  };
 }
 
 interface PruneVictim extends RunSummary {
@@ -837,7 +837,7 @@ function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
   };
 }
 
-export { foldRun as projectRunState } from "./state";
+export { foldRun as projectRunState } from "./facts";
 
 interface QueuedItem extends QueueMessage {
   readonly enqueuedAt: number;
@@ -937,18 +937,7 @@ export class InMemoryQueue implements Queue {
   }
 }
 
-export interface InMemoryClockOpts {
-  readonly trigger?: InMemoryTrigger;
-}
-
 export class InMemoryClock implements Clock {
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly trigger: InMemoryTrigger | undefined;
-
-  constructor(opts: InMemoryClockOpts = {}) {
-    this.trigger = opts.trigger;
-  }
-
   now(): Date {
     return new Date();
   }
@@ -968,38 +957,5 @@ export class InMemoryClock implements Clock {
       };
       signal?.addEventListener("abort", onAbort, { once: true });
     });
-  }
-
-  async schedule(at: Date, runId: RunId, stepId: StepId): Promise<void> {
-    const key = `${runId}::${stepId}`;
-    const existing = this.timers.get(key);
-    if (existing !== undefined) clearTimeout(existing);
-
-    const delay = Math.max(0, at.getTime() - Date.now());
-    const handle = setTimeout(() => {
-      this.timers.delete(key);
-      this.trigger?.fire(runId);
-    }, delay);
-    this.timers.set(key, handle);
-  }
-
-  dispose(): void {
-    for (const t of this.timers.values()) clearTimeout(t);
-    this.timers.clear();
-  }
-}
-
-export class InMemoryTrigger implements Trigger {
-  private handlers: Array<(runId: RunId) => void> = [];
-
-  subscribe(handler: (runId: RunId) => void): () => void {
-    this.handlers.push(handler);
-    return () => {
-      this.handlers = this.handlers.filter((h) => h !== handler);
-    };
-  }
-
-  fire(runId: RunId): void {
-    for (const h of this.handlers) h(runId);
   }
 }

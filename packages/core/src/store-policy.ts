@@ -187,7 +187,6 @@ export function factEffects(fact: Fact): FactEffects {
     case "step.retried":
     case "step.skipped":
     case "step.abort-requested":
-    case "signal.sent":
     case "signal.received":
     case "signal.buffered":
     case "once.recorded":
