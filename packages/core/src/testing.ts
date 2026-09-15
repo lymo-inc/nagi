@@ -1,3 +1,4 @@
+import { NagiConcurrencyConflictError } from "./errors";
 import { Facts } from "./facts";
 import { InMemoryQueue } from "./memory";
 import { stepStateOf, stepStatusOf } from "./state";
@@ -520,6 +521,84 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         timedOut.map((t) => t.attempt),
         [A2],
         "fresh deadline fired",
+      );
+    },
+  },
+  {
+    name: "appendFact(step.reset): reopens a completed / failed run to running in both the fold and the read model; canceled stays canceled",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      for (const status of ["completed", "failed"] as const) {
+        const flowId = fid();
+        const runId = rid();
+        await startRun(s, runId, { flowId });
+        await startStep(s, runId, "s");
+        await endRun(s, runId, status);
+        await s.appendFact(
+          runId,
+          Facts.stepReset({ runId, stepId: "s", at: new Date() }),
+        );
+        eq(
+          (await s.loadRunState(runId)).phase.tag,
+          "running",
+          `fold after flow.${status}`,
+        );
+        const { runs } = await s.queryRuns({
+          where: { flowId, status: ["running"] },
+        });
+        eq(
+          runs.map((r) => r.runId),
+          [runId],
+          `read model after flow.${status}`,
+        );
+      }
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s");
+      await endRun(s, runId, "canceled");
+      await s.appendFact(
+        runId,
+        Facts.stepReset({ runId, stepId: "s", at: new Date() }),
+      );
+      eq((await s.loadRunState(runId)).phase.tag, "canceled", "canceled");
+    },
+  },
+  {
+    name: "appendFact(step.reset): a reopened run re-takes its (flowId, key) slot — refused with NagiConcurrencyConflictError while another active run holds it",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const flowId = fid();
+      const a = rid();
+      const b = rid();
+      await startRun(s, a, { flowId, concurrencyKey: "k" });
+      await startStep(s, a, "s");
+      await endRun(s, a, "completed");
+      eq(
+        (await startRun(s, b, { flowId, concurrencyKey: "k" })).canceled,
+        [],
+        "slot free after a completed",
+      );
+      const reset = Facts.stepReset({ runId: a, stepId: "s", at: new Date() });
+      let err: unknown;
+      try {
+        await s.appendFact(a, reset);
+      } catch (e) {
+        err = e;
+      }
+      ok(
+        err instanceof NagiConcurrencyConflictError,
+        "reopen while b holds the key must throw NagiConcurrencyConflictError",
+      );
+      eq((await s.loadRunState(a)).phase.tag, "completed", "a untouched");
+
+      await endRun(s, b, "completed");
+      await s.appendFact(a, reset);
+      eq((await s.loadRunState(a)).phase.tag, "running", "a reopened");
+      const res = await startRun(s, rid(), { flowId, concurrencyKey: "k" });
+      eq(
+        res.canceled.map((c) => c.runId),
+        [a],
+        "the reopened run holds the slot again",
       );
     },
   },
