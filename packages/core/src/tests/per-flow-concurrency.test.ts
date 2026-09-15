@@ -2,8 +2,20 @@ import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
-import type { RunId } from "../types";
+import type { QueueEnqueueOpts, RunId, StepId } from "../types";
 import { passthroughSchema } from "./test-helpers";
+
+// A pre-upgrade queue adapter: its envelope has no flowId.
+class LegacyQueue extends InMemoryQueue {
+  override async enqueue(
+    runId: RunId,
+    stepId: StepId,
+    opts?: QueueEnqueueOpts,
+  ): Promise<void> {
+    const { flowId: _flowId, ...legacy } = opts ?? {};
+    return super.enqueue(runId, stepId, legacy);
+  }
+}
 
 // The outage shape this bounds: N steps of ONE flow wedge in their handlers
 // and hold every worker slot, so no other flow's runs ever get scheduled.
@@ -90,7 +102,7 @@ describe("worker maxConcurrencyPerFlow", () => {
 
   it("messages without flowId are exempt (pre-upgrade messages still dispatch)", async () => {
     const store = new InMemoryStore();
-    const queue = new InMemoryQueue();
+    const queue = new LegacyQueue();
     const clock = new InMemoryClock();
 
     const f = flow({
@@ -101,17 +113,20 @@ describe("worker maxConcurrencyPerFlow", () => {
       }),
     });
     const wf = await nagi({ flows: [f], store, queue, clock });
-    const runId = await wf.start(f, {});
+    const runIds = [await wf.start(f, {}), await wf.start(f, {})];
 
-    // Strip flowId from the queued message, simulating a pre-upgrade envelope.
-    const pending = (
-      queue as unknown as { pending: Array<Record<string, unknown>> }
-    ).pending;
-    for (const item of pending) delete item["flowId"];
-
-    await wf
-      .worker({ maxConcurrencyPerFlow: 1, timerSweepIntervalMs: 0 })
-      .runUntilEmpty();
-    expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
+    // Cap of 1 with two same-flow messages in one batch: a flowId-bearing
+    // second message would be deferred; exempt messages both dispatch.
+    const { processed } = await wf
+      .worker({
+        concurrency: 2,
+        maxConcurrencyPerFlow: 1,
+        timerSweepIntervalMs: 0,
+      })
+      .runOnce({ maxSteps: 2 });
+    expect(processed).toBe(2);
+    for (const runId of runIds) {
+      expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
+    }
   });
 });

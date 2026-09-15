@@ -1,4 +1,4 @@
-import { type DispatchDeps, makeDispatcher } from "../dispatch";
+import { type MockInstance, vi } from "vitest";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { type NagiConfig, nagi, type Wf } from "../runtime";
 import { errorOf, isTerminalRun, runStatusOf, stepStatusOf } from "../state";
@@ -16,6 +16,7 @@ import type {
   SerializedError,
   StandardSchemaV1,
   StepStatus,
+  Worker,
   WorkerConfig,
 } from "../types";
 
@@ -111,12 +112,12 @@ export interface Harness {
   readonly queue: InMemoryQueue;
   readonly clock: InMemoryClock;
 
-  readonly deps: DispatchDeps;
-
   startWorker(config?: WorkerConfig): { stop: () => Promise<void> };
 
-  drainOnce(count?: number): Promise<number>;
-  drain(opts?: { maxIter?: number }): Promise<number>;
+  // Bounded drains through the real Worker at concurrency 1, so dispatch order
+  // is queue order. Both stop at the first empty dequeue.
+  drainOnce(maxSteps?: number): Promise<number>;
+  drain(opts?: { maxSteps?: number }): Promise<number>;
 
   waitForEnd(runId: RunId, timeoutMs?: number): Promise<Result>;
   waitForStep(
@@ -152,36 +153,23 @@ export async function makeHarness(
 
   if (flowList.length === 0) throw new Error("makeHarness: no flows provided");
 
-  const deps = (wf as unknown as { __dispatchDeps: DispatchDeps })
-    .__dispatchDeps;
-  const dispatcher = makeDispatcher(deps);
-
-  async function drainOnce(count = 32): Promise<number> {
-    const messages = await queue.dequeue({ count });
-    for (const msg of messages) {
-      await dispatcher.dispatchMessage(msg);
-    }
-    return messages.length;
-  }
+  const worker: Worker = wf.worker({ concurrency: 1 });
 
   return {
     wf,
     store,
     queue,
     clock,
-    deps,
 
     startWorker(config) {
       const ac = new AbortController();
-      const merged: WorkerConfig = {
-        pollIntervalMs: config?.pollIntervalMs ?? 5,
-        ...(config?.concurrency !== undefined
-          ? { concurrency: config.concurrency }
-          : {}),
-        signal: config?.signal ?? ac.signal,
-      };
-      const worker = wf.worker(merged);
-      const done = worker.run();
+      const done = wf
+        .worker({
+          pollIntervalMs: 5,
+          ...config,
+          signal: config?.signal ?? ac.signal,
+        })
+        .run();
       return {
         stop: async () => {
           ac.abort();
@@ -190,17 +178,18 @@ export async function makeHarness(
       };
     },
 
-    drainOnce,
+    async drainOnce(maxSteps = 1) {
+      const { processed } = await worker.runOnce({ maxSteps });
+      return processed;
+    },
 
     async drain(opts) {
-      const max = opts?.maxIter ?? 256;
-      let total = 0;
-      for (let i = 0; i < max; i++) {
-        const n = await drainOnce();
-        if (n === 0) return total;
-        total += n;
+      const maxSteps = opts?.maxSteps ?? 4096;
+      const { processed } = await worker.runOnce({ maxSteps });
+      if (processed >= maxSteps) {
+        throw new Error(`drain: exceeded ${maxSteps} steps`);
       }
-      throw new Error(`drain: exceeded ${max} iterations`);
+      return processed;
     },
 
     async waitForEnd(runId, timeoutMs = 3_000) {
@@ -231,6 +220,22 @@ export async function makeHarness(
     async result(runId) {
       return makeResult(await store.loadRunState(runId));
     },
+  };
+}
+
+export function leasePorts(): {
+  store: InMemoryStore;
+  queue: InMemoryQueue;
+  extendLease: MockInstance<InMemoryStore["extendLease"]>;
+  extend: MockInstance<InMemoryQueue["extend"]>;
+} {
+  const store = new InMemoryStore();
+  const queue = new InMemoryQueue();
+  return {
+    store,
+    queue,
+    extendLease: vi.spyOn(store, "extendLease").mockResolvedValue(undefined),
+    extend: vi.spyOn(queue, "extend").mockResolvedValue(undefined),
   };
 }
 

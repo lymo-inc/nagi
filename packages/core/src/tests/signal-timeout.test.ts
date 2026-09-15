@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { makeDispatcher } from "../dispatch";
 import {
   emptySchema,
+  type Harness,
   makeHarness,
   passthroughSchema,
   spyOnLog,
@@ -33,13 +33,25 @@ function gatedFlow(opts: { id: string; timeoutMs?: number }) {
   });
 }
 
-const FAR_FUTURE = () => new Date(Date.now() + 3_600_000);
+// Runs the real worker loop, sweeping every 1ms, for the duration of `body`.
+async function whileSweeping<T>(
+  h: Harness,
+  body: () => Promise<T>,
+): Promise<T> {
+  const worker = h.startWorker({ pollIntervalMs: 1, timerSweepIntervalMs: 1 });
+  try {
+    return await body();
+  } finally {
+    await worker.stop();
+  }
+}
+
+const tick = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 describe("b.signal timeout", () => {
   it("fails the awaiting signal step (and cascades) once its deadline passes", async () => {
-    const f = gatedFlow({ id: "to-fires", timeoutMs: 1_000 });
+    const f = gatedFlow({ id: "to-fires", timeoutMs: 5 });
     const h = await makeHarness(f);
-    const dispatcher = makeDispatcher(h.deps);
 
     const runId = await h.wf.start(f, {});
     await h.drain();
@@ -47,10 +59,7 @@ describe("b.signal timeout", () => {
       "awaitingSignal",
     );
 
-    const failed = await dispatcher.sweepTimers(FAR_FUTURE());
-    expect(failed).toBe(1);
-
-    const result = await h.result(runId);
+    const result = await whileSweeping(h, () => h.waitForEnd(runId));
     expect(result.status).toBe("failed");
     expect(result.stepStatus("awaitAudio")).toBe("failed");
     expect(result.error("awaitAudio").name).toBe("NagiSignalTimeoutError");
@@ -60,43 +69,35 @@ describe("b.signal timeout", () => {
   });
 
   it("does NOT fire before the deadline (fire_at gating)", async () => {
-    const f = gatedFlow({ id: "to-not-due", timeoutMs: 1_000 });
+    const f = gatedFlow({ id: "to-not-due", timeoutMs: 60_000 });
     const h = await makeHarness(f);
-    const dispatcher = makeDispatcher(h.deps);
 
     const runId = await h.wf.start(f, {});
     await h.drain();
 
-    // Sweep at ~now: the deadline (parked-at + 1s) hasn't passed.
-    const early = await dispatcher.sweepTimers(new Date());
-    expect(early).toBe(0);
-    expect((await h.store.loadRunState(runId)).steps["awaitAudio"]?.tag).toBe(
-      "awaitingSignal",
-    );
-
-    // …and it still fires once the deadline is past.
-    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(1);
-    expect((await h.result(runId)).status).toBe("failed");
+    // Many sweeps, none due: the deadline (parked-at + 60s) hasn't passed.
+    await whileSweeping(h, () => tick(30));
+    const result = await h.result(runId);
+    expect(result.stepStatus("awaitAudio")).toBe("running");
+    expect(result.factCount("step.failed")).toBe(0);
   });
 
   it("never arms a timer for a signal without timeoutMs (parks forever, as before)", async () => {
     const f = gatedFlow({ id: "to-none" });
     const h = await makeHarness(f);
-    const dispatcher = makeDispatcher(h.deps);
 
     const runId = await h.wf.start(f, {});
     await h.drain();
 
-    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(0);
-    expect((await h.store.loadRunState(runId)).steps["awaitAudio"]?.tag).toBe(
-      "awaitingSignal",
-    );
+    await whileSweeping(h, () => tick(30));
+    const result = await h.result(runId);
+    expect(result.stepStatus("awaitAudio")).toBe("running");
+    expect(result.factCount("step.failed")).toBe(0);
   });
 
   it("is a no-op once the signal was delivered (delivery wins; timer disarmed)", async () => {
-    const f = gatedFlow({ id: "to-delivered", timeoutMs: 1_000 });
+    const f = gatedFlow({ id: "to-delivered", timeoutMs: 5 });
     const h = await makeHarness(f);
-    const dispatcher = makeDispatcher(h.deps);
 
     const runId = await h.wf.start(f, {});
     await h.drain();
@@ -104,21 +105,24 @@ describe("b.signal timeout", () => {
     await h.drain();
     expect((await h.result(runId)).status).toBe("completed");
 
-    // A late sweep finds no armed timer (disarmed on deliver) and no awaiting
-    // step — nothing to fail.
-    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(0);
-    expect((await h.result(runId)).status).toBe("completed");
+    // Sweeps well past the deadline find no armed timer (disarmed on deliver)
+    // and no awaiting step — nothing to fail.
+    await whileSweeping(h, () => tick(30));
+    const result = await h.result(runId);
+    expect(result.status).toBe("completed");
+    expect(result.factCount("step.failed")).toBe(0);
   });
 
-  it("is idempotent: a second sweep does not re-fail or duplicate facts", async () => {
-    const f = gatedFlow({ id: "to-idempotent", timeoutMs: 1_000 });
+  it("is idempotent: repeated sweeps do not re-fail or duplicate facts", async () => {
+    const f = gatedFlow({ id: "to-idempotent", timeoutMs: 5 });
     const h = await makeHarness(f);
-    const dispatcher = makeDispatcher(h.deps);
 
     const runId = await h.wf.start(f, {});
     await h.drain();
-    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(1);
-    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(0);
+    await whileSweeping(h, async () => {
+      await h.waitForEnd(runId);
+      await tick(30);
+    });
 
     const result = await h.result(runId);
     expect(result.status).toBe("failed");
@@ -127,7 +131,7 @@ describe("b.signal timeout", () => {
   });
 
   it("fires onStepError and onFlowError when a signal times out (parity with other failures)", async () => {
-    const f = gatedFlow({ id: "to-hooks", timeoutMs: 1_000 });
+    const f = gatedFlow({ id: "to-hooks", timeoutMs: 5 });
     const stepErrors: Array<{ stepId: string; name: string }> = [];
     let flowErrored = false;
     const h = await makeHarness(f, {
@@ -140,11 +144,13 @@ describe("b.signal timeout", () => {
         },
       },
     });
-    const dispatcher = makeDispatcher(h.deps);
 
-    await h.wf.start(f, {});
+    const runId = await h.wf.start(f, {});
     await h.drain();
-    await dispatcher.sweepTimers(FAR_FUTURE());
+    await whileSweeping(h, async () => {
+      await h.waitForEnd(runId);
+      await tick(30);
+    });
 
     expect(stepErrors).toEqual([
       { stepId: "awaitAudio", name: "NagiSignalTimeoutError" },
@@ -153,23 +159,22 @@ describe("b.signal timeout", () => {
   });
 
   it("keeps the earliest deadline: re-arming does not push the timeout out (reaper-safe)", async () => {
-    const f = gatedFlow({ id: "to-earliest", timeoutMs: 1_000 });
+    const f = gatedFlow({ id: "to-earliest", timeoutMs: 5 });
     const h = await makeHarness(f);
-    const dispatcher = makeDispatcher(h.deps);
 
     const runId = await h.wf.start(f, {});
     await h.drain();
 
     // A lease-reap re-dispatch would re-arm; simulate it trying to shove the
-    // deadline 10h out. upsertTimer keeps the earliest, so the original ~1s
-    // deadline still wins and a sweep 1h out fires it.
+    // deadline 10h out. upsertTimer keeps the earliest, so the original ~5ms
+    // deadline still wins and the sweep fires it.
     await h.store.upsertTimer(
       runId,
       "awaitAudio",
       new Date(Date.now() + 10 * 3_600_000),
     );
-    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(1);
-    expect((await h.result(runId)).status).toBe("failed");
+    const result = await whileSweeping(h, () => h.waitForEnd(runId));
+    expect(result.status).toBe("failed");
   });
 
   it("the worker self-sweeps on its configured cadence (no external loop)", async () => {
@@ -195,7 +200,7 @@ describe("b.signal timeout", () => {
   });
 
   it("advances the remaining runs when one run's advance throws", async () => {
-    const f = gatedFlow({ id: "to-isolated", timeoutMs: 1_000 });
+    const f = gatedFlow({ id: "to-isolated", timeoutMs: 5 });
     const { onLog, entries } = spyOnLog();
     const h = await makeHarness(f, { onLog });
 
@@ -203,23 +208,21 @@ describe("b.signal timeout", () => {
     const runB = await h.wf.start(f, {});
     await h.drain();
 
-    // Simulate a store blip while resolving run A's flow: resolveFlow rejects
-    // for A only, so A's advance throws and B must still be finalized.
-    const dispatcher = makeDispatcher({
-      ...h.deps,
-      resolveFlow: async (id) => {
-        if (id === runA) throw new Error("store blip (simulated)");
-        return h.deps.resolveFlow(id);
-      },
-    });
-
-    // Both timers fire; the store fails both steps regardless.
-    expect(await dispatcher.sweepTimers(FAR_FUTURE())).toBe(2);
-
-    // B finalized despite A throwing.
-    const b = await h.result(runB);
-    expect(b.status).toBe("failed");
-    expect(b.factCount("flow.failed")).toBe(1);
+    // Simulate a store blip on run A only: every read of A's state rejects, so
+    // A's advance throws inside the sweep while B must still be finalized.
+    const loadRunState = h.store.loadRunState.bind(h.store);
+    h.store.loadRunState = async (id) => {
+      if (id === runA) throw new Error("store blip (simulated)");
+      return loadRunState(id);
+    };
+    try {
+      // Both timers fire; the store fails both steps regardless.
+      const b = await whileSweeping(h, () => h.waitForEnd(runB));
+      expect(b.status).toBe("failed");
+      expect(b.factCount("flow.failed")).toBe(1);
+    } finally {
+      h.store.loadRunState = loadRunState;
+    }
 
     // A: step failed by the store, run not advanced, and an error log names it.
     const a = await h.result(runA);

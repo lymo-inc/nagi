@@ -3,7 +3,7 @@ import { flow } from "../builder";
 import { NagiSnapshotDriftError } from "../errors";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
-import type { Fact, RunId } from "../types";
+import type { Fact, LogEntry, RunId } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
 function makeFlowA() {
@@ -28,6 +28,101 @@ function makeFlowB() {
 }
 
 describe("NagiFlowSnapshotGoneError", () => {
+  it("dispatching a run whose flow_hash is not in the current registry is snapshot-gone: nacked for a frozen-version worker, step never runs", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    // Process A: register flow + start run + leave message in queue.
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    // Process B: same store, but flow body differs → different flowHash. The
+    // queued message is for the old hash.
+    const fB = makeFlowB();
+    const logs: LogEntry[] = [];
+    const wfB = await nagi({
+      flows: [fB],
+      store,
+      queue,
+      clock,
+      onLog: (e) => logs.push(e),
+    });
+
+    const seenReadCounts: number[] = [];
+    const { processed } = await wfB
+      .worker({
+        timerSweepIntervalMs: 0,
+        snapshotGonePolicy: (readCount) => {
+          seenReadCounts.push(readCount);
+          return { action: "retry", delayMs: 60_000 };
+        },
+      })
+      .runUntilEmpty();
+    expect(processed).toBe(1);
+    expect(seenReadCounts).toEqual([1]);
+
+    const warn = logs.find((l) =>
+      l.msg.includes("flow snapshot gone — nacking"),
+    );
+    expect(warn?.level).toBe("warn");
+    expect(warn?.attrs).toMatchObject({ runId, flowId: "fA", readCount: 1 });
+
+    // Message kept for a frozen-version worker (delayed), run untouched.
+    const [entry] = await wfB.inspectQueue(runId);
+    expect(entry).toMatchObject({ stepId: "s", readCount: 1 });
+    expect(entry?.visibleAt.getTime()).toBeGreaterThan(Date.now());
+    const state = await store.loadRunState(runId);
+    expect(state.phase.tag).toBe("running");
+    expect(state.facts.some((f) => f.kind === "step.started")).toBe(false);
+  });
+
+  it("includes pinnedHash and currentHash for diagnostic", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    const fB = makeFlowB();
+    const logs: LogEntry[] = [];
+    const wfB = await nagi({
+      flows: [fB],
+      store,
+      queue,
+      clock,
+      onLog: (e) => logs.push(e),
+    });
+    await wfB
+      .worker({
+        timerSweepIntervalMs: 0,
+        snapshotGonePolicy: () => ({ action: "fail" }),
+      })
+      .runUntilEmpty();
+
+    const failed = logs.find((l) =>
+      l.msg.includes("redelivery budget exhausted"),
+    );
+    expect(failed?.level).toBe("error");
+    const attrs = failed?.attrs ?? {};
+    expect(attrs["runId"]).toBe(runId);
+    expect(attrs["flowId"]).toBe("fA");
+    expect(typeof attrs["pinnedHash"]).toBe("string");
+    expect(String(attrs["pinnedHash"]).length).toBeGreaterThan(0);
+    expect(typeof attrs["currentHash"]).toBe("string");
+    expect(attrs["currentHash"]).not.toBe(attrs["pinnedHash"]);
+
+    const state = await store.loadRunState(runId);
+    expect(state.phase.tag).toBe("failed");
+    if (state.phase.tag === "failed") {
+      expect(state.phase.error.name).toBe("NagiFlowSnapshotGoneError");
+    }
+    expect(await wfB.inspectQueue(runId)).toHaveLength(0);
+  });
+
   it("wf.cancel on a run with a gone flow_hash succeeds (cancel bypasses flow registry)", async () => {
     const store = new InMemoryStore();
     const queue = new InMemoryQueue();
@@ -92,6 +187,37 @@ describe("NagiFlowSnapshotGoneError", () => {
     await expect(
       wfB.signal(runId, "wait", { ok: true } as never),
     ).resolves.toBeUndefined();
+  });
+
+  it("NagiFlowSnapshotGoneError not raised when current registry has matching hash", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    // Re-create nagi with the SAME flow definition → same hash.
+    const logs: LogEntry[] = [];
+    const wfA2 = await nagi({
+      flows: [fA],
+      store,
+      queue,
+      clock,
+      onLog: (e) => logs.push(e),
+    });
+    const { processed } = await wfA2
+      .worker({
+        timerSweepIntervalMs: 0,
+        snapshotGonePolicy: () => {
+          throw new Error("policy must not run when the hash matches");
+        },
+      })
+      .runUntilEmpty();
+    expect(processed).toBe(1);
+    expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
+    expect(logs.some((l) => l.msg.includes("snapshot gone"))).toBe(false);
   });
 
   it("is exported from @nagi-js/core", async () => {
