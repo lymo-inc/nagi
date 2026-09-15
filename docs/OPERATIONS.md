@@ -79,6 +79,11 @@ Prevention layers, in order:
 3. `WorkerConfig.maxConcurrencyPerFlow` (multi-flow deployments: set it to at
    most `concurrency - 1`) keeps one flow from occupying every slot.
 
+If you override `pgmqQueue({ visibilityTimeoutMs })` or
+`nagi({ heartbeatIntervalMs })`, keep `heartbeatIntervalMs < visibilityTimeoutMs`;
+otherwise every step longer than the visibility timeout is redelivered before
+its first lease extension (defaults: 40s interval, 120s visibility).
+
 ## Operator actions
 
 `wf.operator()` (all take `{ actor, note? }` for the audit trail):
