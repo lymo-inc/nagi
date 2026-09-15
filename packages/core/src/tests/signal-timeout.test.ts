@@ -203,13 +203,13 @@ describe("b.signal timeout", () => {
     const runB = await h.wf.start(f, {});
     await h.drain();
 
-    // Simulate run A's flow snapshot being gone (deploy replaced it): flowFor
-    // throws for A only. advance() calls flowFor first, so A's advance throws.
+    // Simulate a store blip while resolving run A's flow: resolveFlow rejects
+    // for A only, so A's advance throws and B must still be finalized.
     const dispatcher = makeDispatcher({
       ...h.deps,
-      flowFor: async (id) => {
-        if (id === runA) throw new Error("snapshot gone (simulated)");
-        return h.deps.flowFor(id);
+      resolveFlow: async (id) => {
+        if (id === runA) throw new Error("store blip (simulated)");
+        return h.deps.resolveFlow(id);
       },
     });
 

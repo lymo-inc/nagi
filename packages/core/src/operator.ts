@@ -1,7 +1,7 @@
 import type { Dispatcher } from "./dispatch";
 import { NagiRuntimeError, validationError } from "./errors";
 import { Facts } from "./facts";
-import type { FlowRegistry } from "./flow-registry";
+import type { FlowRegistry } from "./flows";
 import { compact, type EmitLog } from "./internal";
 import { descendantsOf, stepStateOf } from "./scheduler";
 import {
@@ -56,7 +56,7 @@ export function makeOperator(o: OperatorDeps): Operator {
   ): Promise<void> {
     requireActor("operator.skip", opts.actor);
     const state = await store.loadRunState(runId);
-    const flow = registry.requireForRun(state.flowId, runId);
+    const flow = registry.require(state.flowId);
     if (!(stepId in flow.steps)) {
       throw validationError(
         `operator.skip: step "${stepId}" is not a step in flow "${flow.id}".`,
@@ -125,7 +125,7 @@ export function makeOperator(o: OperatorDeps): Operator {
         `operator.retry: run ${runId} is canceled; cannot retry. Start a new run instead.`,
       );
     }
-    const flow = registry.requireForRun(state.flowId, runId);
+    const flow = registry.require(state.flowId);
     if (!(stepId in flow.steps)) {
       throw validationError(
         `operator.retry: step "${stepId}" is not a step in flow "${flow.id}".`,
