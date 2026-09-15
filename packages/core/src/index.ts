@@ -35,9 +35,9 @@ export {
   InMemoryClock,
   InMemoryQueue,
   InMemoryStore,
-  InMemoryTrigger,
   projectRunState,
 } from "./memory";
+export { defaultSnapshotGonePolicy } from "./retry";
 export { RunId } from "./run-id";
 export type {
   RunDescription,
@@ -200,7 +200,6 @@ export type {
   SubflowStepOutput,
   TaskConfig,
   TimedOutSignal,
-  Trigger,
   Tx,
   Worker,
   WorkerConfig,
@@ -208,4 +207,3 @@ export type {
   WorkerRunResult,
   WorkerRunUntilEmptyOpts,
 } from "./types";
-export { defaultSnapshotGonePolicy } from "./worker";

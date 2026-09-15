@@ -1,6 +1,16 @@
-import { type DispatchDeps, type Dispatcher, makeDispatcher } from "./dispatch";
-import { NagiFlowSnapshotGoneError, serializeError } from "./errors";
+import {
+  type DispatchDeps,
+  type Dispatcher,
+  type DispatchResult,
+  makeDispatcher,
+} from "./dispatch";
+import { type NagiFlowSnapshotGoneError, serializeError } from "./errors";
 import { Facts } from "./facts";
+import {
+  type Backoff,
+  defaultSnapshotGonePolicy,
+  dequeueBackoff,
+} from "./retry";
 import type {
   Clock,
   Millis,
@@ -17,33 +27,6 @@ const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_POLL_INTERVAL_MS: Millis = 1_000;
 const DEFAULT_TIMER_SWEEP_INTERVAL_MS: Millis = 30_000;
 const SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS: Millis = 30_000;
-const MAX_DEQUEUE_BACKOFF_MS: Millis = 30_000;
-const MIN_DEQUEUE_BACKOFF_MS: Millis = 50;
-
-// Bounds redelivery of a message whose run is pinned to a flow snapshot no
-// longer in any live registry. "retry" exists ONLY for the rolling-deploy
-// window, where a not-yet-replaced worker may still hold the pinned code and
-// can finish the run. Once that window has clearly passed, retrying is pure
-// poison: the observed failure mode was set_vt(0) redelivery ~1/s for 8 days
-// (read_ct 660k) drowning staging logs. "fail" is the honest terminal state —
-// the run cannot advance on any current code — and unlike the old behavior it
-// leaves a workflow_run.error a human can triage, then admin-restart.
-// Quadratic backoff capped at 5 min, budget 60 deliveries ≈ a 4.2h retry
-// window. Rationale: the window must comfortably exceed the longest plausible
-// old/new worker overlap (a rolling deploy is minutes, but a wedged draining
-// task has been observed hanging on for hours), and 4h matches the house
-// signal-timeout constant while staying under typical stuck-run alerting
-// thresholds (6h) — so a run that is GOING to fail fails before it pages as
-// stuck. Within the window: fast redelivery early (sub-minute, when a frozen
-// worker most likely still exists), quiet later (5 min cadence, ~60 log lines
-// total for a run that never recovers — vs 660k at set_vt(0)).
-export const defaultSnapshotGonePolicy: SnapshotGonePolicy = (readCount) => {
-  if (readCount > 60) return { action: "fail" };
-  return {
-    action: "retry",
-    delayMs: Math.min(readCount * readCount * 1_000, 300_000),
-  };
-};
 
 export interface WorkerDeps extends DispatchDeps {
   readonly clock: Clock;
@@ -57,6 +40,7 @@ class WorkerImpl implements Worker {
   private inFlight = 0;
   private readonly concurrency: number;
   private readonly pollIntervalMs: Millis;
+  private readonly dequeueBackoffMs: Backoff;
   private readonly signal: AbortSignal | undefined;
   private readonly dispatcher: Dispatcher;
   private readonly timerSweepIntervalMs: Millis;
@@ -71,6 +55,7 @@ class WorkerImpl implements Worker {
   ) {
     this.concurrency = Math.max(1, config?.concurrency ?? DEFAULT_CONCURRENCY);
     this.pollIntervalMs = config?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.dequeueBackoffMs = dequeueBackoff(this.pollIntervalMs);
     this.signal = config?.signal;
     this.dispatcher = makeDispatcher(deps);
     this.snapshotGonePolicy =
@@ -227,19 +212,6 @@ class WorkerImpl implements Worker {
     return this.deps.queue.dequeue({ count: Math.max(1, count) });
   }
 
-  // Exponential, capped, reset on the first success: a one-off blip costs one
-  // poll interval, a real outage settles to a 30s cadence instead of hammering
-  // a down database and flooding logs. Anchored on pollIntervalMs (default 1s,
-  // so the default curve is 1s -> 30s) and floored so a 0/near-0 poll interval
-  // cannot turn a persistent failure into a tight loop.
-  private dequeueBackoffMs(consecutiveFailures: number): Millis {
-    const base = Math.max(this.pollIntervalMs, MIN_DEQUEUE_BACKOFF_MS);
-    return Math.min(
-      base * 2 ** (consecutiveFailures - 1),
-      MAX_DEQUEUE_BACKOFF_MS,
-    );
-  }
-
   private fire(msg: QueueMessage): void {
     this.inFlight++;
     const release = this.trackFlow(msg);
@@ -250,29 +222,10 @@ class WorkerImpl implements Worker {
   }
 
   private async dispatchSafely(msg: QueueMessage): Promise<void> {
+    let result: DispatchResult;
     try {
-      await this.dispatcher.dispatchMessage(msg);
+      result = await this.dispatcher.dispatchMessage(msg);
     } catch (err) {
-      if (err instanceof NagiFlowSnapshotGoneError) {
-        try {
-          await this.handleSnapshotGone(msg, err);
-        } catch (handleErr) {
-          // A broken policy or store failure must neither escape (fire() has
-          // no rejection handler) nor tight-loop the message — the delayed
-          // nack keeps the redelivery cadence bounded until it's fixed.
-          this.deps.emitLog({
-            level: "error",
-            msg: "worker.dispatch: snapshot-gone handling failed",
-            attrs: { runId: err.runId, error: String(handleErr) },
-          });
-          try {
-            await this.deps.queue.nack(msg.receipt, {
-              delayMs: SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS,
-            });
-          } catch {}
-        }
-        return;
-      }
       this.deps.emitLog({
         level: "error",
         msg: "worker.dispatch threw uncaught",
@@ -281,6 +234,30 @@ class WorkerImpl implements Worker {
       try {
         await this.deps.queue.nack(msg.receipt);
       } catch {}
+      return;
+    }
+    switch (result.kind) {
+      case "done":
+        return;
+      case "snapshot-gone":
+        try {
+          await this.handleSnapshotGone(msg, result.error);
+        } catch (handleErr) {
+          // A broken policy or store failure must neither escape (fire() has
+          // no rejection handler) nor tight-loop the message — the delayed
+          // nack keeps the redelivery cadence bounded until it's fixed.
+          this.deps.emitLog({
+            level: "error",
+            msg: "worker.dispatch: snapshot-gone handling failed",
+            attrs: { runId: result.error.runId, error: String(handleErr) },
+          });
+          try {
+            await this.deps.queue.nack(msg.receipt, {
+              delayMs: SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS,
+            });
+          } catch {}
+        }
+        return;
     }
   }
 
@@ -288,7 +265,6 @@ class WorkerImpl implements Worker {
   // says a frozen-version worker might still claim it; past that budget the
   // run is terminally failed with the snapshot-gone error and the message
   // acked, so poison messages cannot outlive the deploy that orphaned them.
-  // (Terminal runs never reach here — dispatchMessage acks them itself.)
   private async handleSnapshotGone(
     msg: QueueMessage,
     err: NagiFlowSnapshotGoneError,

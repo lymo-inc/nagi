@@ -1,5 +1,5 @@
-import type { DispatchDeps } from "../dispatch";
-import { NagiFlowSnapshotGoneError, serializeError } from "../errors";
+import type { DispatchDeps, DispatchResult } from "../dispatch";
+import { serializeError } from "../errors";
 import { Facts } from "../facts";
 import {
   asStepMapWithDefs,
@@ -14,13 +14,13 @@ import {
   selectArm,
   type TaskDef,
 } from "../internal";
+import { resolveRetry } from "../retry";
 import { deriveChildRunId } from "../run-id";
 import { stepStateOf } from "../scheduler";
 import { isAbortRequested, isTerminalRun, resolvedOf } from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
   classifyFailure,
-  DEFAULT_RETRY,
   makeActivityCtx,
   makeStepCtx,
   resolveExecutionFact,
@@ -58,7 +58,7 @@ interface ExecuteTaskResult {
 }
 
 export interface MessageHandler {
-  dispatchMessage(message: QueueMessage): Promise<void>;
+  dispatchMessage(message: QueueMessage): Promise<DispatchResult>;
 }
 
 // Replay generation for a subflow step: the count of step.reset facts for it.
@@ -81,35 +81,35 @@ export function makeMessage(
   const { fireHook, fireStepLifecycle } = hooks;
   const { advance } = progression;
 
-  async function dispatchMessage(message: QueueMessage): Promise<void> {
+  async function dispatchMessage(
+    message: QueueMessage,
+  ): Promise<DispatchResult> {
     const { queue } = deps;
+    const resolution = await deps.resolveFlow(message.runId);
     let flow: Flow;
-    try {
-      flow = await deps.flowFor(message.runId);
-    } catch (err) {
-      // A terminal run's message must not outlive it: without this, a run
-      // canceled AFTER its flow snapshot went gone (deploy replaced the flow
-      // mid-flight) would nack-loop forever, because the hash check fires
-      // before admit()'s canceled-phase check ever runs.
-      if (
-        err instanceof NagiFlowSnapshotGoneError &&
-        isTerminalRun(await deps.store.loadRunState(message.runId))
-      ) {
+    switch (resolution.kind) {
+      case "current":
+        flow = resolution.flow;
+        break;
+      // A terminal run's message must not outlive it: a run canceled AFTER
+      // its snapshot went gone would otherwise nack-loop forever, since the
+      // hash check fires before admit()'s canceled-phase check ever runs.
+      case "gone-terminal":
         await queue.ack(message.receipt);
-        return;
-      }
-      throw err;
+        return { kind: "done" };
+      case "gone-live":
+        return { kind: "snapshot-gone", error: resolution.error };
     }
 
     const admission = await admit({ flow, message });
     if (admission.tag === "skip") {
       await queue.ack(message.receipt);
-      return;
+      return { kind: "done" };
     }
     if (admission.tag === "recover") {
       await advance(message.runId);
       await queue.ack(message.receipt);
-      return;
+      return { kind: "done" };
     }
     const { def, state } = admission;
 
@@ -144,6 +144,7 @@ export function makeMessage(
     // Ack last: if interpret's advance throws, dispatchSafely nacks and the
     // redelivery takes the recover path above.
     await queue.ack(message.receipt);
+    return { kind: "done" };
   }
 
   async function admit(args: {
@@ -592,7 +593,7 @@ export function makeMessage(
     const handler = handlerDef(def);
 
     const postState = await store.loadRunState(runId);
-    const policy = handler?.retry ?? deps.defaultRetry ?? DEFAULT_RETRY;
+    const policy = resolveRetry(handler?.retry, deps.defaultRetry);
     const outcome = classifyFailure({
       attempt,
       policy,

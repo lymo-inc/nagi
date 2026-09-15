@@ -712,12 +712,14 @@ export interface Store {
 
   // MUST never prune non-terminal runs; delete in batches of opts.batchSize.
   pruneFacts(opts: Required<PruneOpts>): Promise<PruneResult>;
+
+  // Optional streaming side-channel for b.streamingTask. Lives on the Store
+  // because the close contract below needs the terminal facts, which only the
+  // Store observes. Absent → nagi() throws at registration for streaming steps.
+  readonly stream?: StreamTransport;
 }
 
-// Streaming side-channel for b.streamingTask, separate from Store: chunk
-// transport is ephemeral and out-of-band, never transactional. A Store may
-// implement it (the in-memory reference does); otherwise nagi() throws at
-// registration if a flow has a streaming step.
+// Chunk transport is ephemeral and out-of-band, never transactional.
 export interface StreamTransport {
   // The iterator MUST close when the step reaches a terminal fact.
   subscribeStream(
@@ -832,16 +834,16 @@ export interface Queue {
   // Optional read-only triage view of a run's in-queue messages (see
   // wf.inspectQueue). Optional because not every broker can query by run.
   inspect?(runId: RunId): Promise<readonly QueueInspectEntry[]>;
+  // Optional: a Queue whose writes join `tx`, so an enqueue commits atomically
+  // with the Store writes in the same tx (startStaged, lease sweep). The
+  // returned Queue MUST route every write through `tx` and nothing else.
+  // Absent → callers use the plain queue; there is no atomicity to inherit.
+  withTx?(tx: Tx): Queue;
 }
 
 export interface Clock {
   now(): Date;
   sleep(ms: Millis, signal?: AbortSignal): Promise<void>;
-  schedule(at: Date, runId: RunId, stepId: StepId): Promise<void>;
-}
-
-export interface Trigger {
-  subscribe(handler: (runId: RunId) => void): () => void;
 }
 
 export type FactKind =
