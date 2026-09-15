@@ -1000,8 +1000,8 @@ class PostgresStore<DB = unknown> implements Store {
        WHERE (${flowId ?? null}::text IS NULL OR flow_id = ${flowId ?? null})
          AND (${statuses === undefined ? null : statuses}::text[] IS NULL
               OR status = ANY(${statuses === undefined ? null : statuses}::text[]))
-         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)} IS NULL
-              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)})
+         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)}::jsonb IS NULL
+              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)}::jsonb)
          AND (${cursor === null ? null : new Date(cursor.t)}::timestamptz IS NULL
               OR (started_at, run_id) <
                  (${cursor === null ? null : new Date(cursor.t)}::timestamptz,
@@ -1200,7 +1200,7 @@ class PostgresStore<DB = unknown> implements Store {
 
         const victims = victimRows.rows.map((r) => r.run_id);
         if (victims.length === 0) {
-          return { runs: 0, facts: 0 };
+          return { candidates: 0, runs: 0, facts: 0 };
         }
 
         const factDel = await sql<{ run_id: string }>`
@@ -1232,10 +1232,18 @@ class PostgresStore<DB = unknown> implements Store {
           `.execute(trx);
         }
 
-        return { runs: victims.length, facts: factDel.rows.length };
+        // Under READ COMMITTED a concurrent pruner can have emptied a victim's
+        // facts after our snapshot (the workflow_run row is untouched when
+        // keepSummary is on, so the EXISTS qual is never re-checked). Count only
+        // runs whose facts this call actually removed.
+        return {
+          candidates: victims.length,
+          runs: new Set(factDel.rows.map((r) => r.run_id)).size,
+          facts: factDel.rows.length,
+        };
       });
 
-      if (batch.runs === 0) break;
+      if (batch.candidates === 0) break;
       runsPruned += batch.runs;
       factsPruned += batch.facts;
     }
