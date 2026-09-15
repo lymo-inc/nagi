@@ -1,5 +1,161 @@
 # @nagi-js/core
 
+## 0.1.1-rc.19
+
+### Patch Changes
+
+- d468140: Collapse hypothetical seams (#42): one adapter is not a seam. Interfaces now declare only what the engine exercises.
+
+  **Removed (`@nagi-js/core`)**
+
+  - `Clock.schedule(at, runId, stepId)` — zero engine callers; only its own test exercised it. `Clock` is now `{ now, sleep }`.
+  - `InMemoryClock.dispose()` and the `InMemoryClock` constructor options (`{ trigger }`) — existed only to back `schedule`. `new InMemoryClock()` is unchanged.
+  - `Trigger` interface and `InMemoryTrigger` — `Trigger.subscribe` had no subscriber anywhere in the engine.
+  - `NagiConfig.trigger` — accepted and never read.
+  - `NagiConfig.streamTransport` — streaming is now a Store capability (below); there is no second injection path.
+
+  **Removed (`@nagi-js/postgres`)**
+
+  - `postgresTrigger`, `PostgresTriggerOpts`, `ListenClient`, `NotificationMessage` — the only implementation of the removed `Trigger` interface. Nothing in the runtime consumed it; a LISTEN/NOTIFY wake-up can return as a real seam once the engine has a caller for it.
+
+  **`Queue.withTx?(tx): Queue` is now declared once, in core.** It has two consumers (`wf.startStaged` and the Postgres store's lease sweep), so it is a real seam. Both call sites use the typed optional method (`queue.withTx?.(tx) ?? queue`); the two private `typeof q.withTx === "function"` duck-typing helpers in core and postgres are gone. The returned Queue MUST route every write through `tx`. `PgmqQueue` still narrows it to required, the same way it narrows `ensureSchema`.
+
+  **`StreamTransport` folded into `Store.stream?: StreamTransport`.** The runtime no longer sniffs the Store for `subscribeStream`/`publishChunk`; it reads `config.store.stream`. It lives on the Store, not beside it, because the close contract (the iterator MUST end when the step reaches a terminal fact) can only be honored by whoever observes the fact log — which is the Store. `InMemoryStore.stream` is the reference implementation (`store.subscribeStream` / `store.publishChunk` moved to `store.stream.subscribeStream` / `store.stream.publishChunk`). A Postgres deployment satisfies it the same way: a Store that exposes `stream`, driving close/retry off its own `appendFact` (e.g. LISTEN/NOTIFY fan-out of chunks with the in-memory hub's semantics). `postgresStore` does not implement it yet, so a flow with a `b.streamingTask` step still throws at `nagi()` registration on Postgres — unchanged behavior, now stated by the type instead of discovered at runtime.
+
+  `Operator` is left as is: it is referenced by name in docs and the operator changeset.
+
+- bbeeef7: Own each fact kind in one place (#38). `packages/core/src/facts/` now holds,
+  per lifecycle (`flow` / `step` / `signal` / `lease`), a kind's shape, its
+  constructor, its fold arm, and its read-model row delta. `foldRun` moved from
+  `state.ts` to `facts/`; `state.ts` is the read model only. The public `Fact`
+  union and every `*Fact` type still come from `@nagi-js/core` (single door).
+
+  New: `rowDeltaOf(fact): RowDelta | null` and the `RowDelta` type. The Postgres
+  store no longer hand-transcribes an 18-case fact→table switch; it interprets
+  the small `RowDelta` vocabulary core declares per kind, and every persistence
+  path (`appendFact`, `settleStep`, `runStep`, `settleSignal`,
+  `sweepSignalTimeouts`, concurrency cancel) goes through the same
+  `persistFact`. A new fact kind that lacks a fold arm or a row-delta declaration
+  fails to compile; audit-only kinds declare `rows: null` explicitly.
+
+  Removed (dead, never produced or read — public-surface removals):
+
+  - `signal.sent`: `FactKind` member, `SignalSentFact`, `SignalSentEvent`,
+    `FlowHooks.onSignalSent`, and the `@nagi-js/otel` `composeHooks` fan-out.
+    No runtime path ever constructed or fired it.
+  - `RunState.anomalies` and the `Anomaly` type. Nothing read them; the fold is
+    still total (a contradictory fact keeps the prior step state).
+
+  Persisted logs fold unchanged; unknown kinds in a log (e.g. a removed one)
+  fold and materialize as no-ops instead of throwing.
+
+- 9624f15: Internal: every retry/backoff decision now lives in one module (`retry.ts`).
+  `DEFAULT_RETRY` was defined twice with the same values — once for execution
+  (`step-exec.ts`) and once for flow hashing (`canonicalize.ts`) — so a change
+  to one either silently re-hashed every flow (stranding in-flight runs as
+  snapshot-gone) or silently never took effect at runtime. It is now defined
+  once and imported by both; the canonical values are pinned by test and are
+  byte-identical to before, so **no flow hash changes**.
+
+  The four backoff curves (step retry, dequeue outage backoff, snapshot-gone
+  redelivery budget, lease-reap re-dispatch) are named pure functions with one
+  signature shape, covered by a single table-driven test. Policy resolution
+  (`handler.retry` → `nagi({ defaultRetry })` → built-in) is `resolveRetry`.
+
+  No public API change: `defaultSnapshotGonePolicy` is still exported from the
+  package root with identical behavior.
+
+- bbeeef7: Run lifecycle (start / supersede / cancel / spawn-child) now lives in one
+  internal module with a single "start a run" path. `wf.startById`,
+  `wf.startStagedById`, and subflow child spawning are thin callers over it; the
+  own-tx vs caller-tx choice is resolved at exactly one fork, and the post-commit
+  effects (superseded-run hooks + parent propagation, the start event, the
+  initial dispatch) are a value applied by one function — immediately, or from
+  `applyOnCommit`.
+
+  Two staged-start (`wf.startStaged`) gaps close along the way:
+
+  - Roots that are all gated (`when: () => false`) used to enqueue nothing and
+    leave the run parked; the run now advances from `applyOnCommit`, as
+    `wf.start` always did.
+  - A mix of runnable and gated roots still enqueues the runnable roots on the
+    caller's tx, exactly as before; the gated siblings' `step.skipped` facts are
+    now recorded from `applyOnCommit` instead of waiting for the next advance.
+
+  `applyOnCommit` memoizes its first invocation: later calls are no-ops on
+  success, and re-throw the same rejection if that first application failed
+  (previously a second call after a failure resolved silently).
+
+  No public API or fact-shape changes.
+
+- ef71525: Internal: the snapshot-gone condition (a run pinned to a `flowHash` this
+  process did not register) now has one owner. Flow registration, the hash
+  table, and the disposition live in one module that answers "which Flow runs
+  this run" with a discriminated result — `current`, `gone-live` (the worker's
+  `snapshotGonePolicy` decides), or `gone-terminal` (ack and drop). The message
+  handler, worker, and replay consume that result instead of each re-deriving
+  the condition from the error. No change to `SnapshotGonePolicy`,
+  `NagiFlowSnapshotGoneError`, the default retry budget, or replay's
+  drift-allowed synthesis as observed by consumers.
+- b10921c: Move the remaining `Store` policy into core and make the prose `MUST`
+  contracts executable.
+
+  New pure functions in `@nagi-js/core` (the seam `decideSignal` /
+  `decideExpiredLeaseAction` already use — core decides, the adapter owns only
+  its tx boundary): `factEffects` (which leases / timers / concurrency slots a
+  fact releases), the `queryRuns` cursor codec and limit clamp
+  (`encodeRunCursor` / `decodeRunCursor` / `clampQueryLimit` / `compareRunOrder`
+  / `isPastCursor`), `jsonContains` (reference `@>` semantics for
+  `where.input`), `selectExpired` (expiry filter before limit for lease and
+  timer sweeps) and `selectPruneBatch` (prune eligibility, oldest-first
+  batching). Both adapters call them; the 48 byte-identical cursor lines in
+  `@nagi-js/postgres` are gone.
+
+  `InMemoryStore` now agrees with `postgresStore` where the two had drifted:
+
+  - Leases are released on `settleStep`, `runStep`, `settleSignal` delivery,
+    signal timeout, `step.canceled` and `step.reset`, driven by `factEffects`
+    at the single `appendFact` choke point. `describe()` no longer reports a
+    `lease` on a settled step, and `sweepLeases` no longer sees settled steps as
+    candidates.
+  - `sweepLeases` / `sweepSignalTimeouts` filter on expiry before applying
+    `limit`, so an expired lease can no longer starve behind `limit` live ones.
+  - `pruneFacts` drains in batches of `batchSize` (loop until empty), matching
+    the Postgres loop.
+  - `recordOnce` is first-write-wins (was last-write-wins).
+  - `describe()` returns the retained summary (no steps) for a run pruned with
+    `keepSummary: true` instead of `null`.
+
+  `postgresStore` applies `factEffects` in `appendFact` and every settle path,
+  replacing six hand-placed lease deletes. One behavioural change: `settleStep`
+  / `runStep` with `step.completed` now also drop a stale signal timer for that
+  step (previously only the signal-delivery path did). The conformance suite
+  also caught a real bug: `queryRuns` without a `where.input` filter failed on
+  Postgres with `could not determine data type of parameter` (an untyped
+  `$n IS NULL`); the parameter is now cast to `jsonb`.
+
+  New subpath `@nagi-js/core/testing` exports `storeContract`, a
+  framework-agnostic conformance suite (one case per `Store` `MUST`, plus one
+  per divergence above) and `passthroughSchema`. Run it against any adapter:
+
+  ```ts
+  for (const c of storeContract) it(c.name, () => c.run({ makeStore }));
+  ```
+
+  `@nagi-js/core` runs it against `InMemoryStore`; `@nagi-js/postgres` runs it
+  against `postgresStore` in `store-contract.test.ts` (gated on
+  `NAGI_POSTGRES_TEST_URL`, like the integration suite).
+
+- 179d3e7: Remove the undocumented `__dispatchDeps` property `nagi()` planted on the `wf`
+  object. It was never part of the public API (non-enumerable, untyped) and
+  existed only so core's own test harness could bypass the `Worker` with a
+  private dispatcher; the harness now drives `wf.worker(...)` directly, so the
+  real dequeue/admission/snapshot-gone loop is what every harness test covers.
+
+  `Worker.runUntilEmpty({ deadline })` now reads the injected `Clock` for its
+  deadline instead of `Date.now()` — the bounded drain's only wall-clock read.
+  No behaviour change for any shipped clock.
+
 ## 0.1.1-rc.18
 
 ### Patch Changes
