@@ -137,7 +137,7 @@ describe("b.signal timeout", () => {
     });
     const dispatcher = makeDispatcher(h.deps);
 
-    const runId = await h.wf.start(f, {});
+    await h.wf.start(f, {});
     await h.drain();
     await dispatcher.sweepTimers(FAR_FUTURE());
 

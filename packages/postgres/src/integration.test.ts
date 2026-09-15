@@ -161,9 +161,12 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(await store.claimStep(runId, "s1", 1)).not.toBeNull();
     await new Promise((r) => setTimeout(r, 80));
 
-    const reaped = await store.sweepLeases({ now: new Date(), queue });
+    // The schema is shared across this file, so the sweep also reaps the
+    // expired lease left by the re-acquire test above — assert on ours only.
+    const reaped = (await store.sweepLeases({ now: new Date(), queue })).filter(
+      (r) => r.runId === runId,
+    );
     expect(reaped).toHaveLength(1);
-    expect(reaped[0]?.runId).toBe(runId);
     expect(reaped[0]?.nextAttempt).toBe(2);
 
     // Re-claim at the new attempt succeeds (lease row was deleted by sweep)
@@ -588,17 +591,18 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
 
     it("status filter accepts single value and array", async () => {
       const wf = await makeNagi();
-      await seed("f", {});
-      await seed("f", {}, "completed");
-      await seed("f", {}, "failed");
+      // Own flowId: the schema is shared with every earlier test's terminal runs.
+      await seed("qr-status", {});
+      await seed("qr-status", {}, "completed");
+      await seed("qr-status", {}, "failed");
 
       const completed = await wf.queryRuns({
-        where: { status: ["completed"] },
+        where: { flowId: "qr-status", status: ["completed"] },
       });
       expect(completed.runs).toHaveLength(1);
 
       const both = await wf.queryRuns({
-        where: { status: ["completed", "failed"] },
+        where: { flowId: "qr-status", status: ["completed", "failed"] },
       });
       expect(both.runs).toHaveLength(2);
     });
