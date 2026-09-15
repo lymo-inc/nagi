@@ -380,11 +380,12 @@ class PostgresStore<DB = unknown> implements Store {
     attempt: AttemptNumber,
   ): Promise<ClaimToken | null> {
     const token = `lease-${crypto.randomUUID()}`;
-    const expiresAt = new Date(Date.now() + this.leaseMs);
 
+    // Expiry on the database clock, like extendLease and the ON CONFLICT guard
+    // below — an app clock a few seconds fast must not grant a second claim.
     const result = await sql<{ token: string }>`
       INSERT INTO ${sql.raw(this.t("lease"))} (run_id, step_id, attempt, token, expires_at)
-      VALUES (${runId}, ${stepId}, ${attempt}, ${token}, ${expiresAt})
+      VALUES (${runId}, ${stepId}, ${attempt}, ${token}, now() + (${this.leaseMs}::int * interval '1 ms'))
       ON CONFLICT (run_id, step_id, attempt) DO UPDATE
         SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at
         WHERE ${sql.raw(this.t("lease"))}.expires_at < now()
@@ -770,12 +771,38 @@ class PostgresStore<DB = unknown> implements Store {
           ON CONFLICT (run_id, step_id, attempt) DO UPDATE SET status = 'skipped'
         `.execute(trx);
         return;
-      case "reset":
+      case "reset": {
+        // Reopen a completed/failed run (replay, operator.retry). Read the
+        // identity first: after a unique violation the tx is aborted and no
+        // further SELECT would succeed.
+        const row = await sql<{
+          flow_id: string;
+          concurrency_key: string | null;
+        }>`
+          SELECT flow_id, concurrency_key FROM ${sql.raw(this.t("workflow_run"))}
+           WHERE run_id = ${runId}
+        `.execute(trx);
+        try {
+          await sql`
+            UPDATE ${sql.raw(this.t("workflow_run"))}
+               SET status = 'running', output = NULL, error = NULL, completed_at = NULL
+             WHERE run_id = ${runId} AND status IN ('completed', 'failed')
+          `.execute(trx);
+        } catch (err) {
+          // workflow_run_concurrency_active_uidx: another active run holds this key.
+          if (!isUniqueViolation(err)) throw err;
+          throw new NagiConcurrencyConflictError({
+            runId,
+            flowId: row.rows[0]?.flow_id ?? "",
+            concurrencyKey: row.rows[0]?.concurrency_key ?? "",
+          });
+        }
         await sql`
           DELETE FROM ${sql.raw(this.t("step_run"))}
            WHERE run_id = ${runId} AND step_id = ${delta.stepId}
         `.execute(trx);
         return;
+      }
     }
   }
 
@@ -948,8 +975,8 @@ class PostgresStore<DB = unknown> implements Store {
        WHERE (${flowId ?? null}::text IS NULL OR flow_id = ${flowId ?? null})
          AND (${statuses === undefined ? null : statuses}::text[] IS NULL
               OR status = ANY(${statuses === undefined ? null : statuses}::text[]))
-         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)} IS NULL
-              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)})
+         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)}::jsonb IS NULL
+              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)}::jsonb)
          AND (${cursor === null ? null : new Date(cursor.t)}::timestamptz IS NULL
               OR (started_at, run_id) <
                  (${cursor === null ? null : new Date(cursor.t)}::timestamptz,
@@ -1148,7 +1175,7 @@ class PostgresStore<DB = unknown> implements Store {
 
         const victims = victimRows.rows.map((r) => r.run_id);
         if (victims.length === 0) {
-          return { runs: 0, facts: 0 };
+          return { candidates: 0, runs: 0, facts: 0 };
         }
 
         const factDel = await sql<{ run_id: string }>`
@@ -1180,10 +1207,18 @@ class PostgresStore<DB = unknown> implements Store {
           `.execute(trx);
         }
 
-        return { runs: victims.length, facts: factDel.rows.length };
+        // Under READ COMMITTED a concurrent pruner can have emptied a victim's
+        // facts after our snapshot (the workflow_run row is untouched when
+        // keepSummary is on, so the EXISTS qual is never re-checked). Count only
+        // runs whose facts this call actually removed.
+        return {
+          candidates: victims.length,
+          runs: new Set(factDel.rows.map((r) => r.run_id)).size,
+          facts: factDel.rows.length,
+        };
       });
 
-      if (batch.runs === 0) break;
+      if (batch.candidates === 0) break;
       runsPruned += batch.runs;
       factsPruned += batch.facts;
     }

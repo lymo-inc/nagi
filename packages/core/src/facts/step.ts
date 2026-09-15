@@ -345,6 +345,13 @@ export const stepKinds = {
     fold: (draft, fact) => {
       draft.steps[fact.stepId] = PENDING;
       delete draft.selectedArms[fact.stepId];
+      // A reset step must wait for a fresh signal, never replay the old one.
+      delete draft.bufferedSignals[fact.stepId];
+      // A run with a pending step is not settled. Reset reopens completed/failed
+      // (replay, operator.retry); canceled stays canceled — retry rejects those.
+      if (draft.phase.tag === "completed" || draft.phase.tag === "failed") {
+        draft.phase = { tag: "running" };
+      }
     },
     rows: (fact) => ({ row: "step", status: "reset", stepId: fact.stepId }),
   },

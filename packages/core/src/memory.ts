@@ -1,3 +1,4 @@
+import { NagiConcurrencyConflictError } from "./errors";
 import { Facts, foldRun } from "./facts";
 import { decideExpiredLeaseAction, type ReapedLease } from "./lease-reaper";
 import type {
@@ -77,6 +78,8 @@ export class InMemoryStore implements Store, StreamTransport {
   private readonly globalFacts: GlobalFact[] = [];
   private readonly activeByKey = new Map<string, RunId>();
   private readonly keyByActiveRun = new Map<RunId, string>();
+  // Kept past terminal facts so a reopened run can re-take its slot.
+  private readonly slotByRun = new Map<RunId, string>();
   private readonly childrenByParent = new Map<RunId, Set<RunId>>();
   private readonly summaries = new Map<RunId, RunSummary>();
   private readonly streamHub = new InMemoryStreamHub();
@@ -92,6 +95,26 @@ export class InMemoryStore implements Store, StreamTransport {
 
   async appendFact(runId: RunId, fact: Fact): Promise<void> {
     const list = this.facts.get(runId) ?? [];
+    if (fact.kind === "step.reset") {
+      // Mirror of the Postgres partial unique index: a reopened run re-takes
+      // its concurrency slot, and must not steal it from another active run.
+      const prior = foldRun(runId, list);
+      if (prior.phase.tag === "completed" || prior.phase.tag === "failed") {
+        const slot = this.slotByRun.get(runId);
+        if (slot !== undefined) {
+          const holder = this.activeByKey.get(slot);
+          if (holder !== undefined && holder !== runId) {
+            throw new NagiConcurrencyConflictError({
+              runId,
+              flowId: prior.flowId,
+              concurrencyKey: slot.slice(slot.indexOf("::") + 2),
+            });
+          }
+          this.activeByKey.set(slot, runId);
+          this.keyByActiveRun.set(runId, slot);
+        }
+      }
+    }
     list.push(fact);
     this.facts.set(runId, list);
     // Drive the stream hub off the durable fact log. These fire for ALL steps;
@@ -181,6 +204,7 @@ export class InMemoryStore implements Store, StreamTransport {
       }
       this.activeByKey.set(slot, runId);
       this.keyByActiveRun.set(runId, slot);
+      this.slotByRun.set(runId, slot);
     }
 
     this.facts.set(runId, [fact]);
@@ -563,7 +587,8 @@ export class InMemoryStore implements Store, StreamTransport {
     let error: Json | undefined;
     let canceledByRunId: RunId | undefined;
     let concurrencyKey: string | undefined;
-    for (let i = factList.length - 1; i >= 0; i--) {
+    // A reopened run carries stale terminal facts; only a terminal phase owns them.
+    for (let i = isTerminalRun(state) ? factList.length - 1 : -1; i >= 0; i--) {
       const f = factList[i];
       if (f === undefined) continue;
       if (f.kind === "flow.completed") {
@@ -775,7 +800,7 @@ function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
   if (first === undefined || first.kind !== "flow.started") return null;
   const projected = foldRun(runId, facts);
   let completedAt: Date | null = null;
-  for (let i = facts.length - 1; i >= 0; i--) {
+  for (let i = isTerminalRun(projected) ? facts.length - 1 : -1; i >= 0; i--) {
     const f = facts[i];
     if (f === undefined) continue;
     if (

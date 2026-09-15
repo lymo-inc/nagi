@@ -58,8 +58,15 @@ export const signalFacts = {
 } as const;
 
 export const signalKinds = {
-  // Audit-only: delivery settles the step through its own step.completed.
-  "signal.received": { fold: () => {}, rows: null },
+  "signal.received": {
+    // Delivery settles the step through its own step.completed; here the
+    // buffer is spent. Leaving it would make the next incoming signal a silent
+    // no-op and a later reset auto-complete.
+    fold: (draft, fact) => {
+      delete draft.bufferedSignals[fact.stepId];
+    },
+    rows: null,
+  },
   "signal.buffered": {
     // First buffered signal per step wins, mirroring the happy path where the
     // first delivered signal completes the step and later ones no-op.
