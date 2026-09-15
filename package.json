@@ -28,17 +28,17 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.14",
-    "@changesets/cli": "^2.31.0",
+    "@changesets/cli": "^2.31.1",
     "@nagi-js/core": "workspace:*",
     "@nagi-js/otel": "workspace:*",
     "@nagi-js/pgmq": "workspace:*",
     "@nagi-js/postgres": "workspace:*",
     "husky": "^9.1.7",
-    "lint-staged": "^17.0.7",
+    "lint-staged": "^17.5.1",
     "publint": "^0.2.12",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.11"
   },
   "lint-staged": {
     "*.{ts,tsx,js,jsx,json,jsonc}": "biome check --write --no-errors-on-unmatched"
