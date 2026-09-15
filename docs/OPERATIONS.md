@@ -18,7 +18,7 @@ const q = await wf.inspectQueue(runId); // in-queue messages for the run
 | running, 0 started steps          | entry with `readCount: 0`      | Never scheduled — workers starved or not consuming               |
 | running, step has live `lease`    | entry with future `visibleAt`  | Actively executing (slow handler — watch for watchdog warns)     |
 | running, signal step `running`    | no entries                     | Parked on a signal/child — check the signal source, not the pool |
-| running, no lease, no entries     | —                              | Advance was lost — `operator().retry(runId, stepId)` re-drives   |
+| running, no lease, no entries     | —                              | Advance was lost — self-heals on next redelivery; `operator().retry(runId, stepId, { actor })` re-drives immediately |
 | any status                        | entry with high `readCount`    | Redelivery loop — see poison messages below                      |
 
 ## Nothing is being consumed (fleet-wide stall)
