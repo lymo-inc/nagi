@@ -13,7 +13,11 @@ import type {
 import { type Kysely, sql } from "kysely";
 
 const DEFAULT_QUEUE_NAME = "nagi";
-const DEFAULT_VISIBILITY_TIMEOUT_MS: Millis = 30_000;
+// Must exceed core's DEFAULT_HEARTBEAT_INTERVAL_MS (40s), or a slow step is
+// redelivered before its first lease extension. Matches core's
+// DEFAULT_HEARTBEAT_LEASE_MS so a crashed worker's message and its store
+// lease become reclaimable at the same time.
+const DEFAULT_VISIBILITY_TIMEOUT_MS: Millis = 120_000;
 
 export interface PgmqQueueOpts<DB = unknown> {
   readonly db: Kysely<DB>;

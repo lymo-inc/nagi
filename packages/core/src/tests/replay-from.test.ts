@@ -133,6 +133,10 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     await h.drain();
     expect(aRuns).toBe(2);
     expect(bRuns).toBe(2);
+    const result = await h.result(runId);
+    expect(result.status).toBe("completed");
+    expect(result.factCount("flow.failed")).toBe(1);
+    expect(result.factCount("flow.completed")).toBe(1);
   });
 
   it("`from` on a match step re-selects the arm and re-runs arm steps", async () => {

@@ -1,5 +1,52 @@
 # @nagi-js/core
 
+## 0.1.1-rc.18
+
+### Patch Changes
+
+- 0d1203c: A signal step's buffered early signal is now cleared when it is delivered and
+  when the step is reset (`operator.retry`, `wf.replay({ from })`). Previously
+  the first buffered payload lived on the projection forever: a reset signal
+  step completed instantly with the stale payload, and a genuinely new
+  `wf.signal` for that step was reported as buffered without writing a fact.
+- 4d4b178: A run whose step settled but whose follow-up `advance` was lost (worker crash
+  or store error between the terminal fact and the next enqueue) now self-heals:
+  redelivery of the step's message re-drives the run instead of being dropped,
+  and the message is acked only after the advance succeeds.
+- f27b5b9: Operator plane: `wf.inspectQueue(runId)` — read-only triage view of a run's in-queue messages (stepId, attempt, readCount, visibleAt) via optional `Queue.inspect()`; implemented for pgmq and the in-memory queue. Together with `wf.describe()` this replaces the hand-run SQL triage recipes; docs/OPERATIONS.md is the runbook.
+- eff6275: The signal-timeout sweep now isolates each run: a run whose advance throws
+  (flow snapshot gone, transient store error) is logged at `error` level and
+  skipped, and the remaining runs in the batch are still advanced to
+  `flow.failed`. Previously the first throw aborted the whole batch, and because
+  the store had already dropped the fired timers, the stranded runs were never
+  swept again.
+- 4b20b2e: `NagiNonRetryableError`: throw from a step to fail immediately, skipping the remaining retry budget. Honored anywhere on the cause chain.
+- 0d22d1f: Per-flow blast-radius bound: `WorkerConfig.maxConcurrencyPerFlow` caps the worker slots any single flow may hold; over-cap messages defer via delayed nack. `flowId` now rides the message envelope (stamped at every enqueue path incl. lease-reap; absent pre-upgrade messages are exempt). Multi-flow deployments should set the cap ≤ concurrency − 1 so one wedged flow can never occupy the whole pool.
+- 4b20b2e: Bound snapshot-gone redelivery. `QueueMessage.readCount` (pgmq `read_ct`) now travels with every delivery; the worker consults a `SnapshotGonePolicy(readCount)` — retry = delayed nack for the rolling-deploy window, then terminally fail the run with the real error and ack. Terminal runs' messages are acked at dispatch (a canceled run can no longer nack-loop). Default policy: quadratic backoff capped at 5 min, fail past 60 deliveries (~4.2h window).
+- 6d9c0c5: `step.reset` (from `wf.replay({ from })` and `operator.retry`) now reopens a
+  `completed`/`failed` run to `running`. Previously the run stayed terminal:
+  the re-run steps finished but no `flow.completed` was ever written
+  (`describe()`/`queryRuns` kept reporting `failed`, `onFlowComplete` never
+  fired, a waiting parent subflow was never woken), and the cancel watcher
+  aborted any re-run handler honoring `ctx.signal` after 250 ms because the run
+  looked terminal. Reopening a run whose concurrency key another active run
+  holds throws `NagiConcurrencyConflictError`. `canceled` runs are not reopened.
+- 4b20b2e: BREAKING: `b.signal` now requires `timeoutMs: Millis | "unbounded"` — unbounded parking must be an explicit opt-in, never an omission. `"unbounded"` canonicalizes as omission, so existing flows keep their hashes (and in-flight runs) when migrating a timeout-less signal to `"unbounded"`. Also BREAKING: the unenforced `timeoutMs` knob is removed from task/activity/streaming/subflow configs (it armed nothing; a flow that set it changes hash on upgrade). New lease-hold watchdog: `leaseHoldWarnMs` (default 5 min, 0 disables) warns whenever a step body holds a worker slot past each threshold multiple.
+- d751145: Worker loop survives transient queue failures. A rejected `queue.dequeue` used
+  to propagate out of `worker.run()` and terminate the poll loop: a single
+  `pg-pool` connection timeout inside `pgmq.read` silently stopped ALL flow
+  processing in a process that stayed otherwise healthy — no steps scheduled, no
+  messages consumed, and no signal until stuck-run alerts fired hours later.
+
+  `run()` now catches dequeue failures, logs `worker.dequeue failed; backing off`
+  (with `consecutiveFailures` and `backoffMs`), sleeps, and keeps polling —
+  exponential from `pollIntervalMs`, capped at 30s, reset on the first success.
+  Its contract is now explicit: `run()` settles only via the abort signal.
+
+  `runOnce()` / `runUntilEmpty()` are unchanged and still reject on queue
+  failure — they are bounded drains whose caller is awaiting a result, so a
+  rejection there is observed rather than silent.
+
 ## 0.1.1-rc.17
 
 ### Patch Changes

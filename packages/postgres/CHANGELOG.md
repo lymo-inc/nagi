@@ -1,5 +1,43 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.18
+
+### Patch Changes
+
+- 7867f5c: `pgmqQueue` default `visibilityTimeoutMs` is now 120s (was 30s), above core's
+  40s heartbeat interval — with stock settings a step longer than 30s was
+  redelivered before its first lease extension. `postgresStore.claimStep` now
+  computes lease expiry on the database clock, matching `extendLease`, so
+  application clock skew can no longer grant a second claim on a live lease.
+- f3268eb: `postgresStore.pruneFacts` over-reported `runsPruned` when two pruners ran
+  concurrently: under READ COMMITTED the second pruner's victim SELECT could
+  return runs whose facts the first had already deleted, and each was counted as
+  pruned. `runsPruned` now counts only runs whose facts the call actually
+  removed, and the batch loop stops on no candidates rather than on no deletions.
+- 9478345: `postgresStore.queryRuns` without a `where.input` filter failed on a real
+  database with `could not determine data type of parameter` — the absent
+  filter was bound as an untyped NULL. It is now cast to `jsonb`. Surfaced by the
+  first CI run of the Postgres integration suite.
+- 6d9c0c5: `step.reset` (from `wf.replay({ from })` and `operator.retry`) now reopens a
+  `completed`/`failed` run to `running`. Previously the run stayed terminal:
+  the re-run steps finished but no `flow.completed` was ever written
+  (`describe()`/`queryRuns` kept reporting `failed`, `onFlowComplete` never
+  fired, a waiting parent subflow was never woken), and the cancel watcher
+  aborted any re-run handler honoring `ctx.signal` after 250 ms because the run
+  looked terminal. Reopening a run whose concurrency key another active run
+  holds throws `NagiConcurrencyConflictError`. `canceled` runs are not reopened.
+- Updated dependencies [0d1203c]
+- Updated dependencies [4d4b178]
+- Updated dependencies [f27b5b9]
+- Updated dependencies [eff6275]
+- Updated dependencies [4b20b2e]
+- Updated dependencies [0d22d1f]
+- Updated dependencies [4b20b2e]
+- Updated dependencies [6d9c0c5]
+- Updated dependencies [4b20b2e]
+- Updated dependencies [d751145]
+  - @nagi-js/core@0.1.1-rc.18
+
 ## 0.1.1-rc.17
 
 ### Patch Changes

@@ -379,6 +379,13 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
       case "step.reset":
         steps[fact.stepId] = PENDING;
         delete selectedArms[fact.stepId];
+        // A reset step must wait for a fresh signal, never replay the old one.
+        delete bufferedSignals[fact.stepId];
+        // A run with a pending step is not settled. Reset reopens completed/failed
+        // (replay, operator.retry); canceled stays canceled — retry rejects those.
+        if (phase.tag === "completed" || phase.tag === "failed") {
+          phase = { tag: "running" };
+        }
         break;
       case "step.started":
       case "step.completed":
@@ -410,8 +417,12 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
           };
         }
         break;
-      case "signal.sent":
       case "signal.received":
+        // Delivered: the buffer is spent. Leaving it would make the next
+        // incoming signal a silent no-op and a later reset auto-complete.
+        delete bufferedSignals[fact.stepId];
+        break;
+      case "signal.sent":
       case "once.recorded":
       case "lease.reaped":
         // Audit-only: the reaper re-enqueues at attempt+1; the projection
