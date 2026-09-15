@@ -181,10 +181,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   const emitLog = makeEmit(config.onLog);
   await config.queue.ensureSchema?.();
 
-  // Falls back to the store when it also implements StreamTransport (the
-  // in-memory reference does); real deployments inject a dedicated transport.
-  const streamTransport =
-    config.streamTransport ?? asStreamTransport(config.store);
+  const streamTransport = config.store.stream;
 
   // Streaming steps publish ephemeral chunks out-of-band, so without a transport
   // they cannot be carried. Only scanned on the failure path.
@@ -735,12 +732,6 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       });
     },
   };
-  Object.defineProperty(wf, "__dispatchDeps", {
-    value: dispatchDeps,
-    enumerable: false,
-    writable: false,
-    configurable: false,
-  });
   // Trust boundary: persisted flow_id values were registered flow ids at write
   // time, so assert the erased string back to the registered union here.
   return wf as unknown as Wf<TFlows>;
