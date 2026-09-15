@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
-import { makeDispatcher } from "../dispatch";
 import { Facts } from "../facts";
 import type { AttemptNumber, QueueMessage, RunId } from "../types";
 import { emptySchema, makeHarness } from "./test-helpers";
@@ -73,37 +72,27 @@ describe("durable advance after settle", () => {
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
 
+    // The first state read that sees `a` completed rejects — i.e. interpret()'s
+    // advance() throws after the settle fact is written but before the ack.
     let fired = false;
-    const flakyStore = new Proxy(h.store, {
-      get(target, prop, recv) {
-        if (prop === "loadRunState") {
-          return async (id: RunId) => {
-            const s = await target.loadRunState(id);
-            if (!fired && s.steps["a"]?.tag === "completed") {
-              fired = true;
-              throw new Error("flaky");
-            }
-            return s;
-          };
-        }
-        const v = Reflect.get(target, prop, recv);
-        return typeof v === "function" ? v.bind(target) : v;
-      },
-    });
-    const dispatcher = makeDispatcher({ ...h.deps, store: flakyStore });
+    const loadRunState = h.store.loadRunState.bind(h.store);
+    h.store.loadRunState = async (id: RunId) => {
+      const s = await loadRunState(id);
+      if (!fired && s.steps["a"]?.tag === "completed") {
+        fired = true;
+        throw new Error("flaky");
+      }
+      return s;
+    };
 
-    const [msg] = await h.queue.dequeue({ count: 1 });
-    expect(msg?.stepId).toBe("a");
-    await expect(
-      dispatcher.dispatchMessage(msg as QueueMessage),
-    ).rejects.toThrow("flaky");
+    // One step through the real worker: the dispatch throws, the worker nacks.
+    expect(await h.drainOnce(1)).toBe(1);
+    expect(fired).toBe(true);
 
-    // Not acked: interpret()'s advance() threw before the ack ran.
+    // Not acked: the message is back in the queue, redeliverable.
     expect((await h.queue.inspect(runId)).length).toBe(1);
 
-    // Redeliver and let the harness's own (non-flaky) dispatcher drain — the
-    // recover path re-drives the run to completion.
-    await h.queue.nack((msg as QueueMessage).receipt);
+    // Redelivery takes the recover path and re-drives the run to completion.
     await h.drain();
 
     expect((await h.result(runId)).status).toBe("completed");

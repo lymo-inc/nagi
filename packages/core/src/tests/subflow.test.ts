@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { outputOf, stepStateOf } from "../state";
-import type { FlowStartedFact } from "../types";
+import type { AttemptNumber, FlowStartedFact } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
 describe("b.subflow — happy path", () => {
@@ -398,45 +398,36 @@ describe("b.subflow — idempotent spawn (self-supersede regression)", () => {
       }),
       output: (steps) => steps.work,
     });
-    // Minimal parent — only needed to own a runId / parent link. We drive the
-    // duplicate spawn directly via startChildRun to model redelivery of the
-    // same (parentRunId, stepId, attempt) without lease/queue plumbing.
     const parent = flow({
       id: "parent-host",
       input: passthroughSchema<Record<string, never>>(),
-      build: (b) => ({ noop: b.task({ run: async () => ({ ok: true }) }) }),
+      build: (b) => ({ sub: b.subflow(child, { input: () => ({ x: 5 }) }) }),
     });
 
     const h = await makeHarness([parent, child]);
     const parentRunId = await h.wf.start(parent, {});
+    // At-least-once: the spawn message is delivered a second time at a higher
+    // attempt (what a lease-reap enqueues) — the SAME generation, so it must
+    // re-attach, not spawn a second child that self-supersedes. Queued ahead
+    // of the child's own work so the re-dispatch meets an in-flight child.
+    await h.queue.enqueue(parentRunId, "sub", {
+      attempt: 2 as AttemptNumber,
+      flowId: parent.id,
+    });
     await h.drain();
-
-    const parentRef = { runId: parentRunId, stepId: "sub", attempt: 1 };
-    const first = await h.deps.startChildRun({
-      child,
-      childInput: { x: 5 },
-      parent: parentRef,
-      generation: 0,
-    });
-    // A re-dispatch at a higher attempt (lease-reap) is the SAME generation, so
-    // it must re-attach — not spawn a second child that self-supersedes.
-    const second = await h.deps.startChildRun({
-      child,
-      childInput: { x: 5 },
-      parent: { ...parentRef, attempt: 2 },
-      generation: 0,
-    });
-
-    // Deterministic id ⇒ the redelivery re-attached to the same child.
-    expect(second).toBe(first);
 
     // Exactly one child run exists for this parent.
     const children = await h.store.listChildren(parentRunId);
-    expect(children).toEqual([first]);
+    expect(children).toHaveLength(1);
+    const [childRunId] = children;
+    if (childRunId === undefined) throw new Error("unreachable");
 
-    // The child was never canceled by a self-supersede; it runs to completion.
-    await h.drain();
-    const childState = await h.store.loadRunState(first);
-    expect(childState.phase.tag).toBe("completed");
+    // The child was never canceled by a self-supersede; both runs complete.
+    expect((await h.store.loadRunState(childRunId)).phase.tag).toBe(
+      "completed",
+    );
+    const result = await h.result(parentRunId);
+    expect(result.status).toBe("completed");
+    expect(result.output("sub")).toMatchObject({ output: { doubled: 10 } });
   });
 });

@@ -6,8 +6,8 @@ import {
 } from "../lease-reaper";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
-import type { AttemptNumber, Fact, Queue, RunId, StepId } from "../types";
-import { passthroughSchema } from "./test-helpers";
+import type { AttemptNumber, Fact, RunId, StepId } from "../types";
+import { leasePorts, passthroughSchema } from "./test-helpers";
 
 const RUN_ID = "run-test" as RunId;
 const STEP_ID = "s1" as StepId;
@@ -239,10 +239,7 @@ describe("Heartbeat extends both queue VT and store lease", () => {
   it("extends queue VT and store lease atomically per tick", async () => {
     vi.useFakeTimers();
     try {
-      const extend = vi.fn().mockResolvedValue(undefined);
-      const extendLease = vi.fn().mockResolvedValue(undefined);
-      const queue = { extend } as unknown as Queue;
-      const store = { extendLease } as unknown as import("../types").Store;
+      const { queue, store, extend, extendLease } = leasePorts();
       const emitLog = vi.fn();
       const { startHeartbeat } = await import("../step-exec");
       const hb = startHeartbeat({

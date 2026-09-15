@@ -166,4 +166,20 @@ describe("worker.run dequeue resilience", () => {
       "Connection terminated",
     );
   });
+
+  it("runUntilEmpty rejects the same way", async () => {
+    const store = new InMemoryStore();
+    const queue = new FlakyDequeueQueue(new InMemoryQueue(), 1);
+    const wf = await nagi({
+      flows: [noop],
+      store,
+      queue,
+      clock: new InMemoryClock(),
+    });
+    await wf.start(noop, {});
+
+    await expect(wf.worker().runUntilEmpty()).rejects.toThrow(
+      "Connection terminated",
+    );
+  });
 });
