@@ -38,6 +38,7 @@ export {
   InMemoryStore,
   projectRunState,
 } from "./memory";
+export { defaultSnapshotGonePolicy } from "./retry";
 export { RunId } from "./run-id";
 export type {
   RunDescription,
@@ -204,4 +205,3 @@ export type {
   WorkerRunResult,
   WorkerRunUntilEmptyOpts,
 } from "./types";
-export { defaultSnapshotGonePolicy } from "./worker";
