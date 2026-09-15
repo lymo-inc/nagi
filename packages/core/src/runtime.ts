@@ -55,8 +55,6 @@ import type {
   StepId,
   Store,
   StreamEvent,
-  StreamTransport,
-  Trigger,
   Tx,
   Worker,
   WorkerConfig,
@@ -67,10 +65,8 @@ import { makeWorker } from "./worker";
 export interface NagiConfig {
   readonly flows: ReadonlyArray<Flow>;
   readonly store: Store;
-  readonly streamTransport?: StreamTransport;
   readonly queue: Queue;
   readonly clock?: Clock;
-  readonly trigger?: Trigger;
   readonly hooks?: FlowHooks;
   readonly onLog?: (entry: LogEntry) => void;
   readonly defaultRetry?: RetryPolicy;
@@ -191,10 +187,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
   const registry = makeFlowRegistry(config.flows);
 
-  // Falls back to the store when it also implements StreamTransport (the
-  // in-memory reference does); real deployments inject a dedicated transport.
-  const streamTransport =
-    config.streamTransport ?? asStreamTransport(config.store);
+  const streamTransport = config.store.stream;
 
   // Streaming steps publish ephemeral chunks out-of-band, so without a transport
   // they cannot be carried. Only scanned on the failure path.
@@ -204,9 +197,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         if (getDef(step).kind !== "streaming") continue;
         throw new NagiRuntimeError(
           `Flow "${f.id}" has a streaming step "${stepId}" (b.streamingTask), ` +
-            `but no StreamTransport is configured — it cannot transport ` +
-            `ephemeral chunks. Pass streamTransport (or a store that implements ` +
-            `it, e.g. the in-memory store) or remove the streaming step.`,
+            `but the store has no \`stream\` transport — it cannot carry ` +
+            `ephemeral chunks. Use a store that exposes \`stream\` (e.g. the ` +
+            `in-memory store) or remove the streaming step.`,
         );
       }
     }
@@ -595,7 +588,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         const seedState = foldRun(runId, [fact]);
         const transition = nextTransition(flow, seedState);
         if (transition.kind === "dispatch") {
-          const txQueue = bindQueueToTx(config.queue, opts.tx);
+          // Join the caller's tx when the queue can, so the entrypoint enqueue
+          // commits atomically with the run-row insert + flow.started fact.
+          const txQueue = config.queue.withTx?.(opts.tx) ?? config.queue;
           for (const stepId of transition.runnable) {
             await txQueue.enqueue(runId, stepId, { flowId: flow.id });
           }
@@ -883,25 +878,4 @@ export const nagi: typeof nagiImpl & { run: typeof nagiRun } = Object.assign(
 
 function mintRunId(): RunId {
   return `run-${crypto.randomUUID()}` as RunId;
-}
-
-function asStreamTransport(store: Store): StreamTransport | undefined {
-  const s = store as Partial<StreamTransport>;
-  return typeof s.subscribeStream === "function" &&
-    typeof s.publishChunk === "function"
-    ? (s as StreamTransport)
-    : undefined;
-}
-
-// Adapters that expose `withTx` (e.g. pgmq) join the supplied tx so the
-// initial-step enqueue commits atomically with the store run-row insert +
-// flow.started fact. Plain queues (in-memory) ignore the tx — there is no
-// atomicity to inherit there anyway.
-interface QueueWithTx extends Queue {
-  withTx(tx: Tx): Queue;
-}
-function bindQueueToTx(queue: Queue, tx: Tx): Queue {
-  const q = queue as Partial<QueueWithTx>;
-  if (typeof q.withTx === "function") return q.withTx(tx);
-  return queue;
 }
