@@ -591,17 +591,18 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
 
     it("status filter accepts single value and array", async () => {
       const wf = await makeNagi();
-      await seed("f", {});
-      await seed("f", {}, "completed");
-      await seed("f", {}, "failed");
+      // Own flowId: the schema is shared with every earlier test's terminal runs.
+      await seed("qr-status", {});
+      await seed("qr-status", {}, "completed");
+      await seed("qr-status", {}, "failed");
 
       const completed = await wf.queryRuns({
-        where: { status: ["completed"] },
+        where: { flowId: "qr-status", status: ["completed"] },
       });
       expect(completed.runs).toHaveLength(1);
 
       const both = await wf.queryRuns({
-        where: { status: ["completed", "failed"] },
+        where: { flowId: "qr-status", status: ["completed", "failed"] },
       });
       expect(both.runs).toHaveLength(2);
     });

@@ -1174,7 +1174,7 @@ class PostgresStore<DB = unknown> implements Store {
 
         const victims = victimRows.rows.map((r) => r.run_id);
         if (victims.length === 0) {
-          return { runs: 0, facts: 0 };
+          return { candidates: 0, runs: 0, facts: 0 };
         }
 
         const factDel = await sql<{ run_id: string }>`
@@ -1206,10 +1206,18 @@ class PostgresStore<DB = unknown> implements Store {
           `.execute(trx);
         }
 
-        return { runs: victims.length, facts: factDel.rows.length };
+        // Under READ COMMITTED a concurrent pruner can have emptied a victim's
+        // facts after our snapshot (the workflow_run row is untouched when
+        // keepSummary is on, so the EXISTS qual is never re-checked). Count only
+        // runs whose facts this call actually removed.
+        return {
+          candidates: victims.length,
+          runs: new Set(factDel.rows.map((r) => r.run_id)).size,
+          facts: factDel.rows.length,
+        };
       });
 
-      if (batch.runs === 0) break;
+      if (batch.candidates === 0) break;
       runsPruned += batch.runs;
       factsPruned += batch.facts;
     }
