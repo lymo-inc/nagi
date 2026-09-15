@@ -161,9 +161,12 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(await store.claimStep(runId, "s1", 1)).not.toBeNull();
     await new Promise((r) => setTimeout(r, 80));
 
-    const reaped = await store.sweepLeases({ now: new Date(), queue });
+    // The schema is shared across this file, so the sweep also reaps the
+    // expired lease left by the re-acquire test above — assert on ours only.
+    const reaped = (await store.sweepLeases({ now: new Date(), queue })).filter(
+      (r) => r.runId === runId,
+    );
     expect(reaped).toHaveLength(1);
-    expect(reaped[0]?.runId).toBe(runId);
     expect(reaped[0]?.nextAttempt).toBe(2);
 
     // Re-claim at the new attempt succeeds (lease row was deleted by sweep)

@@ -974,8 +974,8 @@ class PostgresStore<DB = unknown> implements Store {
        WHERE (${flowId ?? null}::text IS NULL OR flow_id = ${flowId ?? null})
          AND (${statuses === undefined ? null : statuses}::text[] IS NULL
               OR status = ANY(${statuses === undefined ? null : statuses}::text[]))
-         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)} IS NULL
-              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)})
+         AND (${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)}::jsonb IS NULL
+              OR input @> ${inputFilter === undefined ? null : jsonb(inputFilter as unknown as Json)}::jsonb)
          AND (${cursor === null ? null : new Date(cursor.t)}::timestamptz IS NULL
               OR (started_at, run_id) <
                  (${cursor === null ? null : new Date(cursor.t)}::timestamptz,
