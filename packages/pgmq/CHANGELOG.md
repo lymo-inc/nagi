@@ -1,5 +1,29 @@
 # @nagi-js/pgmq
 
+## 0.1.1-rc.18
+
+### Patch Changes
+
+- f27b5b9: Operator plane: `wf.inspectQueue(runId)` — read-only triage view of a run's in-queue messages (stepId, attempt, readCount, visibleAt) via optional `Queue.inspect()`; implemented for pgmq and the in-memory queue. Together with `wf.describe()` this replaces the hand-run SQL triage recipes; docs/OPERATIONS.md is the runbook.
+- 7867f5c: `pgmqQueue` default `visibilityTimeoutMs` is now 120s (was 30s), above core's
+  40s heartbeat interval — with stock settings a step longer than 30s was
+  redelivered before its first lease extension. `postgresStore.claimStep` now
+  computes lease expiry on the database clock, matching `extendLease`, so
+  application clock skew can no longer grant a second claim on a live lease.
+- 0d22d1f: Per-flow blast-radius bound: `WorkerConfig.maxConcurrencyPerFlow` caps the worker slots any single flow may hold; over-cap messages defer via delayed nack. `flowId` now rides the message envelope (stamped at every enqueue path incl. lease-reap; absent pre-upgrade messages are exempt). Multi-flow deployments should set the cap ≤ concurrency − 1 so one wedged flow can never occupy the whole pool.
+- 4b20b2e: Bound snapshot-gone redelivery. `QueueMessage.readCount` (pgmq `read_ct`) now travels with every delivery; the worker consults a `SnapshotGonePolicy(readCount)` — retry = delayed nack for the rolling-deploy window, then terminally fail the run with the real error and ack. Terminal runs' messages are acked at dispatch (a canceled run can no longer nack-loop). Default policy: quadratic backoff capped at 5 min, fail past 60 deliveries (~4.2h window).
+- Updated dependencies [0d1203c]
+- Updated dependencies [4d4b178]
+- Updated dependencies [f27b5b9]
+- Updated dependencies [eff6275]
+- Updated dependencies [4b20b2e]
+- Updated dependencies [0d22d1f]
+- Updated dependencies [4b20b2e]
+- Updated dependencies [6d9c0c5]
+- Updated dependencies [4b20b2e]
+- Updated dependencies [d751145]
+  - @nagi-js/core@0.1.1-rc.18
+
 ## 0.1.1-rc.17
 
 ### Patch Changes
