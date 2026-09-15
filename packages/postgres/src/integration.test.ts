@@ -8,6 +8,7 @@ import {
   type RunId,
   type Wf,
 } from "@nagi-js/core";
+import { passthroughSchema } from "@nagi-js/core/testing";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -1416,16 +1417,6 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     });
   });
 });
-
-function passthroughSchema<T>() {
-  return {
-    "~standard": {
-      version: 1 as const,
-      vendor: "nagi-test",
-      validate: (value: unknown) => ({ value: value as T }),
-    },
-  };
-}
 
 async function loadStatus(
   db: Kysely<unknown>,

@@ -84,6 +84,23 @@ export {
   unwrap,
 } from "./state";
 export { NagiAbortError } from "./step-exec";
+export {
+  clampQueryLimit,
+  compareRunOrder,
+  DEFAULT_SWEEP_LIMIT,
+  decodeRunCursor,
+  encodeRunCursor,
+  type FactEffects,
+  factEffects,
+  isPastCursor,
+  jsonContains,
+  type PruneCandidate,
+  QUERY_RUNS_DEFAULT_LIMIT,
+  QUERY_RUNS_MAX_LIMIT,
+  type RunCursor,
+  selectExpired,
+  selectPruneBatch,
+} from "./store-policy";
 // Explicit public type surface (not `export type *`): a new type in types.ts is
 // internal-by-default, and any change to the public surface shows up as a diff.
 export type {
