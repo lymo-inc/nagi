@@ -1073,6 +1073,9 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
             },
           }),
         }),
+        output(s) {
+          return s.s;
+        },
       });
       const wf = await makeNagi(f);
       const runId = await wf.start(f, {});
