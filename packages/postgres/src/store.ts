@@ -780,7 +780,32 @@ class PostgresStore<DB = unknown> implements Store {
           ON CONFLICT (run_id, step_id, attempt) DO UPDATE SET status = 'skipped'
         `.execute(trx);
         return;
-      case "step.reset":
+      case "step.reset": {
+        // Reopen a completed/failed run (replay, operator.retry). Read the
+        // identity first: after a unique violation the tx is aborted and no
+        // further SELECT would succeed.
+        const row = await sql<{
+          flow_id: string;
+          concurrency_key: string | null;
+        }>`
+          SELECT flow_id, concurrency_key FROM ${sql.raw(this.t("workflow_run"))}
+           WHERE run_id = ${runId}
+        `.execute(trx);
+        try {
+          await sql`
+            UPDATE ${sql.raw(this.t("workflow_run"))}
+               SET status = 'running', output = NULL, error = NULL, completed_at = NULL
+             WHERE run_id = ${runId} AND status IN ('completed', 'failed')
+          `.execute(trx);
+        } catch (err) {
+          // workflow_run_concurrency_active_uidx: another active run holds this key.
+          if (!isUniqueViolation(err)) throw err;
+          throw new NagiConcurrencyConflictError({
+            runId,
+            flowId: row.rows[0]?.flow_id ?? "",
+            concurrencyKey: row.rows[0]?.concurrency_key ?? "",
+          });
+        }
         await sql`
           DELETE FROM ${sql.raw(this.t("step_run"))}
            WHERE run_id = ${runId} AND step_id = ${fact.stepId}
@@ -788,6 +813,7 @@ class PostgresStore<DB = unknown> implements Store {
         await this.deleteLease(trx, runId, fact.stepId);
         await this.deleteTimer(trx, runId, fact.stepId);
         return;
+      }
       case "once.recorded":
         await sql`
           INSERT INTO ${sql.raw(this.t("dedupe"))} (run_id, step_id, scope, value)
