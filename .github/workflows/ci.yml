@@ -23,8 +23,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
-      - run: pnpm typecheck
+      # Adapters resolve @nagi-js/core through its dist/ — build before typecheck.
       - run: pnpm -r build
+      - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm verify:publint
       - run: pnpm verify:types
