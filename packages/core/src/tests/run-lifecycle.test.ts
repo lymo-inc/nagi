@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import type { Hooks } from "../exec/hooks";
 import { Facts } from "../facts";
-import { makeFlowRegistry } from "../flow-registry";
+import { type FlowRegistry, registerFlows } from "../flows";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import {
   makeRunLifecycle,
@@ -66,6 +66,7 @@ const CALLER: TxBoundary = { kind: "caller", tx: FAKE_TX };
 
 interface Fixture {
   readonly lifecycle: RunLifecycle;
+  readonly registry: FlowRegistry;
   readonly store: InMemoryStore;
   readonly queue: InMemoryQueue;
   readonly clock: InMemoryClock;
@@ -75,7 +76,7 @@ interface Fixture {
   readonly propagateToParent: ReturnType<typeof vi.fn>;
 }
 
-function makeFixture(flows: readonly Flow[]): Fixture {
+async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
   const store = new InMemoryStore();
   const queue = new InMemoryQueue();
   const clock = new InMemoryClock();
@@ -90,13 +91,13 @@ function makeFixture(flows: readonly Flow[]): Fixture {
   };
   const advance = vi.fn(async () => {});
   const propagateToParent = vi.fn(async () => {});
+  const registry = await registerFlows({ flows, store, clock });
   const lifecycle = makeRunLifecycle({
     store,
     queue,
     clock,
-    registry: makeFlowRegistry(flows),
+    registry,
     codeVersion: "test",
-    hashFor: (id) => `hash-${id}`,
     queueForTx: (tx): Queue => ({
       async enqueue(runId: RunId, stepId: StepId, opts?: QueueEnqueueOpts) {
         txEnqueued.push({ tx, runId, stepId });
@@ -114,6 +115,7 @@ function makeFixture(flows: readonly Flow[]): Fixture {
   });
   return {
     lifecycle,
+    registry,
     store,
     queue,
     clock,
@@ -247,7 +249,7 @@ const scenarios: readonly Scenario[] = [
 describe("run lifecycle — start scenarios", () => {
   for (const s of scenarios) {
     it(s.name, async () => {
-      const fx = makeFixture([s.flow]);
+      const fx = await makeFixture([s.flow]);
       const input = { videoId: "v1" };
 
       let priorRunId: RunId | undefined;
@@ -279,7 +281,7 @@ describe("run lifecycle — start scenarios", () => {
       expect(effects.superseded).toEqual(s.expectSuperseded(priorRunId));
       const state = await fx.store.loadRunState(runId);
       expect(state.flowId).toBe(s.flow.id);
-      expect(state.flowHash).toBe(`hash-${s.flow.id}`);
+      expect(state.flowHash).toBe(fx.registry.hashOf(s.flow.id));
       expect(state.facts.map((f) => f.kind)).toEqual(["flow.started"]);
       expect(effects.started).toEqual({
         runId,
@@ -344,7 +346,7 @@ describe("run lifecycle — start scenarios", () => {
   }
 
   it("post-commit skip recording yields to a worker that already advanced", async () => {
-    const fx = makeFixture([mixedFlow]);
+    const fx = await makeFixture([mixedFlow]);
     const runId = "raced" as RunId;
     const staged = await fx.lifecycle.stage({
       flow: mixedFlow,
@@ -373,7 +375,7 @@ describe("run lifecycle — start scenarios", () => {
   });
 
   it("re-staging an existing runId yields `exists` on either boundary", async () => {
-    const fx = makeFixture([plainFlow]);
+    const fx = await makeFixture([plainFlow]);
     const runId = "dup" as RunId;
     const first = await fx.lifecycle.stage({
       flow: plainFlow,
@@ -397,7 +399,7 @@ describe("run lifecycle — start scenarios", () => {
   });
 
   it("start() mints a runId, validates a supplied one, and validates input", async () => {
-    const fx = makeFixture([plainFlow]);
+    const fx = await makeFixture([plainFlow]);
     const minted = await fx.lifecycle.start({
       flowId: "lc-plain",
       input: { videoId: "v1" },

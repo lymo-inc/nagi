@@ -1,5 +1,10 @@
-import { type DispatchDeps, type Dispatcher, makeDispatcher } from "./dispatch";
-import { NagiFlowSnapshotGoneError, serializeError } from "./errors";
+import {
+  type DispatchDeps,
+  type Dispatcher,
+  type DispatchResult,
+  makeDispatcher,
+} from "./dispatch";
+import { type NagiFlowSnapshotGoneError, serializeError } from "./errors";
 import { Facts } from "./facts";
 import type {
   Clock,
@@ -249,29 +254,10 @@ class WorkerImpl implements Worker {
   }
 
   private async dispatchSafely(msg: QueueMessage): Promise<void> {
+    let result: DispatchResult;
     try {
-      await this.dispatcher.dispatchMessage(msg);
+      result = await this.dispatcher.dispatchMessage(msg);
     } catch (err) {
-      if (err instanceof NagiFlowSnapshotGoneError) {
-        try {
-          await this.handleSnapshotGone(msg, err);
-        } catch (handleErr) {
-          // A broken policy or store failure must neither escape (fire() has
-          // no rejection handler) nor tight-loop the message — the delayed
-          // nack keeps the redelivery cadence bounded until it's fixed.
-          this.deps.emitLog({
-            level: "error",
-            msg: "worker.dispatch: snapshot-gone handling failed",
-            attrs: { runId: err.runId, error: String(handleErr) },
-          });
-          try {
-            await this.deps.queue.nack(msg.receipt, {
-              delayMs: SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS,
-            });
-          } catch {}
-        }
-        return;
-      }
       this.deps.emitLog({
         level: "error",
         msg: "worker.dispatch threw uncaught",
@@ -280,6 +266,30 @@ class WorkerImpl implements Worker {
       try {
         await this.deps.queue.nack(msg.receipt);
       } catch {}
+      return;
+    }
+    switch (result.kind) {
+      case "done":
+        return;
+      case "snapshot-gone":
+        try {
+          await this.handleSnapshotGone(msg, result.error);
+        } catch (handleErr) {
+          // A broken policy or store failure must neither escape (fire() has
+          // no rejection handler) nor tight-loop the message — the delayed
+          // nack keeps the redelivery cadence bounded until it's fixed.
+          this.deps.emitLog({
+            level: "error",
+            msg: "worker.dispatch: snapshot-gone handling failed",
+            attrs: { runId: result.error.runId, error: String(handleErr) },
+          });
+          try {
+            await this.deps.queue.nack(msg.receipt, {
+              delayMs: SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS,
+            });
+          } catch {}
+        }
+        return;
     }
   }
 
@@ -287,7 +297,6 @@ class WorkerImpl implements Worker {
   // says a frozen-version worker might still claim it; past that budget the
   // run is terminally failed with the snapshot-gone error and the message
   // acked, so poison messages cannot outlive the deploy that orphaned them.
-  // (Terminal runs never reach here — dispatchMessage acks them itself.)
   private async handleSnapshotGone(
     msg: QueueMessage,
     err: NagiFlowSnapshotGoneError,

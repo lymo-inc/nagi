@@ -7,7 +7,7 @@ import {
 } from "./errors";
 import type { Hooks } from "./exec/hooks";
 import { Facts } from "./facts";
-import type { FlowRegistry } from "./flow-registry";
+import type { FlowRegistry } from "./flows";
 import { compact, type EmitLog } from "./internal";
 import { deriveChildRunId } from "./run-id";
 import {
@@ -43,7 +43,6 @@ export interface RunLifecycleDeps {
   readonly clock: Clock;
   readonly registry: FlowRegistry;
   readonly codeVersion: string;
-  readonly hashFor: (flowId: string) => string | undefined;
   readonly queueForTx: (tx: Tx) => Queue;
   readonly hooks: Hooks;
   readonly flowHooks: FlowHooks | undefined;
@@ -170,8 +169,8 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
       input: validatedInput,
       at: startedAt,
       codeVersion: deps.codeVersion,
+      flowHash: registry.hashOf(flow.id),
       ...compact({
-        flowHash: deps.hashFor(flow.id),
         parent:
           parent !== undefined
             ? { runId: parent.runId, stepId: parent.stepId }
