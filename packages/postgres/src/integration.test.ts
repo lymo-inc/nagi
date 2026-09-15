@@ -2,6 +2,7 @@ import {
   flow,
   InMemoryClock,
   InMemoryQueue,
+  NagiConcurrencyConflictError,
   nagi,
   type RunId,
   type Wf,
@@ -1050,6 +1051,92 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
          WHERE run_id = ${runId}
       `.execute(db);
       expect(timers.rows[0]?.n).toBe(0);
+    }, 20_000);
+  });
+
+  describe("step.reset — reopens a settled run via PG", () => {
+    it("operator.retry on a failed run reopens it and describe() reports completed", async () => {
+      let shouldFail = true;
+      const f = flow({
+        id: "pg-reopen-retry",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          s: b.task({
+            retry: { maxAttempts: 1, backoff: "fixed" },
+            run: async () => {
+              if (shouldFail) throw new Error("boom");
+              return { ok: true };
+            },
+          }),
+        }),
+      });
+      const wf = await makeNagi(f);
+      const runId = await wf.start(f, {});
+      await runToEnd(wf, runId);
+      const failed = await wf.describe(runId);
+      expect(failed?.run.status).toBe("failed");
+      expect(failed?.run.completedAt).toBeDefined();
+
+      shouldFail = false;
+      await wf.operator().retry(runId, "s", { actor: "ops" });
+      // The reset materialized status = 'running', so runToEnd waits for the
+      // re-run instead of returning on the stale 'failed'.
+      await runToEnd(wf, runId);
+
+      const reopened = await wf.describe(runId);
+      expect(reopened?.run.status).toBe("completed");
+      expect(reopened?.run.completedAt).toBeDefined();
+      expect(reopened?.run.error).toBeUndefined();
+      expect(await loadOutput(db, schema, runId)).toEqual({ ok: true });
+    }, 20_000);
+
+    it("operator.retry rejects with NagiConcurrencyConflictError when another run holds the key", async () => {
+      let shouldFail = true;
+      const f = flow({
+        id: "pg-reopen-conflict",
+        input: passthroughSchema<Record<string, never>>(),
+        concurrency: { keyFn: () => "k", mode: "cancel-in-progress" },
+        build: (b) => {
+          const s = b.task({
+            retry: { maxAttempts: 1, backoff: "fixed" },
+            run: async () => {
+              if (shouldFail) throw new Error("boom");
+              return { ok: true };
+            },
+          });
+          const wait = b.signal({
+            needs: { s },
+            timeoutMs: "unbounded" as const,
+            names: ["go"],
+            schema: passthroughSchema<{ ok: boolean }>(),
+          });
+          return { s, wait };
+        },
+      });
+      const wf = await makeNagi(f);
+      const run1 = await wf.start(f, {});
+      await runToEnd(wf, run1);
+      expect(await loadStatus(db, schema, run1)).toBe("failed");
+
+      // run2 takes the freed key; it is never drained, so it stays 'running'
+      // and holds workflow_run_concurrency_active_uidx for (flow_id, 'k').
+      shouldFail = false;
+      const run2 = await wf.start(f, {});
+      expect(await loadStatus(db, schema, run2)).toBe("running");
+
+      await expect(
+        wf.operator().retry(run1, "s", { actor: "ops" }),
+      ).rejects.toBeInstanceOf(NagiConcurrencyConflictError);
+
+      // The conflict rolled the appendFact transaction back: no reset fact,
+      // no status change on either run.
+      expect(await loadStatus(db, schema, run1)).toBe("failed");
+      expect(await loadStatus(db, schema, run2)).toBe("running");
+      const resets = await sql<{ n: number }>`
+        SELECT count(*)::int AS n FROM ${sql.raw(`${schema}.fact`)}
+         WHERE run_id = ${run1} AND kind = 'step.reset'
+      `.execute(db);
+      expect(resets.rows[0]?.n).toBe(0);
     }, 20_000);
   });
 

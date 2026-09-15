@@ -381,6 +381,11 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
         delete selectedArms[fact.stepId];
         // A reset step must wait for a fresh signal, never replay the old one.
         delete bufferedSignals[fact.stepId];
+        // A run with a pending step is not settled. Reset reopens completed/failed
+        // (replay, operator.retry); canceled stays canceled — retry rejects those.
+        if (phase.tag === "completed" || phase.tag === "failed") {
+          phase = { tag: "running" };
+        }
         break;
       case "step.started":
       case "step.completed":
