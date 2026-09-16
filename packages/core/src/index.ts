@@ -111,6 +111,7 @@ export type {
   ClaimToken,
   Clock,
   ConcurrencyMode,
+  DriftPolicy,
   Fact,
   FactKind,
   Flow,

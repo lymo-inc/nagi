@@ -390,3 +390,128 @@ describe("snapshot-gone poison handling", () => {
     expect((await store.loadRunState(runId)).phase.tag).toBe("running");
   });
 });
+
+// A one-task rolling deploy has no frozen-version worker: under "freeze" the
+// deploy that changes a flow strands every run in flight on it, and even
+// replay({ allowDrift }) only helped inside the replay dispatcher — the step it
+// enqueued came back to the ordinary worker, which resolved the run by its
+// pinned hash and went straight back to snapshot-gone.
+describe("driftPolicy: synthesize", () => {
+  it("a worker on new code resumes a drifted run on the pinned shape with live handlers", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+    const pinnedHash = await store.getRef("fA");
+
+    const logs: LogEntry[] = [];
+    const wfB = await nagi({
+      flows: [makeFlowB()],
+      store,
+      queue,
+      clock,
+      driftPolicy: "synthesize",
+      onLog: (e) => logs.push(e),
+    });
+    const { processed } = await wfB
+      .worker({
+        timerSweepIntervalMs: 0,
+        snapshotGonePolicy: () => {
+          throw new Error("policy must not run when drift is synthesized");
+        },
+      })
+      .runUntilEmpty();
+    expect(processed).toBe(1);
+
+    const state = await store.loadRunState(runId);
+    expect(state.phase.tag).toBe("completed");
+    // B's handler ran for the pinned step…
+    expect(state.steps["s"]).toMatchObject({
+      tag: "completed",
+      output: { different: true },
+    });
+    // …on A's shape: the step B added is not part of this run…
+    expect(state.steps["added"]).toBeUndefined();
+    // …and the run stays pinned to the hash it started on. History is honest.
+    expect(state.flowHash).toBe(pinnedHash);
+    expect(logs.some((l) => l.msg.includes("snapshot gone"))).toBe(false);
+  });
+
+  it("falls back to snapshot-gone handling when a pinned step no longer exists live", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    const fRenamed = flow({
+      id: "fA",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({ renamed: b.task({ run: async () => ({}) }) }),
+    });
+    const logs: LogEntry[] = [];
+    const seenReadCounts: number[] = [];
+    const wfB = await nagi({
+      flows: [fRenamed],
+      store,
+      queue,
+      clock,
+      driftPolicy: "synthesize",
+      onLog: (e) => logs.push(e),
+    });
+    const { processed } = await wfB
+      .worker({
+        timerSweepIntervalMs: 0,
+        snapshotGonePolicy: (readCount) => {
+          seenReadCounts.push(readCount);
+          return { action: "fail" };
+        },
+      })
+      .runUntilEmpty();
+    expect(processed).toBe(1);
+    expect(seenReadCounts).toEqual([1]);
+
+    const warn = logs.find((l) => l.msg.includes("drift synthesis failed"));
+    expect(warn?.level).toBe("warn");
+    expect(warn?.attrs).toMatchObject({ runId, flowId: "fA" });
+    expect(String(warn?.attrs?.["error"])).toContain('step "s"');
+
+    const state = await store.loadRunState(runId);
+    expect(state.phase.tag).toBe("failed");
+    if (state.phase.tag === "failed") {
+      expect(state.phase.error.name).toBe("NagiFlowSnapshotGoneError");
+    }
+  });
+
+  it("replay({ mode: 'continue' }) needs no allowDrift — the policy already permits drift", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeFlowA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    const wfB = await nagi({
+      flows: [makeFlowB()],
+      store,
+      queue,
+      clock,
+      driftPolicy: "synthesize",
+    });
+    // The orphan-sweeper shape: a bare continue on a run the deploy cut off.
+    await expect(
+      wfB.replay(runId, { mode: "continue" }),
+    ).resolves.toBeUndefined();
+    await wfB.worker({ timerSweepIntervalMs: 0 }).runUntilEmpty();
+
+    const state = await store.loadRunState(runId);
+    expect(state.phase.tag).toBe("completed");
+    expect(state.steps["s"]).toMatchObject({ output: { different: true } });
+  });
+});

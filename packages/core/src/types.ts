@@ -477,7 +477,9 @@ export interface WorkerConfig {
   // (deploy replaced the flow while the run was in flight). Defaults to
   // defaultSnapshotGonePolicy. "retry" keeps the message alive for a
   // not-yet-updated worker to claim during a rolling deploy; "fail"
-  // terminally fails the run with the snapshot-gone error and acks.
+  // terminally fails the run with the snapshot-gone error and acks. Only
+  // reached under `nagi({ driftPolicy: "freeze" })` (the default), or when
+  // "synthesize" has nothing honest to resume from.
   readonly snapshotGonePolicy?: SnapshotGonePolicy;
   // Cap on worker slots any single flow may occupy at once. Bounds blast
   // radius: without it, one wedged flow's steps can hold every slot and
@@ -494,6 +496,22 @@ export type SnapshotGoneDisposition =
   | { readonly action: "fail" };
 
 export type SnapshotGonePolicy = (readCount: number) => SnapshotGoneDisposition;
+
+// What this process does with a live run pinned to a flow hash it no longer
+// produces (a deploy changed the flow while the run was in flight).
+//   "freeze"     — the run is snapshot-gone: its messages are nacked for a
+//                  frozen-version worker per snapshotGonePolicy, then failed.
+//                  Right when an old-code worker really does stay up until
+//                  its runs drain.
+//   "synthesize" — resume on the pinned DAG shape with the live handlers,
+//                  exactly what replay({ allowDrift: true }) does, so the run
+//                  continues on the new code. Right when nothing keeps old
+//                  code running (one task, rolling replace): under "freeze"
+//                  every such deploy strands every in-flight run. Falls back
+//                  to "freeze" handling only when the snapshot is missing or a
+//                  pinned step no longer exists live — nothing can honestly
+//                  resume those.
+export type DriftPolicy = "freeze" | "synthesize";
 
 export interface WorkerRunOnceOpts {
   readonly maxSteps?: number;

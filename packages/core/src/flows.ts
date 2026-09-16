@@ -47,9 +47,10 @@ export interface FlowRegistry {
   hashOf(flowId: string): string;
   isStreaming(stepId: string): boolean;
   resolve(state: RunState): FlowResolution;
-  // Drift-allowed replay: the pinned snapshot's DAG with the live flow's
-  // handlers attached. Throws NagiRuntimeError when there is no live flow to
-  // borrow handlers from or the snapshot is no longer in the store.
+  // The pinned snapshot's DAG with the live flow's handlers attached — what
+  // drift-allowed replay and `driftPolicy: "synthesize"` resume a drifted run
+  // on. Throws NagiRuntimeError when there is no live flow to borrow handlers
+  // from, the snapshot is no longer in the store, or a pinned step vanished.
   synthesize(gone: FlowGone): Promise<Flow>;
 }
 
@@ -156,7 +157,22 @@ export async function registerFlows(deps: {
       : { kind: "gone-live", error, live };
   }
 
-  async function synthesize(gone: FlowGone): Promise<Flow> {
+  // The live flow is fixed for this process, so a synthesis is a function of
+  // the pinned hash alone. Cached so a drifted run does not reload its snapshot
+  // on every message; a failed synthesis is not kept (the snapshot may arrive).
+  const synthesizedByHash = new Map<string, Promise<Flow>>();
+
+  function synthesize(gone: FlowGone): Promise<Flow> {
+    const { pinnedHash } = gone.error;
+    const cached = synthesizedByHash.get(pinnedHash);
+    if (cached !== undefined) return cached;
+    const pending = synthesizeUncached(gone);
+    synthesizedByHash.set(pinnedHash, pending);
+    pending.catch(() => synthesizedByHash.delete(pinnedHash));
+    return pending;
+  }
+
+  async function synthesizeUncached(gone: FlowGone): Promise<Flow> {
     const { runId, flowId, pinnedHash } = gone.error;
     if (gone.live === undefined) {
       throw new NagiRuntimeError(
@@ -167,7 +183,7 @@ export async function registerFlows(deps: {
     if (snapshot === null) {
       throw new NagiRuntimeError(
         `Run ${runId} pinned to flow hash ${pinnedHash.slice(0, 12)}… but ` +
-          `no snapshot with that hash was found. Cannot replay with allowDrift.`,
+          `no snapshot with that hash was found. Nothing can resume it.`,
       );
     }
     return synthesizeReplayFlow(

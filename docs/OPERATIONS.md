@@ -43,12 +43,23 @@ Sustained `worker.dequeue failed; backing off` at `error` level means the queue
 is unreachable, not that runs are broken; the loop resumes on its own once the
 queue comes back.
 
-## Poison messages / snapshot-gone (deploy replaced an in-flight flow)
+## Deploy replaced an in-flight flow (drift / snapshot-gone)
 
-Self-healing since the snapshot-gone policy: the worker retries with backoff
-for the rolling-deploy window, then **terminally fails the run** with
-`NagiFlowSnapshotGoneError` in `workflow_run.error` and acks the message.
-Nothing loops forever.
+Every run is pinned to the hash of the flow it started on. What a worker on
+new code does with a live run pinned to an old hash is `nagi({ driftPolicy })`:
+
+- `"synthesize"` — the run **continues on the new code**: nagi rebuilds the
+  pinned DAG shape from the snapshot and attaches the live handlers (the same
+  thing `replay({ allowDrift: true })` does), so completed steps keep their
+  outputs and the interrupted step re-runs. Choose this when nothing keeps old
+  code running after a deploy (one task, rolling replace) — under `"freeze"`
+  such a deploy strands every in-flight run. Falls through to the
+  snapshot-gone handling below only when the snapshot is missing or a pinned
+  step no longer exists live (grep `drift synthesis failed`).
+- `"freeze"` (default) — the run is **snapshot-gone**: the worker nacks its
+  messages with backoff so a still-running old-code worker can claim them,
+  then **terminally fails the run** with `NagiFlowSnapshotGoneError` in
+  `workflow_run.error` and acks the message. Nothing loops forever.
 
 Intervene earlier if needed:
 
@@ -58,8 +69,8 @@ Intervene earlier if needed:
 - To re-run the work on current code: start a fresh run (concurrency
   cancel-in-progress supersedes the dead one).
 
-Tune via `WorkerConfig.snapshotGonePolicy`; wrap `defaultSnapshotGonePolicy`
-to widen/narrow the retry window.
+Tune the `"freeze"` window via `WorkerConfig.snapshotGonePolicy`; wrap
+`defaultSnapshotGonePolicy` to widen/narrow it.
 
 ## Permanently-unprocessable input
 
