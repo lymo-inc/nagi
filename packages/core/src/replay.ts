@@ -7,16 +7,17 @@ import {
 import { Facts } from "./facts";
 import type { FlowRegistry } from "./flows";
 import { descendantsOf } from "./scheduler";
-import type { Flow, Queue, ReplayOpts, RunId } from "./types";
+import type { DriftPolicy, Flow, Queue, ReplayOpts, RunId } from "./types";
 
 export interface ReplayDeps extends DispatchDeps {
   readonly registry: FlowRegistry;
+  readonly driftPolicy: DriftPolicy;
 }
 
 export function makeReplay(deps: ReplayDeps): {
   replay(runId: RunId, opts?: ReplayOpts): Promise<void>;
 } {
-  const { registry, store, queue, clock } = deps;
+  const { registry, store, queue, clock, driftPolicy } = deps;
 
   async function replay(
     runId: RunId,
@@ -47,7 +48,10 @@ export function makeReplay(deps: ReplayDeps): {
     let replayDeps = baseDeps;
     let effectiveFlow: Flow = liveFlow;
     if (resolution.kind !== "current") {
-      if (!opts.allowDrift) {
+      // allowDrift is the per-call override of a "freeze" runtime; under
+      // "synthesize" the worker would resume this run against live handlers
+      // anyway, so refusing here would only make replay stricter than dispatch.
+      if (!opts.allowDrift && driftPolicy === "freeze") {
         throw new NagiSnapshotDriftError({
           runId,
           expected: resolution.error.pinnedHash,

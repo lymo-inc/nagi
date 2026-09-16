@@ -18,6 +18,7 @@ import {
 } from "./step-exec";
 import type {
   Clock,
+  DriftPolicy,
   Flow,
   FlowHooks,
   FlowIdOf,
@@ -54,6 +55,9 @@ export interface NagiConfig {
   readonly onLog?: (entry: LogEntry) => void;
   readonly defaultRetry?: RetryPolicy;
   readonly codeVersion?: string;
+  // Default "freeze". See DriftPolicy — pick "synthesize" when no
+  // frozen-version worker outlives a deploy.
+  readonly driftPolicy?: DriftPolicy;
   // heartbeatIntervalMs must stay below the queue's initial visibility timeout,
   // or a slow step's message is redelivered before the first lease extension.
   readonly heartbeatIntervalMs?: Millis;
@@ -195,8 +199,33 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   const codeVersion =
     config.codeVersion ?? (await fingerprintFlows(config.flows));
 
+  const driftPolicy: DriftPolicy = config.driftPolicy ?? "freeze";
+
+  // The one place a run meets its flow, for dispatch, hooks and replay alike.
+  // Under "synthesize" a drifted-but-live run resolves to its pinned DAG with
+  // the live handlers attached; only a run nagi cannot honestly rebuild stays
+  // gone-live for the worker's snapshot-gone policy.
   async function resolveFlow(runId: RunId): Promise<FlowResolution> {
-    return registry.resolve(await config.store.loadRunState(runId));
+    const resolution = registry.resolve(await config.store.loadRunState(runId));
+    if (resolution.kind !== "gone-live" || driftPolicy === "freeze") {
+      return resolution;
+    }
+    try {
+      return { kind: "current", flow: await registry.synthesize(resolution) };
+    } catch (err) {
+      if (!(err instanceof NagiRuntimeError)) throw err;
+      emitLog({
+        level: "warn",
+        msg: "resolveFlow: drift synthesis failed — treating run as snapshot-gone",
+        attrs: {
+          runId: resolution.error.runId,
+          flowId: resolution.error.flowId,
+          pinnedHash: resolution.error.pinnedHash,
+          error: err.message,
+        },
+      });
+      return resolution;
+    }
   }
 
   function lookupFlow(flowId: string): Flow | undefined {
@@ -250,7 +279,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     emitLog,
     ...compact({ flowHooks: config.hooks }),
   });
-  const replayer = makeReplay({ ...dispatchDeps, registry });
+  const replayer = makeReplay({ ...dispatchDeps, registry, driftPolicy });
 
   const wf: Wf = {
     async start<F extends Flow>(
