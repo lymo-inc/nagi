@@ -47,7 +47,7 @@
     "@nagi-js/core": "workspace:*"
   },
   "peerDependencies": {
-    "kysely": "^0.28.0"
+    "kysely": "^0.29.0"
   },
   "repository": {
     "type": "git",
