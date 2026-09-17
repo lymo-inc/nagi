@@ -1,5 +1,11 @@
 # @nagi-js/pgmq
 
+## 0.1.1-rc.21
+
+### Patch Changes
+
+- 8a7891f: Require `kysely` ^0.29.0 as the peer (was ^0.28.0), and build and test against 0.29.
+
 ## 0.1.1-rc.20
 
 ### Patch Changes
