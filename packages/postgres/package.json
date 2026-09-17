@@ -47,11 +47,11 @@
     "@nagi-js/core": "workspace:*"
   },
   "peerDependencies": {
-    "kysely": "^0.28.0"
+    "kysely": "^0.29.0"
   },
   "devDependencies": {
     "@types/pg": "^8.23.1",
-    "kysely": "^0.28.0",
+    "kysely": "^0.29.0",
     "pg": "^8.23.0"
   },
   "repository": {
