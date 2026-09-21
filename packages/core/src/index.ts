@@ -23,6 +23,7 @@ export {
   NagiRuntimeError,
   NagiSignalTimeoutError,
   NagiSnapshotDriftError,
+  NagiStepTimeoutError,
   NagiValidationError,
 } from "./errors";
 export { type RowDelta, rowDeltaOf } from "./facts";
@@ -39,6 +40,14 @@ export {
   projectRunState,
 } from "./memory";
 export { defaultSnapshotGonePolicy } from "./retry";
+// Reusable by Store adapters: the chunk fan-out is process-local machinery, not
+// a persistence concern, so every adapter drives this same hub rather than
+// reimplementing subscriber buffering and close semantics.
+export {
+  InMemoryRunEventHub,
+  isTerminalRunEvent,
+  runEventOf,
+} from "./run-events";
 export { RunId } from "./run-id";
 export type {
   RunDescription,
@@ -101,6 +110,11 @@ export {
   selectExpired,
   selectPruneBatch,
 } from "./store-policy";
+export {
+  InMemoryStreamHub,
+  STREAM_REPLAY_BUFFER_CAP,
+  STREAM_SUBSCRIBER_BUFFER_CAP,
+} from "./stream-hub";
 // Explicit public type surface (not `export type *`): a new type in types.ts is
 // internal-by-default, and any change to the public surface shows up as a diff.
 export type {
@@ -155,6 +169,7 @@ export type {
   OnceRecordedFact,
   Operator,
   OperatorAuditOpts,
+  OperatorRetryOpts,
   Optional,
   ParentLink,
   ParentRef,
@@ -172,9 +187,13 @@ export type {
   Register,
   ReplayMode,
   ReplayOpts,
+  ResetScope,
   ResolvedConcurrency,
   ResolvedNeeds,
   RetryPolicy,
+  RunEvent,
+  RunEventEnvelope,
+  RunEventTransport,
   RunStatus,
   RunSummary,
   SerializedError,

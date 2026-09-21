@@ -1,5 +1,57 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.22
+
+### Patch Changes
+
+- c50101f: `canceled_by_run_id` can no longer name a run that does not exist (nagi#29).
+
+  The orphan was blamed on custom stores, legacy rows or admin writes, because `tryStartRun` is single-tx atomic and so cannot produce it. Two canonical paths produce it anyway, and both are now closed. Each was reproduced against real Postgres and against the in-memory store before being fixed, and both are pinned by the shared conformance suite.
+
+  **Retention.** `pruneFacts` deletes run rows without regard for who points at them, so a policy that keeps `canceled` for audit while dropping `completed` deletes the superseder and strands its victim's reference. Migration `0008_canceled_by_run_id_fk` nulls existing orphans, indexes the column (every `workflow_run` delete re-checks the constraint, and retention deletes in batches) and adds a self-referencing FK with `ON DELETE SET NULL`.
+
+  **A handler's own claim.** `NagiCanceledError` is public and takes any `canceledByRunId`; `classifyFailure` turns it into a concurrency-cause `flow.canceled` fact, which projects straight into the column. Nothing checked that the named run existed — so a consumer reporting its own supersession wrote an orphan directly. The column now takes the id only when it resolves, in both stores. The fact log is untouched and keeps the claim verbatim: facts are immutable, and the column is a projection.
+
+  Because of that, the constraint can be immediate rather than deferred. `tryStartRun` has to cancel the prior run _before_ inserting the superseder — the partial unique index on `(flow_id, concurrency_key)` only frees the slot once the prior leaves `pending`/`running` — so the cancel write cannot name the superseder. It resolves the reference after the insert instead.
+
+  See `docs/OPERATIONS.md` for applying `0008` to a large live table without the validation lock.
+
+- c1e0331: `b.streamingTask` now works on Postgres. `postgresStore()` takes a `listener` and implements `StreamTransport` over `LISTEN`/`NOTIFY`; until now the transport existed only on the in-memory store, so a flow declaring a streaming step was refused against any production store.
+
+  The listening connection is injected rather than opened by the adapter: Kysely hides the driver (`PostgresConnection` holds the `pg` client privately and exposes no notification event) and this package keeps `pg` a devDependency, so neon / postgres.js / pglite users are not forced onto it. Consumers pass a `StreamListener`, the same way they already pass `db`.
+
+  Two ordering properties the transport has to guarantee, neither of which is free over a connection pool:
+
+  - **Chunks of one step stay in order.** `db` is a pool, so un-awaited `pg_notify` calls can take different connections and arrive reversed. Publishes are chained per step; different steps stay independent.
+  - **A close never overtakes its chunks.** Close/retry frames ride the fact's transaction and land at commit, while chunks commit immediately on their own connections. Before emitting a close the adapter drains that step's publish chain, otherwise the channel shuts and in-flight chunks are discarded.
+
+  `postgresStore()` returns a `PostgresStoreHandle` with `ready()`, which resolves once both channels are actually receiving NOTIFY. A constructor cannot await `listen()`, and NOTIFY does not queue for a connection that is not yet listening, so chunks and events published in that window are lost rather than delayed — `await store.ready()` before starting work you intend to watch. It is total: with no `listener` there is nothing to wait for and it resolves immediately, so a consumer never branches on whether it wired one.
+
+  `core` exports `InMemoryStreamHub` and the buffer caps so adapters reuse one fan-out implementation instead of reimplementing subscriber buffering and close semantics. Chunks are capped at `MAX_CHUNK_BYTES` (7000, inside PostgreSQL's 8000-byte NOTIFY payload limit) and an oversized chunk throws from `ctx.emit` rather than being dropped silently.
+
+- 37086c5: Live run-event subscription (nagi#16 Layer 1). `wf.watchRun(runId, handler)` and `wf.watchRuns(handler)` push `RunEvent`s — flow started/completed/failed/canceled, step started/completed/failed/retried/skipped — as the facts that produce them commit. Both return a disposer; `watchRun` also disposes itself once the run reaches a terminal event, so watching many runs does not leak a handler each.
+
+  The transport lives on the **Store** (`Store.events`), not in core, and that placement is forced rather than stylistic: `flow.canceled(cause: "concurrency")` and `flow.started` are minted inside the adapter, in the same transaction as the row writes. A core-side decorator would silently miss supersession — a terminal event, and one of the most important things an observer wants. Both adapters now publish from where those facts are actually written, and the shared fan-out (`InMemoryRunEventHub`) is exported from core so neither reimplements subscriber bookkeeping.
+
+  On Postgres, events ride the fact's transaction: PostgreSQL holds a `NOTIFY` until commit, so an observer hears about a fact only once it is durable, and a rolled-back attempt announces nothing. `postgresStore()`'s `listener` option now powers both this and streaming chunks — one LISTEN connection, two channels.
+
+  Not durable by design: a handler sees events from the moment it subscribes, and a restart starts over. Pair with `describe()` / `queryRuns()` to catch up. `watchRuns` does not filter — a live stream cannot honestly filter on `status` (the event _is_ the status change) and filtering on `input` would need a state load per event.
+
+  Stores without the transport throw from `watchRun` / `watchRuns` rather than returning a subscription that silently never fires. On Postgres the events channel shares the store's one LISTEN connection, so `await store.ready()` before starting a run you mean to watch — events published before the socket is live are lost, not delayed.
+
+- ad47244: Fix: `uuidv7()` is now monotonic within a millisecond, so the fact log cannot come back out of order.
+
+  `fact_id` is a uuidv7 and `loadRunState` reads facts with `ORDER BY fact_id ASC`, which makes fact_id order _the_ append order that `foldRun` replays a run from. The previous implementation filled all 74 non-timestamp bits with fresh randomness, so two facts written in the same millisecond sorted at random — a run could fold with `step.started` ahead of its own `flow.started`. This surfaced as an intermittent store-conformance failure against real Postgres.
+
+  RFC 9562's 12-bit `rand_a` now carries a per-millisecond counter, seeded in its low half so at least 2048 ids per millisecond are guaranteed ordered, and saturating rather than wrapping past that (wrapping would sort an id before the one it follows). `rand_b` stays fully random, so uniqueness never depends on the counter having headroom.
+
+- Updated dependencies [c50101f]
+- Updated dependencies [b35291a]
+- Updated dependencies [c1e0331]
+- Updated dependencies [5887534]
+- Updated dependencies [37086c5]
+  - @nagi-js/core@0.1.1-rc.21
+
 ## 0.1.1-rc.21
 
 ### Patch Changes

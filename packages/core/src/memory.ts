@@ -1,6 +1,7 @@
 import { NagiConcurrencyConflictError } from "./errors";
 import { Facts, foldRun } from "./facts";
 import { decideExpiredLeaseAction, type ReapedLease } from "./lease-reaper";
+import { InMemoryRunEventHub, runEventOf } from "./run-events";
 import type {
   RunDescription,
   RunView,
@@ -50,6 +51,7 @@ import type {
   QueueEnqueueOpts,
   QueueInspectEntry,
   QueueMessage,
+  RunEventTransport,
   RunId,
   RunState,
   RunSummary,
@@ -143,6 +145,10 @@ export class InMemoryStore implements Store {
     }
     list.push(fact);
     this.facts.set(runId, list);
+    // Lifecycle fan-out rides the same durable write as the stream hub below,
+    // so an observer never sees an event for a fact that was not persisted.
+    const event = runEventOf(fact);
+    if (event !== null) this.eventHub.publish({ ...event, runId });
     // Drive the stream hub off the durable fact log. These fire for ALL steps;
     // the hub's close*/closeRun are safe no-ops for non-streaming steps (no
     // channel exists, so nothing is created and nothing leaks).
@@ -216,7 +222,7 @@ export class InMemoryStore implements Store {
       readonly fact: FlowCanceledByConcurrencyFact;
     }>;
   }> {
-    if (this.facts.has(runId) || this.summaries.has(runId)) {
+    if (this.runExists(runId)) {
       return { started: false, canceled: [] };
     }
 
@@ -243,6 +249,9 @@ export class InMemoryStore implements Store {
     }
 
     this.facts.set(runId, [fact]);
+    // flow.started never passes through appendFact — the run row and its first
+    // fact are written together here — so the event is published here too.
+    this.eventHub.publish({ type: "flow.started", flowId: fact.flowId, runId });
     const parentRunId = fact.parent?.runId;
     if (parentRunId !== undefined) {
       const set = this.childrenByParent.get(parentRunId) ?? new Set<RunId>();
@@ -599,7 +608,9 @@ export class InMemoryStore implements Store {
       }
       if (f.kind === "flow.canceled") {
         completedAt = f.at;
-        if (f.cause === "concurrency") {
+        // The fact keeps the superseder's id forever; the VIEW must not name a
+        // run retention has deleted. A dangling reference here is nagi#29.
+        if (f.cause === "concurrency" && this.runExists(f.canceledByRunId)) {
           canceledByRunId = f.canceledByRunId;
         }
         break;
@@ -696,6 +707,10 @@ export class InMemoryStore implements Store {
 
   // A run pruned with keepSummary keeps its row in Postgres; the summary is
   // the in-memory equivalent, so describe() stays non-null for it.
+  private runExists(runId: RunId): boolean {
+    return this.facts.has(runId) || this.summaries.has(runId);
+  }
+
   private describeSummary(runId: RunId): RunDescription {
     const s = this.summaries.get(runId);
     if (s === undefined) return null;
@@ -761,6 +776,13 @@ export class InMemoryStore implements Store {
     }
     return out;
   }
+
+  private readonly eventHub = new InMemoryRunEventHub();
+
+  readonly events: RunEventTransport = {
+    watchRun: (runId, handler) => this.eventHub.watchRun(runId, handler),
+    watchRuns: (handler) => this.eventHub.watchRuns(handler),
+  };
 
   readonly stream: StreamTransport = {
     subscribeStream: (

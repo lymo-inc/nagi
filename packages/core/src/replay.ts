@@ -6,7 +6,8 @@ import {
 } from "./errors";
 import { Facts } from "./facts";
 import type { FlowRegistry } from "./flows";
-import { descendantsOf } from "./scheduler";
+import { compact } from "./internal";
+import { resetSetOf } from "./scheduler";
 import type { DriftPolicy, Flow, Queue, ReplayOpts, RunId } from "./types";
 
 export interface ReplayDeps extends DispatchDeps {
@@ -79,12 +80,17 @@ export function makeReplay(deps: ReplayDeps): {
           ["from"],
         );
       }
-      const cascade = descendantsOf(effectiveFlow, opts.from);
+      const resetSet = resetSetOf(effectiveFlow, opts.from, opts.scope);
       const at = clock.now();
-      for (const stepId of cascade) {
+      for (const stepId of resetSet) {
         const fact =
           stepId === opts.from
-            ? Facts.stepReset({ runId, stepId, at })
+            ? Facts.stepReset({
+                runId,
+                stepId,
+                at,
+                ...compact({ scope: opts.scope }),
+              })
             : Facts.stepReset({ runId, stepId, at, cascadedFrom: opts.from });
         await store.appendFact(runId, fact);
       }

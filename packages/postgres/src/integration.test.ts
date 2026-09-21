@@ -331,6 +331,52 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     );
   }, 15_000);
 
+  it("canceled_by_run_id FK rejects a phantom superseder and nulls a pruned one", async () => {
+    const victim = `run-${uuidv7()}` as RunId;
+    const superseder = `run-${uuidv7()}` as RunId;
+    const flowId = "pg-canceled-by-fk";
+    const insert = (runId: RunId, status: string) =>
+      sql`
+      INSERT INTO ${sql.raw(`${schema}.workflow_run`)}
+        (run_id, flow_id, status, input, started_at)
+      VALUES (${runId}, ${flowId}, ${status}, '{}'::jsonb, now())
+    `.execute(db);
+
+    await insert(victim, "canceled");
+
+    // nagi#29 hypothesis 3: a non-tx admin write. The database now refuses it
+    // rather than leaving the audit to find it a week later.
+    await expect(
+      sql`
+        UPDATE ${sql.raw(`${schema}.workflow_run`)}
+           SET canceled_by_run_id = ${`run-${uuidv7()}`}
+         WHERE run_id = ${victim}
+      `.execute(db),
+    ).rejects.toThrow(/workflow_run_canceled_by_fk/);
+
+    await insert(superseder, "completed");
+    await sql`
+      UPDATE ${sql.raw(`${schema}.workflow_run`)}
+         SET canceled_by_run_id = ${superseder}
+       WHERE run_id = ${victim}
+    `.execute(db);
+
+    // What retention does: the superseder goes, the victim stays.
+    await sql`DELETE FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${superseder}`.execute(
+      db,
+    );
+    const after = await sql<{
+      canceled_by_run_id: string | null;
+    }>`SELECT canceled_by_run_id FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${victim}`.execute(
+      db,
+    );
+    expect(after.rows[0]?.canceled_by_run_id).toBeNull();
+
+    await sql`DELETE FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${victim}`.execute(
+      db,
+    );
+  }, 15_000);
+
   it("concurrent starts with the same key produce exactly one active run", async () => {
     const f = flow({
       id: "pg-conc-race",

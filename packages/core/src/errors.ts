@@ -94,6 +94,40 @@ export class NagiSignalTimeoutError extends Error {
   }
 }
 
+// A handler step (task / activity / streaming) blew its declared timeoutMs.
+// Distinct from NagiAbortError on purpose: an abort means someone canceled the
+// run or an operator reset the step, and classifyFailure settles those as
+// `canceled`. A deadline is the step's own failure, so it must reach
+// classifyFailure as an ordinary error and retry under the step's policy. The
+// name is NOT "AbortError" for the same reason — that name is how an abort is
+// recognized once it has been unwrapped from the signal's reason.
+export class NagiStepTimeoutError extends Error {
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly attempt: number;
+  readonly timeoutMs: number;
+  constructor({
+    runId,
+    stepId,
+    attempt,
+    timeoutMs,
+  }: {
+    readonly runId: RunId;
+    readonly stepId: string;
+    readonly attempt: number;
+    readonly timeoutMs: number;
+  }) {
+    super(
+      `Step "${stepId}" (run ${runId}, attempt ${attempt}) exceeded its ${timeoutMs}ms deadline — ctx.signal aborted.`,
+    );
+    this.name = "NagiStepTimeoutError";
+    this.runId = runId;
+    this.stepId = stepId;
+    this.attempt = attempt;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 // A run was started against a flowHash that is no longer in this process's
 // registry — typically a forward-incompatible deploy retired the old hash. We
 // raise loudly at dispatch (not silently against the new code) so an admin can

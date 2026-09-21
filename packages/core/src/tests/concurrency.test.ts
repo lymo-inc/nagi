@@ -451,8 +451,38 @@ describe("@nagi-js/core — NagiCanceledError → flow.canceled reclassification
   });
 
   it("RunView for a NagiCanceledError'd run has status='canceled' and canceledByRunId populated", async () => {
+    let superseder: RunId | undefined;
     const f = flow({
       id: "reclassify-runview",
+      input: passthroughSchema<VideoInput>(),
+      build: (b) => ({
+        analyze: b.task({
+          run: async ({ input, ctx }) => {
+            if (input.videoId === "winner") return { ok: true };
+            throw new NagiCanceledError({
+              runId: ctx.runId,
+              canceledByRunId: superseder as RunId,
+              concurrencyKey: "k2",
+            });
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    superseder = await h.wf.start(f, { videoId: "winner" });
+    await h.drain();
+    const runId = await h.wf.start(f, { videoId: "loser" });
+    await h.drain();
+    const desc = await h.wf.describe(runId);
+    expect(desc).not.toBeNull();
+    if (desc === null) return;
+    expect(desc.run.status).toBe("canceled");
+    expect(desc.run.canceledByRunId).toBe(superseder);
+  });
+
+  it("omits a canceler that never existed — the view holds references, the fact holds claims", async () => {
+    const f = flow({
+      id: "reclassify-phantom",
       input: passthroughSchema<VideoInput>(),
       build: (b) => ({
         analyze: b.task({
@@ -469,11 +499,18 @@ describe("@nagi-js/core — NagiCanceledError → flow.canceled reclassification
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, { videoId: "v1" });
     await h.drain();
+
+    // NagiCanceledError is public, so canceledByRunId is whatever the handler
+    // says. Surfacing an unresolvable id as a reference is nagi#29's orphan.
     const desc = await h.wf.describe(runId);
-    expect(desc).not.toBeNull();
-    if (desc === null) return;
-    expect(desc.run.status).toBe("canceled");
-    expect(desc.run.canceledByRunId).toBe("run-superseder-2");
+    expect(desc?.run.status).toBe("canceled");
+    expect(desc?.run.canceledByRunId).toBeUndefined();
+
+    const result = await h.result(runId);
+    const flowCancel = result.factsOf("flow.canceled")[0];
+    expect(flowCancel?.cause).toBe("concurrency");
+    if (flowCancel?.cause === "concurrency")
+      expect(flowCancel.canceledByRunId).toBe("run-superseder-2");
   });
 
   it("canceledByRunId is null for runs that failed for non-cancellation reasons", async () => {

@@ -9,7 +9,7 @@ import type {
 } from "./facts";
 import type { ReapedLease } from "./lease-reaper";
 import type { RunDescription } from "./run-view";
-import type { Resolved, RunState, StepState } from "./state";
+import type { Resolved, RunState, SkipReason, StepState } from "./state";
 
 export type * from "./facts";
 
@@ -166,10 +166,10 @@ export interface RetryPolicy {
   readonly retryOn?: (error: unknown) => boolean;
 }
 
-// No timeoutMs here: it was only ever ENFORCED for signal steps, and an
-// unenforced timeout knob on tasks was false safety. Signal steps carry a
-// required timeout (SignalConfig); handler-step deadline enforcement is
-// tracked upstream as its own feature.
+// No timeoutMs here: the base is shared with signal and subflow steps, which
+// carry their own deadline semantics (SignalConfig's is required; a subflow
+// parks on its child rather than holding a worker slot). Handler steps get an
+// ENFORCED deadline via HandlerConfigBase below.
 interface StepConfigBase<Input, N extends NeedsMap> {
   readonly needs?: N;
   readonly when?: (args: {
@@ -187,10 +187,27 @@ export interface StepLifecycleHooks<Output> {
   readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
-export interface TaskConfig<Input, N extends NeedsMap, Output>
-  extends StepConfigBase<Input, N>,
-    StepLifecycleHooks<Output> {
+// The three handler kinds — task, activity, streaming — share a body that runs
+// on a worker slot, so they share a retry policy and a deadline. Declared once
+// here rather than three times.
+interface HandlerConfigBase<Input, N extends NeedsMap>
+  extends StepConfigBase<Input, N> {
   readonly retry?: RetryPolicy;
+  // Optional ENFORCED deadline. At timeoutMs the step's ctx.signal is aborted
+  // with a NagiStepTimeoutError and the step settles as failed, retryable under
+  // `retry` like any other failure — a slow upstream gets another attempt, a
+  // genuinely stuck one exhausts maxAttempts and fails the run.
+  //
+  // Omitting it means "no deadline", which is a real choice and not an
+  // oversight: leaseHoldWarnMs still warns when a body holds a slot too long.
+  // Enforcement is cooperative — see the deadline wiring in exec/message.ts for
+  // what a handler that ignores ctx.signal can and cannot be held to.
+  readonly timeoutMs?: Millis;
+}
+
+export interface TaskConfig<Input, N extends NeedsMap, Output>
+  extends HandlerConfigBase<Input, N>,
+    StepLifecycleHooks<Output> {
   readonly run: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
@@ -199,9 +216,8 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
 }
 
 export interface ActivityConfig<Input, N extends NeedsMap, Output>
-  extends StepConfigBase<Input, N>,
+  extends HandlerConfigBase<Input, N>,
     StepLifecycleHooks<Output> {
-  readonly retry?: RetryPolicy;
   readonly run: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
@@ -210,9 +226,8 @@ export interface ActivityConfig<Input, N extends NeedsMap, Output>
 }
 
 export interface StreamingTaskConfig<Input, N extends NeedsMap, Output, Chunk>
-  extends StepConfigBase<Input, N>,
+  extends HandlerConfigBase<Input, N>,
     StepLifecycleHooks<Output> {
-  readonly retry?: RetryPolicy;
   readonly run: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
@@ -757,6 +772,70 @@ export interface Store {
   // because the close contract below needs the terminal facts, which only the
   // Store observes. Absent → nagi() throws at registration for streaming steps.
   readonly stream?: StreamTransport;
+
+  // Optional lifecycle fan-out for wf.watchRun / wf.watchRuns. Absent → those
+  // throw, rather than silently returning a stream that never fires.
+  readonly events?: RunEventTransport;
+}
+
+// A lifecycle projection of the fact log, for observers. Deliberately smaller
+// than Fact: leases, timers and once-records are execution bookkeeping, not
+// things a UI or an operator subscribes to.
+export type RunEvent =
+  | { readonly type: "flow.started"; readonly flowId: string }
+  | { readonly type: "flow.completed"; readonly output: Json }
+  | { readonly type: "flow.failed"; readonly error: SerializedError }
+  | {
+      readonly type: "flow.canceled";
+      readonly cause: "concurrency";
+      readonly canceledByRunId: RunId;
+    }
+  | {
+      readonly type: "flow.canceled";
+      readonly cause: "explicit" | "operator";
+    }
+  | {
+      readonly type: "step.started";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+    }
+  | {
+      readonly type: "step.completed";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+      readonly output: Json;
+    }
+  | {
+      readonly type: "step.failed";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+      readonly error: SerializedError;
+    }
+  | {
+      readonly type: "step.retried";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+    }
+  | {
+      readonly type: "step.skipped";
+      readonly stepId: StepId;
+      readonly reason: SkipReason;
+    };
+
+export type RunEventEnvelope = RunEvent & { readonly runId: RunId };
+
+// Lifecycle fan-out. Lives on the Store for the same reason StreamTransport
+// does: some lifecycle facts — concurrency supersession and lease reaping —
+// are minted INSIDE the adapter's transaction and never pass through core, so
+// core cannot observe them from the outside without breaking that atomicity.
+export interface RunEventTransport {
+  // Stops when the returned disposer is called, or after the run reaches a
+  // terminal event.
+  watchRun(runId: RunId, handler: (e: RunEventEnvelope) => void): () => void;
+  // Every run this process can observe. Filtering is the consumer's job:
+  // a live stream cannot honestly filter on `status` (the event IS the status
+  // change) and filtering on `input` would need a state load per event.
+  watchRuns(handler: (e: RunEventEnvelope) => void): () => void;
 }
 
 // Chunk transport is ephemeral and out-of-band, never transactional.
@@ -904,11 +983,21 @@ export type { RunState, StepState };
 
 export type ReplayMode = "inspect" | "continue";
 
+// How far a step reset reaches. "cascade" (the default) resets the step and
+// everything downstream of it, so the run recomputes consistently. "step"
+// resets ONLY the named step and leaves completed descendants alone — the
+// regenerate-one-output shape. Under "step" those descendants keep outputs
+// derived from the step's PREVIOUS output, which is a deliberate contract:
+// callers who need consistency want "cascade".
+export type ResetScope = "cascade" | "step";
+
 export interface ReplayOpts {
   readonly mode: ReplayMode;
   readonly allowDrift?: boolean;
   readonly fireHooks?: boolean;
   readonly from?: StepId;
+  // Only meaningful with `from`. Defaults to "cascade".
+  readonly scope?: ResetScope;
 }
 
 export interface OperatorAuditOpts {
@@ -916,12 +1005,19 @@ export interface OperatorAuditOpts {
   readonly note?: string;
 }
 
+export interface OperatorRetryOpts extends OperatorAuditOpts {
+  // Defaults to "cascade" — the historical behavior.
+  readonly scope?: ResetScope;
+}
+
 export interface Operator {
   skip(runId: RunId, stepId: StepId, opts: OperatorAuditOpts): Promise<void>;
 
   // For a `running` step, MUST first abort the in-flight handler via
   // step.abort-requested and wait for it to settle before resetting.
-  retry(runId: RunId, stepId: StepId, opts: OperatorAuditOpts): Promise<void>;
+  // `opts.scope: "step"` reruns ONLY this step, leaving completed descendants
+  // untouched (they keep outputs derived from the old value).
+  retry(runId: RunId, stepId: StepId, opts: OperatorRetryOpts): Promise<void>;
 
   abort(runId: RunId, opts: OperatorAuditOpts): Promise<void>;
 }

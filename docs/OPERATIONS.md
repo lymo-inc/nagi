@@ -84,10 +84,18 @@ Prevention layers, in order:
 
 1. `b.signal` requires a timeout — external waits park (no slot held) and
    fail honestly as `NagiSignalTimeoutError` when the input never arrives.
-2. The lease-hold watchdog (`leaseHoldWarnMs`, default 5 min) warns every
+2. `timeoutMs` on a task / activity / streaming step arms an enforced
+   deadline: at the deadline `ctx.signal` aborts with `NagiStepTimeoutError`
+   and the step fails, retryable under its own `retry` policy. Enforcement is
+   cooperative — a body that never awaits or checks `ctx.signal` keeps its
+   slot, so the deadline is a contract with handlers that honor the signal,
+   not a kill switch. Pass `ctx.signal` to your HTTP/LLM client.
+3. The lease-hold watchdog (`leaseHoldWarnMs`, default 5 min) warns every
    threshold multiple a step body holds a slot — grep for
-   `holding a worker slot` before the pool saturates.
-3. `WorkerConfig.maxConcurrencyPerFlow` (multi-flow deployments: set it to at
+   `holding a worker slot` before the pool saturates. The watchdog detects;
+   the deadline in layer 2 acts. Set `leaseHoldWarnMs` below your longest
+   `timeoutMs` and a firing watchdog means "a step ignored its deadline".
+4. `WorkerConfig.maxConcurrencyPerFlow` (multi-flow deployments: set it to at
    most `concurrency - 1`) keeps one flow from occupying every slot.
 
 If you override `pgmqQueue({ visibilityTimeoutMs })` or
@@ -95,15 +103,131 @@ If you override `pgmqQueue({ visibilityTimeoutMs })` or
 otherwise every step longer than the visibility timeout is redelivered before
 its first lease extension (defaults: 40s interval, 120s visibility).
 
+## Watching runs live
+
+`wf.watchRun(runId, handler)` and `wf.watchRuns(handler)` push lifecycle events
+as their facts commit. Both return a disposer; `watchRun` also stops on its own
+once the run is terminal.
+
+```ts
+const off = wf.watchRun(runId, (e) => {
+  if (e.type === "step.completed") console.log(e.stepId, e.output);
+});
+```
+
+This needs `Store.events`. The in-memory store always has it; `postgresStore()`
+has it when given a `listener` (the same one streaming uses — one LISTEN
+connection, two channels). Without it both methods throw rather than returning
+a subscription that never fires.
+
+What it is not:
+
+- **Not durable.** A handler sees events from the moment it subscribes; a
+  restart starts over. Catch up with `describe()` / `queryRuns()`, then watch.
+  Events ride the same LISTEN connection as streaming chunks, so the same
+  `await store.ready()` applies before starting a run you mean to watch.
+- **Not filtered.** `watchRuns` delivers every run this process observes.
+  A live stream cannot honestly filter on `status` — the event IS the status
+  change — and filtering on `input` would cost a state load per event.
+- **Not a delivery guarantee.** Events are observation, not execution. A
+  handler that throws is swallowed, so watching a run can never break it.
+
+Concurrency supersession IS observable (`flow.canceled`, `cause:
+"concurrency"`), which matters when a run vanishes from under a client: the
+event carries `canceledByRunId`.
+
+## Streaming steps on Postgres
+
+`b.streamingTask` needs a `stream` transport on the store. The in-memory store
+always has one; `postgresStore()` has one only when given a `listener`,
+and `nagi()` refuses to register a streaming flow without it.
+
+nagi does not open the listening connection itself — Kysely hides the driver, and
+this package does not depend on `pg`. Wire one:
+
+```ts
+const client = new pg.Client({ connectionString });
+await client.connect();
+
+const store = postgresStore({
+  db,
+  listener: {
+    async listen(channel, onNotify) {
+      client.on("notification", (m) => {
+        if (m.channel === channel && m.payload) onNotify(m.payload);
+      });
+      await client.query(`LISTEN "${channel}"`);
+      return () => client.end();
+    },
+  },
+});
+
+await store.ready(); // both channels live; safe to start runs
+```
+
+Operational limits:
+
+- Chunks are capped at 7000 bytes serialized (PostgreSQL's NOTIFY payload limit
+  is 8000). An oversized chunk throws from `ctx.emit`, failing the step, rather
+  than vanishing. Stream references, not payloads.
+- Chunks published before `LISTEN` is established are lost. NOTIFY does not queue
+  for a connection that is not yet listening. Chunks are ephemeral by design —
+  a subscriber that reconnects sees the stream from that point on.
+- `postgresStore()` cannot await `listen()` from a constructor, so the socket
+  goes live shortly after the call returns. **`await store.ready()` before
+  starting work you intend to watch** — it resolves once both channels are
+  receiving. A process that boots its store long before its first run never
+  notices; one that builds a store and immediately starts a run loses the head
+  of the stream, silently and in full order, which reads like a truncated
+  response rather than a race.
+- Chunks never enter the fact log, so they are not replayed. A replayed step
+  re-runs and re-emits.
+
+## Retention and superseded runs
+
+A canceled run's `canceled_by_run_id` names the run that superseded it.
+`pruneFacts` deletes run rows, so a retention policy that keeps `canceled` for
+audit while dropping `completed` deletes the superseder and leaves the
+reference behind.
+
+Postgres nulls the column when that happens (`ON DELETE SET NULL`, migration
+`0008`), so an audit for references naming a missing run returns nothing. The
+victim's own `flow.canceled` fact still carries the id, because facts are
+immutable: the column is a projection, the fact is the record. `wf.describe()`
+matches the column on both stores and omits `canceledByRunId` once the
+superseder is gone.
+
+**Applying `0008` to a large live table.** It nulls any pre-existing orphans,
+then adds the constraint — which takes an `ACCESS EXCLUSIVE` lock on
+`workflow_run` and scans it to validate, blocking reads and writes for the
+duration. On a table big enough for that to matter, run the cleanup `UPDATE`
+and `ADD CONSTRAINT ... NOT VALID` yourself, `VALIDATE CONSTRAINT` separately
+(it takes only `SHARE UPDATE EXCLUSIVE`), then insert the id
+`0008_canceled_by_run_id_fk` into `<schema>.schema_migrations` so `migrate()`
+skips it.
+
 ## Operator actions
 
 `wf.operator()` (all take `{ actor, note? }` for the audit trail):
 
 - `skip(runId, stepId)` — settle a step as skipped and advance past it.
 - `retry(runId, stepId)` — abort if running, reset the step **and its
-  descendants**, re-dispatch. (Non-cascading single-step rerun is tracked in
-  issue #34.)
+  descendants**, re-dispatch.
+- `retry(runId, stepId, { actor, scope: "step" })` — rerun **only** that step.
+  Completed descendants are left alone, so they keep outputs derived from the
+  step's PREVIOUS output; the run is deliberately inconsistent until you rerun
+  them too. Use it to regenerate one artifact when downstream consumers read
+  from their own storage. On a settled run the reset reopens the run, and the
+  flow output recomputes when it re-completes.
 - `abort(runId)` — cancel the run and its children, recursively.
 
-Plus `wf.replay(runId, { mode, from })` for whole-run replay on the current
-flow version, and `wf.cancel(runId)` for a plain stop.
+Plus `wf.replay(runId, { mode, from, scope? })` for whole-run replay on the
+current flow version — `scope` behaves exactly as on `retry` — and
+`wf.cancel(runId)` for a plain stop.
+
+The origin `step.reset` fact records `scope: "step"` for an isolated rerun.
+Intent is recorded rather than inferred: a leaf step has no descendants, so a
+cascading retry on a leaf writes the same single fact an isolated one does.
+
+A subflow step reset under either scope bumps its generation, so it spawns a
+FRESH child run rather than re-attaching to the finished one.
