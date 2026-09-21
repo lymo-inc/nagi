@@ -17,6 +17,7 @@ import type {
   AttemptNumber,
   Flow,
   Json,
+  ResetScope,
   RunState,
   SerializedError,
   StepId,
@@ -288,6 +289,17 @@ export function computeFlowOutput(flow: Flow, runState: RunState): Json {
     if (sstate.tag === "completed") stepOutputs[sid] = sstate.output;
   }
   return flow.output(stepOutputs as never) as Json;
+}
+
+// The steps a reset touches, given its scope. "step" is the regenerate-one
+// shape: only the origin. Both operator.retry and replay({from}) resolve their
+// reset set through here so the two paths can never drift apart.
+export function resetSetOf(
+  flow: Flow,
+  stepId: StepId,
+  scope: ResetScope | undefined,
+): readonly StepId[] {
+  return scope === "step" ? [stepId] : descendantsOf(flow, stepId);
 }
 
 export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {

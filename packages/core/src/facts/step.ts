@@ -9,6 +9,7 @@ import {
 import type {
   AttemptNumber,
   Json,
+  ResetScope,
   RunId,
   SerializedError,
   StepId,
@@ -66,6 +67,11 @@ export interface StepResetFact extends FactBase {
   readonly kind: "step.reset";
   readonly stepId: StepId;
   readonly cascadedFrom?: StepId;
+  // The operator's INTENT, recorded on the origin step only. Absence of
+  // cascadedFrom siblings cannot be read as "isolated": a leaf step has no
+  // descendants either, so a cascading retry on a leaf looks identical. Omitted
+  // for "cascade" so existing facts keep their shape.
+  readonly scope?: ResetScope;
   readonly actor?: string;
   readonly note?: string;
 }
@@ -193,6 +199,7 @@ export const stepFacts = {
     readonly stepId: StepId;
     readonly at: Date;
     readonly cascadedFrom?: StepId;
+    readonly scope?: ResetScope;
     readonly actor?: string;
     readonly note?: string;
   }): StepResetFact {
@@ -203,6 +210,7 @@ export const stepFacts = {
       at: a.at,
       ...compact({
         cascadedFrom: a.cascadedFrom,
+        scope: a.scope === "cascade" ? undefined : a.scope,
         actor: a.actor,
         note: a.note,
       }),

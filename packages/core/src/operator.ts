@@ -3,7 +3,7 @@ import { NagiRuntimeError, validationError } from "./errors";
 import { Facts } from "./facts";
 import type { FlowRegistry } from "./flows";
 import { compact, type EmitLog } from "./internal";
-import { descendantsOf, stepStateOf } from "./scheduler";
+import { resetSetOf, stepStateOf } from "./scheduler";
 import {
   attemptOf,
   isStepTerminal,
@@ -16,6 +16,7 @@ import type {
   Clock,
   Operator,
   OperatorAuditOpts,
+  OperatorRetryOpts,
   RunId,
   StepId,
   Store,
@@ -116,7 +117,7 @@ export function makeOperator(o: OperatorDeps): Operator {
   async function retry(
     runId: RunId,
     stepId: StepId,
-    opts: OperatorAuditOpts,
+    opts: OperatorRetryOpts,
   ): Promise<void> {
     requireActor("operator.retry", opts.actor);
     const state = await store.loadRunState(runId);
@@ -154,9 +155,9 @@ export function makeOperator(o: OperatorDeps): Operator {
       );
     }
 
-    const cascade = descendantsOf(flow, stepId);
+    const resetSet = resetSetOf(flow, stepId, opts.scope);
     const at = clock.now();
-    for (const id of cascade) {
+    for (const id of resetSet) {
       const fact =
         id === stepId
           ? Facts.stepReset({
@@ -164,7 +165,7 @@ export function makeOperator(o: OperatorDeps): Operator {
               stepId: id,
               at,
               actor: opts.actor,
-              ...compact({ note: opts.note }),
+              ...compact({ scope: opts.scope, note: opts.note }),
             })
           : Facts.stepReset({ runId, stepId: id, at, cascadedFrom: stepId });
       await store.appendFact(runId, fact);

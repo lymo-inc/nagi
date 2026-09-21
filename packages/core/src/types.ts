@@ -919,11 +919,21 @@ export type { RunState, StepState };
 
 export type ReplayMode = "inspect" | "continue";
 
+// How far a step reset reaches. "cascade" (the default) resets the step and
+// everything downstream of it, so the run recomputes consistently. "step"
+// resets ONLY the named step and leaves completed descendants alone — the
+// regenerate-one-output shape. Under "step" those descendants keep outputs
+// derived from the step's PREVIOUS output, which is a deliberate contract:
+// callers who need consistency want "cascade".
+export type ResetScope = "cascade" | "step";
+
 export interface ReplayOpts {
   readonly mode: ReplayMode;
   readonly allowDrift?: boolean;
   readonly fireHooks?: boolean;
   readonly from?: StepId;
+  // Only meaningful with `from`. Defaults to "cascade".
+  readonly scope?: ResetScope;
 }
 
 export interface OperatorAuditOpts {
@@ -931,12 +941,19 @@ export interface OperatorAuditOpts {
   readonly note?: string;
 }
 
+export interface OperatorRetryOpts extends OperatorAuditOpts {
+  // Defaults to "cascade" — the historical behavior.
+  readonly scope?: ResetScope;
+}
+
 export interface Operator {
   skip(runId: RunId, stepId: StepId, opts: OperatorAuditOpts): Promise<void>;
 
   // For a `running` step, MUST first abort the in-flight handler via
   // step.abort-requested and wait for it to settle before resetting.
-  retry(runId: RunId, stepId: StepId, opts: OperatorAuditOpts): Promise<void>;
+  // `opts.scope: "step"` reruns ONLY this step, leaving completed descendants
+  // untouched (they keep outputs derived from the old value).
+  retry(runId: RunId, stepId: StepId, opts: OperatorRetryOpts): Promise<void>;
 
   abort(runId: RunId, opts: OperatorAuditOpts): Promise<void>;
 }

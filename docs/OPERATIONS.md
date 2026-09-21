@@ -132,9 +132,22 @@ skips it.
 
 - `skip(runId, stepId)` — settle a step as skipped and advance past it.
 - `retry(runId, stepId)` — abort if running, reset the step **and its
-  descendants**, re-dispatch. (Non-cascading single-step rerun is tracked in
-  issue #34.)
+  descendants**, re-dispatch.
+- `retry(runId, stepId, { actor, scope: "step" })` — rerun **only** that step.
+  Completed descendants are left alone, so they keep outputs derived from the
+  step's PREVIOUS output; the run is deliberately inconsistent until you rerun
+  them too. Use it to regenerate one artifact when downstream consumers read
+  from their own storage. On a settled run the reset reopens the run, and the
+  flow output recomputes when it re-completes.
 - `abort(runId)` — cancel the run and its children, recursively.
 
-Plus `wf.replay(runId, { mode, from })` for whole-run replay on the current
-flow version, and `wf.cancel(runId)` for a plain stop.
+Plus `wf.replay(runId, { mode, from, scope? })` for whole-run replay on the
+current flow version — `scope` behaves exactly as on `retry` — and
+`wf.cancel(runId)` for a plain stop.
+
+The origin `step.reset` fact records `scope: "step"` for an isolated rerun.
+Intent is recorded rather than inferred: a leaf step has no descendants, so a
+cascading retry on a leaf writes the same single fact an isolated one does.
+
+A subflow step reset under either scope bumps its generation, so it spawns a
+FRESH child run rather than re-attaching to the finished one.
