@@ -95,6 +95,29 @@ If you override `pgmqQueue({ visibilityTimeoutMs })` or
 otherwise every step longer than the visibility timeout is redelivered before
 its first lease extension (defaults: 40s interval, 120s visibility).
 
+## Retention and superseded runs
+
+A canceled run's `canceled_by_run_id` names the run that superseded it.
+`pruneFacts` deletes run rows, so a retention policy that keeps `canceled` for
+audit while dropping `completed` deletes the superseder and leaves the
+reference behind.
+
+Postgres nulls the column when that happens (`ON DELETE SET NULL`, migration
+`0008`), so an audit for references naming a missing run returns nothing. The
+victim's own `flow.canceled` fact still carries the id, because facts are
+immutable: the column is a projection, the fact is the record. `wf.describe()`
+matches the column on both stores and omits `canceledByRunId` once the
+superseder is gone.
+
+**Applying `0008` to a large live table.** It nulls any pre-existing orphans,
+then adds the constraint — which takes an `ACCESS EXCLUSIVE` lock on
+`workflow_run` and scans it to validate, blocking reads and writes for the
+duration. On a table big enough for that to matter, run the cleanup `UPDATE`
+and `ADD CONSTRAINT ... NOT VALID` yourself, `VALIDATE CONSTRAINT` separately
+(it takes only `SHARE UPDATE EXCLUSIVE`), then insert the id
+`0008_canceled_by_run_id_fk` into `<schema>.schema_migrations` so `migrate()`
+skips it.
+
 ## Operator actions
 
 `wf.operator()` (all take `{ actor, note? }` for the audit trail):

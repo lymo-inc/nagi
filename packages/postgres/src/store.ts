@@ -189,6 +189,11 @@ class PostgresStore<DB = unknown> implements Store {
           (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
       `.execute(trx);
       await this.insertFact(trx, runId, fact);
+      await this.linkSuperseder(
+        trx,
+        runId,
+        canceled.map((c) => c.runId),
+      );
 
       return { started: true, canceled };
     });
@@ -300,6 +305,11 @@ class PostgresStore<DB = unknown> implements Store {
         throw err;
       }
       await this.insertFact(trx, runId, fact);
+      await this.linkSuperseder(
+        trx,
+        runId,
+        canceled.map((c) => c.runId),
+      );
       return { started: true, canceled };
     }
   }
@@ -650,6 +660,23 @@ class PostgresStore<DB = unknown> implements Store {
     `.execute(trx);
   }
 
+  // Victims are canceled BEFORE the superseder row exists: the partial unique
+  // index on (flow_id, concurrency_key) only frees the slot once they leave
+  // 'pending'/'running'. Their reference is therefore resolved here, after the
+  // insert, rather than by the cancel write that cannot yet name it.
+  private async linkSuperseder(
+    trx: Kysely<DB>,
+    runId: RunId,
+    priors: ReadonlyArray<RunId>,
+  ): Promise<void> {
+    if (priors.length === 0) return;
+    await sql`
+      UPDATE ${sql.raw(this.t("workflow_run"))}
+         SET canceled_by_run_id = ${runId}
+       WHERE run_id = ANY(${priors}::text[])
+    `.execute(trx);
+  }
+
   private async persistFact(
     trx: Kysely<DB>,
     runId: RunId,
@@ -705,10 +732,17 @@ class PostgresStore<DB = unknown> implements Store {
         `.execute(trx);
         return;
       case "canceled":
+        // NagiCanceledError is public: a handler can name any run as its
+        // canceler, and classifyFailure turns that into this delta. The FACT
+        // keeps the claim verbatim; the column takes it only when it resolves,
+        // so the reference stays joinable (nagi#29).
         await sql`
           UPDATE ${sql.raw(this.t("workflow_run"))}
              SET status = 'canceled',
-                 canceled_by_run_id = ${delta.canceledByRunId},
+                 canceled_by_run_id = (
+                   SELECT s.run_id FROM ${sql.raw(this.t("workflow_run"))} s
+                    WHERE s.run_id = ${delta.canceledByRunId}
+                 ),
                  completed_at = ${delta.completedAt}
            WHERE run_id = ${runId}
         `.execute(trx);

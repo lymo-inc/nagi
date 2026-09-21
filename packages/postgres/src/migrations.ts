@@ -173,6 +173,30 @@ export const migrations: readonly Migration[] = [
           AND status IN ('completed','failed','canceled');
     `,
   },
+  {
+    id: "0008_canceled_by_run_id_fk",
+    sql: (schema) => `
+      UPDATE ${schema}.workflow_run w
+         SET canceled_by_run_id = NULL
+       WHERE w.canceled_by_run_id IS NOT NULL
+         AND NOT EXISTS (
+               SELECT 1 FROM ${schema}.workflow_run s
+                WHERE s.run_id = w.canceled_by_run_id
+             );
+
+      CREATE INDEX IF NOT EXISTS workflow_run_canceled_by_idx
+        ON ${schema}.workflow_run (canceled_by_run_id)
+        WHERE canceled_by_run_id IS NOT NULL;
+
+      ALTER TABLE ${schema}.workflow_run
+        DROP CONSTRAINT IF EXISTS workflow_run_canceled_by_fk;
+      ALTER TABLE ${schema}.workflow_run
+        ADD CONSTRAINT workflow_run_canceled_by_fk
+        FOREIGN KEY (canceled_by_run_id)
+        REFERENCES ${schema}.workflow_run(run_id)
+        ON DELETE SET NULL;
+    `,
+  },
 ];
 
 export interface MigrateOpts {

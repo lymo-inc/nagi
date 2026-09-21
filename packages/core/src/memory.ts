@@ -216,7 +216,7 @@ export class InMemoryStore implements Store {
       readonly fact: FlowCanceledByConcurrencyFact;
     }>;
   }> {
-    if (this.facts.has(runId) || this.summaries.has(runId)) {
+    if (this.runExists(runId)) {
       return { started: false, canceled: [] };
     }
 
@@ -599,7 +599,9 @@ export class InMemoryStore implements Store {
       }
       if (f.kind === "flow.canceled") {
         completedAt = f.at;
-        if (f.cause === "concurrency") {
+        // The fact keeps the superseder's id forever; the VIEW must not name a
+        // run retention has deleted. A dangling reference here is nagi#29.
+        if (f.cause === "concurrency" && this.runExists(f.canceledByRunId)) {
           canceledByRunId = f.canceledByRunId;
         }
         break;
@@ -696,6 +698,10 @@ export class InMemoryStore implements Store {
 
   // A run pruned with keepSummary keeps its row in Postgres; the summary is
   // the in-memory equivalent, so describe() stays non-null for it.
+  private runExists(runId: RunId): boolean {
+    return this.facts.has(runId) || this.summaries.has(runId);
+  }
+
   private describeSummary(runId: RunId): RunDescription {
     const s = this.summaries.get(runId);
     if (s === undefined) return null;

@@ -242,6 +242,127 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    // nagi#29: a phantom superseder is a canceled_by_run_id pointing at a run
+    // row that does not exist. The canonical stores cannot produce one because
+    // cancel-prior and insert-new share a transaction; this pins that property
+    // on the CONTRACT so a custom Store cannot regress into the bug silently.
+    name: "tryStartRun: a superseded run's canceledByRunId always references a run that exists",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const flowId = fid();
+      const a = rid();
+      const b = rid();
+      await startRun(s, a, { flowId, concurrencyKey: "k" });
+      await startRun(s, b, { flowId, concurrencyKey: "k" });
+
+      const superseder = (await s.describe(a))?.run.canceledByRunId;
+      ok(superseder !== undefined, "a records a superseder");
+      ok(
+        (await s.describe(superseder as RunId)) !== null,
+        "the superseder run row must exist — a dangling reference is nagi#29",
+      );
+      eq(
+        (await s.loadRunState(superseder as RunId)).facts.length > 0,
+        true,
+        "the superseder must have a durable fact log, not just a reference",
+      );
+    },
+  },
+  {
+    // The other half of the same atomicity claim: a start that does NOT happen
+    // must not cancel anything. An implementation that cancels priors before
+    // confirming its own insert leaves exactly the orphaned state nagi#29 saw.
+    name: "tryStartRun: a refused start cancels no prior run",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const flowId = fid();
+      const a = rid();
+      const b = rid();
+      await startRun(s, a, { flowId, concurrencyKey: "k" });
+      await startRun(s, b, { flowId, concurrencyKey: "k2" });
+
+      // b is already known, so this start is refused. It must not take the
+      // "k" slot from a on the way out.
+      const refused = await startRun(s, b, { flowId, concurrencyKey: "k" });
+      eq(refused.started, false, "second start for a known runId is refused");
+      eq(refused.canceled.length, 0, "a refused start cancels nothing");
+      eq(
+        (await s.loadRunState(a)).phase.tag,
+        "running",
+        "the prior run on that key survives a refused start",
+      );
+    },
+  },
+  {
+    // The third face of nagi#29, and the one the issue's hypothesis list
+    // misses: tryStartRun is atomic, but nothing keeps the superseder ALIVE.
+    // Retention that prunes "completed" while keeping "canceled" for audit
+    // deletes the superseder and strands the victim's reference.
+    name: "pruneFacts: pruning a superseder leaves no dangling canceledByRunId",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const flowId = fid();
+      const a = rid();
+      const b = rid();
+      await startRun(s, a, { flowId, concurrencyKey: "k" });
+      await startRun(s, b, { flowId, concurrencyKey: "k" });
+      eq((await s.describe(a))?.run.canceledByRunId, b, "b superseded a");
+
+      await endRun(s, b, "completed");
+      await s.pruneFacts({
+        olderThan: new Date(Date.now() + 60_000),
+        statuses: ["completed"],
+        batchSize: 100,
+        keepSummary: false,
+      });
+
+      const victim = await s.describe(a);
+      ok(victim !== null, "a canceled run survives a completed-only policy");
+      const ref = victim.run.canceledByRunId;
+      if (ref !== undefined)
+        ok(
+          (await s.describe(ref)) !== null,
+          "canceledByRunId must not outlive the run it names — nagi#29",
+        );
+    },
+  },
+  {
+    // NagiCanceledError is public: a handler can name any run as its canceler
+    // and classifyFailure turns that claim into a concurrency-cause fact. The
+    // fact is the record; the VIEW must not present an unresolvable claim as a
+    // reference, or every consumer's audit finds nagi#29's orphan.
+    name: "appendFact(flow.canceled): a canceler that never existed is not surfaced as a reference",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const victim = rid();
+      await startRun(s, victim);
+      await s.appendFact(
+        victim,
+        Facts.flowCanceledByConcurrency({
+          runId: victim,
+          canceledByRunId: rid(),
+          concurrencyKey: "k",
+          at: new Date(),
+        }),
+      );
+
+      const d = await s.describe(victim);
+      ok(d !== null, "the canceled run is still describable");
+      eq(d.run.status, "canceled", "the cancellation itself stands");
+      eq(
+        d.run.canceledByRunId,
+        undefined,
+        "an unresolvable canceler is omitted, not surfaced — nagi#29",
+      );
+      const facts = (await s.loadRunState(victim)).facts;
+      eq(
+        facts.some((f) => f.kind === "flow.canceled"),
+        true,
+        "the fact log keeps the claim verbatim",
+      );
+    },
+  },
+  {
     name: "tryStartRun: a different key or flowId cancels nothing",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
