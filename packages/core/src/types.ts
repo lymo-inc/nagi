@@ -9,7 +9,7 @@ import type {
 } from "./facts";
 import type { ReapedLease } from "./lease-reaper";
 import type { RunDescription } from "./run-view";
-import type { Resolved, RunState, StepState } from "./state";
+import type { Resolved, RunState, SkipReason, StepState } from "./state";
 
 export type * from "./facts";
 
@@ -772,6 +772,70 @@ export interface Store {
   // because the close contract below needs the terminal facts, which only the
   // Store observes. Absent → nagi() throws at registration for streaming steps.
   readonly stream?: StreamTransport;
+
+  // Optional lifecycle fan-out for wf.watchRun / wf.watchRuns. Absent → those
+  // throw, rather than silently returning a stream that never fires.
+  readonly events?: RunEventTransport;
+}
+
+// A lifecycle projection of the fact log, for observers. Deliberately smaller
+// than Fact: leases, timers and once-records are execution bookkeeping, not
+// things a UI or an operator subscribes to.
+export type RunEvent =
+  | { readonly type: "flow.started"; readonly flowId: string }
+  | { readonly type: "flow.completed"; readonly output: Json }
+  | { readonly type: "flow.failed"; readonly error: SerializedError }
+  | {
+      readonly type: "flow.canceled";
+      readonly cause: "concurrency";
+      readonly canceledByRunId: RunId;
+    }
+  | {
+      readonly type: "flow.canceled";
+      readonly cause: "explicit" | "operator";
+    }
+  | {
+      readonly type: "step.started";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+    }
+  | {
+      readonly type: "step.completed";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+      readonly output: Json;
+    }
+  | {
+      readonly type: "step.failed";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+      readonly error: SerializedError;
+    }
+  | {
+      readonly type: "step.retried";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+    }
+  | {
+      readonly type: "step.skipped";
+      readonly stepId: StepId;
+      readonly reason: SkipReason;
+    };
+
+export type RunEventEnvelope = RunEvent & { readonly runId: RunId };
+
+// Lifecycle fan-out. Lives on the Store for the same reason StreamTransport
+// does: some lifecycle facts — concurrency supersession and lease reaping —
+// are minted INSIDE the adapter's transaction and never pass through core, so
+// core cannot observe them from the outside without breaking that atomicity.
+export interface RunEventTransport {
+  // Stops when the returned disposer is called, or after the run reaches a
+  // terminal event.
+  watchRun(runId: RunId, handler: (e: RunEventEnvelope) => void): () => void;
+  // Every run this process can observe. Filtering is the consumer's job:
+  // a live stream cannot honestly filter on `status` (the event IS the status
+  // change) and filtering on `input` would need a state load per event.
+  watchRuns(handler: (e: RunEventEnvelope) => void): () => void;
 }
 
 // Chunk transport is ephemeral and out-of-band, never transactional.

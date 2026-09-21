@@ -103,6 +103,39 @@ If you override `pgmqQueue({ visibilityTimeoutMs })` or
 otherwise every step longer than the visibility timeout is redelivered before
 its first lease extension (defaults: 40s interval, 120s visibility).
 
+## Watching runs live
+
+`wf.watchRun(runId, handler)` and `wf.watchRuns(handler)` push lifecycle events
+as their facts commit. Both return a disposer; `watchRun` also stops on its own
+once the run is terminal.
+
+```ts
+const off = wf.watchRun(runId, (e) => {
+  if (e.type === "step.completed") console.log(e.stepId, e.output);
+});
+```
+
+This needs `Store.events`. The in-memory store always has it; `postgresStore()`
+has it when given a `listener` (the same one streaming uses — one LISTEN
+connection, two channels). Without it both methods throw rather than returning
+a subscription that never fires.
+
+What it is not:
+
+- **Not durable.** A handler sees events from the moment it subscribes; a
+  restart starts over. Catch up with `describe()` / `queryRuns()`, then watch.
+  Events ride the same LISTEN connection as streaming chunks, so the same
+  `await store.ready()` applies before starting a run you mean to watch.
+- **Not filtered.** `watchRuns` delivers every run this process observes.
+  A live stream cannot honestly filter on `status` — the event IS the status
+  change — and filtering on `input` would cost a state load per event.
+- **Not a delivery guarantee.** Events are observation, not execution. A
+  handler that throws is swallowed, so watching a run can never break it.
+
+Concurrency supersession IS observable (`flow.canceled`, `cause:
+"concurrency"`), which matters when a run vanishes from under a client: the
+event carries `canceledByRunId`.
+
 ## Streaming steps on Postgres
 
 `b.streamingTask` needs a `stream` transport on the store. The in-memory store

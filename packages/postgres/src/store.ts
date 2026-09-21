@@ -17,6 +17,8 @@ import type {
   ReapedLease,
   RowDelta,
   RunDescription,
+  RunEventEnvelope,
+  RunEventTransport,
   RunId,
   RunState,
   RunStatus,
@@ -45,11 +47,13 @@ import {
   decodeRunCursor,
   encodeRunCursor,
   factEffects,
+  InMemoryRunEventHub,
   InMemoryStreamHub,
   isTerminalRun,
   NagiConcurrencyConflictError,
   projectRunState,
   rowDeltaOf,
+  runEventOf,
   stepStateOf,
   stepStatusOf,
 } from "@nagi-js/core";
@@ -73,9 +77,10 @@ export interface PostgresStoreOpts<DB = unknown> {
   readonly schema?: string;
   readonly leaseMs?: Millis;
   readonly notifyChannel?: string;
-  // The LISTEN connection carrying `b.streamingTask` chunks. Without it the
-  // store exposes no stream transport and nagi() refuses to register a
-  // streaming flow. See StreamListener for why it is injected.
+  // One LISTEN connection, powering both `b.streamingTask` chunks and
+  // wf.watchRun / wf.watchRuns lifecycle events. Without it the store exposes
+  // neither transport: nagi() refuses to register a streaming flow, and the
+  // watch methods throw. See StreamListener for why it is injected.
   readonly listener?: StreamListener;
 }
 
@@ -98,15 +103,18 @@ class PostgresStore<DB = unknown> implements Store {
   private readonly leaseMs: Millis;
   private readonly notifyChannel: string | undefined;
   private readonly streamChannel: string;
-  // Until LISTEN is live NOTIFY delivers nothing here — it never queues for a
-  // connection that is not yet listening — so chunks published before then are
-  // gone, not delayed. Total rather than optional: with no listener there is
-  // simply nothing to wait for.
+  private readonly eventChannel: string;
+  private readonly eventHub: InMemoryRunEventHub | undefined;
+  // Both channels ride one LISTEN connection. Until it is live NOTIFY delivers
+  // nothing here — it never queues for a connection that is not yet listening —
+  // so chunks and events published before then are gone, not delayed. Total
+  // rather than optional: with no listener there is simply nothing to wait for.
   private readonly listening: Promise<void>;
   // Left UNASSIGNED when no listener is supplied: under
   // exactOptionalPropertyTypes an absent property and one set to undefined are
   // different things, and Store declares `stream?`.
   readonly stream?: StreamTransport;
+  readonly events?: RunEventTransport;
 
   constructor(opts: PostgresStoreOpts<DB>) {
     if (!SCHEMA_RE.test(opts.schema ?? "nagi")) {
@@ -121,8 +129,23 @@ class PostgresStore<DB = unknown> implements Store {
     // SCHEMA_RE already bounded this to an identifier, so the channel name is
     // safe and stays inside PostgreSQL's 63-byte limit.
     this.streamChannel = `${this.schema}_stream`;
+    this.eventChannel = `${this.schema}_events`;
     let listening: Promise<void> = Promise.resolve();
     if (opts.listener !== undefined) {
+      const eventHub = new InMemoryRunEventHub();
+      this.eventHub = eventHub;
+      this.events = {
+        watchRun: (runId, handler) => eventHub.watchRun(runId, handler),
+        watchRuns: (handler) => eventHub.watchRuns(handler),
+      };
+      const eventsListening = opts.listener.listen(
+        this.eventChannel,
+        (payload) => {
+          const envelope = decodeEnvelope(payload);
+          if (envelope !== null) eventHub.publish(envelope);
+        },
+      );
+
       const hub = new InMemoryStreamHub();
       const streamListening = opts.listener.listen(
         this.streamChannel,
@@ -133,7 +156,9 @@ class PostgresStore<DB = unknown> implements Store {
       );
       this.stream = this.makeStreamTransport(hub);
 
-      listening = streamListening.then(() => undefined);
+      listening = Promise.all([eventsListening, streamListening]).then(
+        () => undefined,
+      );
     }
     this.listening = listening;
     // ready() reports a failed LISTEN by rejecting, but nothing forces a caller
@@ -142,8 +167,7 @@ class PostgresStore<DB = unknown> implements Store {
     void this.listening.catch(() => undefined);
   }
 
-  // Resolves once this process is actually receiving NOTIFY on the stream
-  // channel.
+  // Resolves once this process is actually receiving NOTIFY on both channels.
   ready(): Promise<void> {
     return this.listening;
   }
@@ -293,6 +317,9 @@ class PostgresStore<DB = unknown> implements Store {
           return false;
         }
         await this.insertFact(trx, runId, fact);
+        // flow.started bypasses persistFact — the run row and its first fact
+        // are written together — so the event is published here too.
+        await this.notifyRunEvent(trx, runId, fact);
         return true;
       });
 
@@ -356,6 +383,7 @@ class PostgresStore<DB = unknown> implements Store {
           (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
       `.execute(trx);
       await this.insertFact(trx, runId, fact);
+      await this.notifyRunEvent(trx, runId, fact);
       await this.linkSuperseder(
         trx,
         runId,
@@ -853,6 +881,24 @@ class PostgresStore<DB = unknown> implements Store {
     const delta = rowDeltaOf(fact);
     if (delta !== null) await this.applyRowDelta(trx, runId, delta);
     await this.notifyStreamClose(trx, runId, fact);
+    await this.notifyRunEvent(trx, runId, fact);
+  }
+
+  // Lifecycle events ride the fact's transaction: PostgreSQL holds a NOTIFY
+  // until commit, so an observer is told about a fact only once it is durable,
+  // and a rolled-back attempt announces nothing. This is also why the transport
+  // lives here rather than in core — flow.canceled(concurrency) and
+  // lease.reaped are minted inside this adapter and never reach core.
+  private async notifyRunEvent(
+    trx: Kysely<DB>,
+    runId: RunId,
+    fact: Fact,
+  ): Promise<void> {
+    if (this.eventHub === undefined) return;
+    const event = runEventOf(fact);
+    if (event === null) return;
+    const payload = JSON.stringify({ ...event, runId });
+    await sql`SELECT pg_notify(${this.eventChannel}, ${payload})`.execute(trx);
   }
 
   // Stream close/retry events ride the SAME transaction as the fact that caused
@@ -1524,4 +1570,18 @@ function closeFrameOf(runId: RunId, fact: Fact): StreamFrame | null {
 
 function byteLength(s: string): number {
   return new TextEncoder().encode(s).length;
+}
+
+// Envelopes cross a database connection, so a malformed payload must not take
+// down the listener.
+function decodeEnvelope(payload: string): RunEventEnvelope | null {
+  try {
+    const parsed = JSON.parse(payload) as RunEventEnvelope;
+    if (parsed === null || typeof parsed !== "object") return null;
+    return typeof parsed.type === "string" && typeof parsed.runId === "string"
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
 }

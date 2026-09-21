@@ -36,6 +36,8 @@ import type {
   QueueInspectEntry,
   ReplayOpts,
   RetryPolicy,
+  RunEventEnvelope,
+  RunEventTransport,
   RunId,
   StepId,
   Store,
@@ -160,6 +162,16 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<C>>;
 
+  // Lifecycle events for one run, as a push subscription. Returns a disposer;
+  // the subscription also ends on its own once the run reaches a terminal
+  // event, so a caller that watches many runs does not leak a handler each.
+  // NOT durable: a handler sees events observed from now on, and a restart
+  // starts over. Pair with describe() / queryRuns() to catch up.
+  watchRun(runId: RunId, handler: (e: RunEventEnvelope) => void): () => void;
+
+  // Lifecycle events for every run this process observes.
+  watchRuns(handler: (e: RunEventEnvelope) => void): () => void;
+
   operator(): Operator;
 
   pruneFacts(opts: PruneOpts): Promise<PruneResult>;
@@ -173,6 +185,19 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   await config.queue.ensureSchema?.();
 
   const streamTransport = config.store.stream;
+  // Absent transport is a configuration problem, not an empty stream: a
+  // subscription that silently never fires is the worst of both worlds.
+  const requireEvents = (caller: string): RunEventTransport => {
+    const events = config.store.events;
+    if (events === undefined) {
+      throw new NagiRuntimeError(
+        `${caller}: this store has no \`events\` transport, so lifecycle ` +
+          `events cannot be observed. The in-memory store always has one; ` +
+          `postgresStore() needs a \`listener\`.`,
+      );
+    }
+    return events;
+  };
 
   // Streaming steps publish ephemeral chunks out-of-band, so without a transport
   // they cannot be carried. Only scanned on the failure path.
@@ -422,6 +447,14 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         stepId,
         opts,
       ) as AsyncIterable<StreamEvent<C>>;
+    },
+
+    watchRun(runId: RunId, handler: (e: RunEventEnvelope) => void): () => void {
+      return requireEvents("wf.watchRun").watchRun(runId, handler);
+    },
+
+    watchRuns(handler: (e: RunEventEnvelope) => void): () => void {
+      return requireEvents("wf.watchRuns").watchRuns(handler);
     },
 
     async pruneFacts(opts: PruneOpts): Promise<PruneResult> {

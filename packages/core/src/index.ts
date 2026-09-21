@@ -40,6 +40,14 @@ export {
   projectRunState,
 } from "./memory";
 export { defaultSnapshotGonePolicy } from "./retry";
+// Reusable by Store adapters: the chunk fan-out is process-local machinery, not
+// a persistence concern, so every adapter drives this same hub rather than
+// reimplementing subscriber buffering and close semantics.
+export {
+  InMemoryRunEventHub,
+  isTerminalRunEvent,
+  runEventOf,
+} from "./run-events";
 export { RunId } from "./run-id";
 export type {
   RunDescription,
@@ -183,6 +191,9 @@ export type {
   ResolvedConcurrency,
   ResolvedNeeds,
   RetryPolicy,
+  RunEvent,
+  RunEventEnvelope,
+  RunEventTransport,
   RunStatus,
   RunSummary,
   SerializedError,
