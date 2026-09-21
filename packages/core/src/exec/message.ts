@@ -25,7 +25,9 @@ import {
   makeStepCtx,
   resolveExecutionFact,
   startCancelWatcher,
+  startDeadline,
   startHeartbeat,
+  unwrapDeadline,
 } from "../step-exec";
 import type {
   Flow,
@@ -404,6 +406,17 @@ export function makeMessage(
       ac,
       intervalMs: deps.cancelPollIntervalMs ?? CANCEL_POLL_INTERVAL_MS,
     });
+    // Shares the watcher's controller: one signal, two reasons.
+    const deadline =
+      def.timeoutMs === undefined
+        ? undefined
+        : startDeadline({
+            runId,
+            stepId,
+            attempt,
+            timeoutMs: def.timeoutMs,
+            ac,
+          });
 
     try {
       let stepAbortedHere = false;
@@ -444,8 +457,11 @@ export function makeMessage(
         },
       );
       return { output, skipAdvance: stepAbortedHere };
+    } catch (err) {
+      throw unwrapDeadline(err, ac.signal);
     } finally {
       watcher.stop();
+      deadline?.stop();
     }
   }
 
@@ -476,6 +492,17 @@ export function makeMessage(
       ac,
       intervalMs: deps.cancelPollIntervalMs ?? CANCEL_POLL_INTERVAL_MS,
     });
+    // Shares the watcher's controller: one signal, two reasons.
+    const deadline =
+      def.timeoutMs === undefined
+        ? undefined
+        : startDeadline({
+            runId,
+            stepId,
+            attempt,
+            timeoutMs: def.timeoutMs,
+            ac,
+          });
 
     try {
       const ctx = makeActivityCtx({
@@ -510,8 +537,11 @@ export function makeMessage(
         },
       );
       return { output, skipAdvance: stepAbortedHere };
+    } catch (err) {
+      throw unwrapDeadline(err, ac.signal);
     } finally {
       watcher.stop();
+      deadline?.stop();
     }
   }
 

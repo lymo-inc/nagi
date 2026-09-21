@@ -23,6 +23,7 @@ export {
   NagiRuntimeError,
   NagiSignalTimeoutError,
   NagiSnapshotDriftError,
+  NagiStepTimeoutError,
   NagiValidationError,
 } from "./errors";
 export { type RowDelta, rowDeltaOf } from "./facts";

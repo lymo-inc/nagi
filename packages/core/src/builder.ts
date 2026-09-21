@@ -53,6 +53,7 @@ function makeBuilder<Input>(): Builder<Input> {
       run: config.run as TaskDef["run"],
       ...compact({
         retry: config.retry,
+        timeoutMs: config.timeoutMs,
         when: config.when as TaskDef["when"],
         onStart: config.onStart,
         onComplete: config.onComplete as TaskDef["onComplete"],
@@ -72,6 +73,7 @@ function makeBuilder<Input>(): Builder<Input> {
       run: config.run as ActivityDef["run"],
       ...compact({
         retry: config.retry,
+        timeoutMs: config.timeoutMs,
         when: config.when as ActivityDef["when"],
         onStart: config.onStart,
         onComplete: config.onComplete as ActivityDef["onComplete"],
@@ -91,6 +93,7 @@ function makeBuilder<Input>(): Builder<Input> {
       run: config.run as StreamingTaskDef["run"],
       ...compact({
         retry: config.retry,
+        timeoutMs: config.timeoutMs,
         when: config.when as StreamingTaskDef["when"],
         onStart: config.onStart,
         onComplete: config.onComplete as StreamingTaskDef["onComplete"],

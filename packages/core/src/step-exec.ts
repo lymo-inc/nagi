@@ -1,4 +1,8 @@
-import { NagiCanceledError, NagiNonRetryableError } from "./errors";
+import {
+  NagiCanceledError,
+  NagiNonRetryableError,
+  NagiStepTimeoutError,
+} from "./errors";
 import { Facts } from "./facts";
 import { makeIdempotencyKey, makeOnce } from "./idempotency";
 import type { EmitLog } from "./internal";
@@ -127,6 +131,39 @@ export function startCancelWatcher(args: {
       stopped = true;
     },
   };
+}
+
+// Arms a handler step's deadline. Aborts the SAME AbortController the cancel
+// watcher uses, so a handler only ever has one signal to honor; the reason
+// discriminates why. Cooperative by construction: we abort and let the body
+// unwind, because a task's handler runs inside store.runStep's transaction and
+// abandoning it mid-flight would strand that tx. unwrapDeadline below turns
+// whatever the body threw on abort back into the timeout error.
+export function startDeadline(args: {
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly attempt: number;
+  readonly timeoutMs: Millis;
+  readonly ac: AbortController;
+}): { readonly stop: () => void } {
+  const { runId, stepId, attempt, timeoutMs, ac } = args;
+  const timer = setTimeout(() => {
+    if (!ac.signal.aborted)
+      ac.abort(new NagiStepTimeoutError({ runId, stepId, attempt, timeoutMs }));
+  }, timeoutMs);
+  return {
+    stop: () => clearTimeout(timer),
+  };
+}
+
+// A handler aborted by its deadline rarely rethrows our error — fetch throws its
+// own AbortError, and a body that swallows the abort may throw something else
+// entirely or nothing at all. The signal's reason is the only reliable witness,
+// so it wins over whatever surfaced. Without this the step would be recorded as
+// a generic AbortError and retryOn policies could not discriminate a deadline
+// from a cancellation.
+export function unwrapDeadline(err: unknown, signal: AbortSignal): unknown {
+  return signal.reason instanceof NagiStepTimeoutError ? signal.reason : err;
 }
 
 export const DEFAULT_HEARTBEAT_LEASE_MS: Millis = 120_000;

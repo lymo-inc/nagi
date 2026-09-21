@@ -80,6 +80,7 @@ export interface TaskDef extends StepLifecycleHooks<Json> {
   readonly kind: "task";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
+  readonly timeoutMs?: Millis;
   readonly when?: Guard;
   readonly run: (args: {
     input: unknown;
@@ -97,6 +98,7 @@ export interface ActivityDef extends StepLifecycleHooks<Json> {
   readonly kind: "activity";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
+  readonly timeoutMs?: Millis;
   readonly when?: Guard;
   readonly run: (args: {
     input: unknown;
@@ -110,6 +112,7 @@ export interface StreamingTaskDef extends StepLifecycleHooks<Json> {
   readonly kind: "streaming";
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
+  readonly timeoutMs?: Millis;
   readonly when?: Guard;
   readonly run: (args: {
     input: unknown;

@@ -84,10 +84,18 @@ Prevention layers, in order:
 
 1. `b.signal` requires a timeout — external waits park (no slot held) and
    fail honestly as `NagiSignalTimeoutError` when the input never arrives.
-2. The lease-hold watchdog (`leaseHoldWarnMs`, default 5 min) warns every
+2. `timeoutMs` on a task / activity / streaming step arms an enforced
+   deadline: at the deadline `ctx.signal` aborts with `NagiStepTimeoutError`
+   and the step fails, retryable under its own `retry` policy. Enforcement is
+   cooperative — a body that never awaits or checks `ctx.signal` keeps its
+   slot, so the deadline is a contract with handlers that honor the signal,
+   not a kill switch. Pass `ctx.signal` to your HTTP/LLM client.
+3. The lease-hold watchdog (`leaseHoldWarnMs`, default 5 min) warns every
    threshold multiple a step body holds a slot — grep for
-   `holding a worker slot` before the pool saturates.
-3. `WorkerConfig.maxConcurrencyPerFlow` (multi-flow deployments: set it to at
+   `holding a worker slot` before the pool saturates. The watchdog detects;
+   the deadline in layer 2 acts. Set `leaseHoldWarnMs` below your longest
+   `timeoutMs` and a firing watchdog means "a step ignored its deadline".
+4. `WorkerConfig.maxConcurrencyPerFlow` (multi-flow deployments: set it to at
    most `concurrency - 1`) keeps one flow from occupying every slot.
 
 If you override `pgmqQueue({ visibilityTimeoutMs })` or

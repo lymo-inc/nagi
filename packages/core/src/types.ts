@@ -166,10 +166,10 @@ export interface RetryPolicy {
   readonly retryOn?: (error: unknown) => boolean;
 }
 
-// No timeoutMs here: it was only ever ENFORCED for signal steps, and an
-// unenforced timeout knob on tasks was false safety. Signal steps carry a
-// required timeout (SignalConfig); handler-step deadline enforcement is
-// tracked upstream as its own feature.
+// No timeoutMs here: the base is shared with signal and subflow steps, which
+// carry their own deadline semantics (SignalConfig's is required; a subflow
+// parks on its child rather than holding a worker slot). Handler steps get an
+// ENFORCED deadline via HandlerConfigBase below.
 interface StepConfigBase<Input, N extends NeedsMap> {
   readonly needs?: N;
   readonly when?: (args: {
@@ -187,10 +187,27 @@ export interface StepLifecycleHooks<Output> {
   readonly onRetry?: (event: StepRetryEvent) => void | Promise<void>;
 }
 
-export interface TaskConfig<Input, N extends NeedsMap, Output>
-  extends StepConfigBase<Input, N>,
-    StepLifecycleHooks<Output> {
+// The three handler kinds — task, activity, streaming — share a body that runs
+// on a worker slot, so they share a retry policy and a deadline. Declared once
+// here rather than three times.
+interface HandlerConfigBase<Input, N extends NeedsMap>
+  extends StepConfigBase<Input, N> {
   readonly retry?: RetryPolicy;
+  // Optional ENFORCED deadline. At timeoutMs the step's ctx.signal is aborted
+  // with a NagiStepTimeoutError and the step settles as failed, retryable under
+  // `retry` like any other failure — a slow upstream gets another attempt, a
+  // genuinely stuck one exhausts maxAttempts and fails the run.
+  //
+  // Omitting it means "no deadline", which is a real choice and not an
+  // oversight: leaseHoldWarnMs still warns when a body holds a slot too long.
+  // Enforcement is cooperative — see the deadline wiring in exec/message.ts for
+  // what a handler that ignores ctx.signal can and cannot be held to.
+  readonly timeoutMs?: Millis;
+}
+
+export interface TaskConfig<Input, N extends NeedsMap, Output>
+  extends HandlerConfigBase<Input, N>,
+    StepLifecycleHooks<Output> {
   readonly run: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
@@ -199,9 +216,8 @@ export interface TaskConfig<Input, N extends NeedsMap, Output>
 }
 
 export interface ActivityConfig<Input, N extends NeedsMap, Output>
-  extends StepConfigBase<Input, N>,
+  extends HandlerConfigBase<Input, N>,
     StepLifecycleHooks<Output> {
-  readonly retry?: RetryPolicy;
   readonly run: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
@@ -210,9 +226,8 @@ export interface ActivityConfig<Input, N extends NeedsMap, Output>
 }
 
 export interface StreamingTaskConfig<Input, N extends NeedsMap, Output, Chunk>
-  extends StepConfigBase<Input, N>,
+  extends HandlerConfigBase<Input, N>,
     StepLifecycleHooks<Output> {
-  readonly retry?: RetryPolicy;
   readonly run: (args: {
     readonly input: NoInfer<Input>;
     readonly needs: NoInfer<ResolvedNeeds<N>>;
