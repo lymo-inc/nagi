@@ -1,5 +1,62 @@
 # @nagi-js/core
 
+## 0.1.1-rc.21
+
+### Patch Changes
+
+- c50101f: `canceled_by_run_id` can no longer name a run that does not exist (nagi#29).
+
+  The orphan was blamed on custom stores, legacy rows or admin writes, because `tryStartRun` is single-tx atomic and so cannot produce it. Two canonical paths produce it anyway, and both are now closed. Each was reproduced against real Postgres and against the in-memory store before being fixed, and both are pinned by the shared conformance suite.
+
+  **Retention.** `pruneFacts` deletes run rows without regard for who points at them, so a policy that keeps `canceled` for audit while dropping `completed` deletes the superseder and strands its victim's reference. Migration `0008_canceled_by_run_id_fk` nulls existing orphans, indexes the column (every `workflow_run` delete re-checks the constraint, and retention deletes in batches) and adds a self-referencing FK with `ON DELETE SET NULL`.
+
+  **A handler's own claim.** `NagiCanceledError` is public and takes any `canceledByRunId`; `classifyFailure` turns it into a concurrency-cause `flow.canceled` fact, which projects straight into the column. Nothing checked that the named run existed — so a consumer reporting its own supersession wrote an orphan directly. The column now takes the id only when it resolves, in both stores. The fact log is untouched and keeps the claim verbatim: facts are immutable, and the column is a projection.
+
+  Because of that, the constraint can be immediate rather than deferred. `tryStartRun` has to cancel the prior run _before_ inserting the superseder — the partial unique index on `(flow_id, concurrency_key)` only frees the slot once the prior leaves `pending`/`running` — so the cancel write cannot name the superseder. It resolves the reference after the insert instead.
+
+  See `docs/OPERATIONS.md` for applying `0008` to a large live table without the validation lock.
+
+- b35291a: `timeoutMs` returns to task / activity / streaming steps, this time ENFORCED. At the deadline the step's `ctx.signal` aborts with a `NagiStepTimeoutError` and the step settles as failed, retryable under its own `retry` policy — a slow upstream gets another attempt, a genuinely stuck step exhausts `maxAttempts` and fails the run.
+
+  A deadline is deliberately not a cancellation: `classifyFailure` reads cancellation from the persisted `step.abort-requested` fact and the run phase, neither of which a deadline writes, so a timed-out step reaches the normal failure path instead of settling as `canceled`. The abort _reason_ carries the discriminator, so a handler that throws its own error on abort (fetch, an SDK) is still recorded as `NagiStepTimeoutError` rather than a generic `AbortError`.
+
+  Enforcement is cooperative — nagi aborts the signal and lets the body unwind, because a task's handler runs inside `store.runStep`'s transaction and abandoning it mid-flight would strand that tx. A handler that never checks `ctx.signal` still holds its slot; `leaseHoldWarnMs` remains the detector for that.
+
+  On a streaming step the deadline also closes its subscribers: the `wf.subscribe` iterator ends with `{ kind: "error" }` carrying the timeout, rather than hanging on a generator that stopped producing.
+
+  `timeoutMs` participates in the flow hash, like the signal-step timeout: changing a deadline changes run semantics, so it changes the flow.
+
+- c1e0331: `b.streamingTask` now works on Postgres. `postgresStore()` takes a `listener` and implements `StreamTransport` over `LISTEN`/`NOTIFY`; until now the transport existed only on the in-memory store, so a flow declaring a streaming step was refused against any production store.
+
+  The listening connection is injected rather than opened by the adapter: Kysely hides the driver (`PostgresConnection` holds the `pg` client privately and exposes no notification event) and this package keeps `pg` a devDependency, so neon / postgres.js / pglite users are not forced onto it. Consumers pass a `StreamListener`, the same way they already pass `db`.
+
+  Two ordering properties the transport has to guarantee, neither of which is free over a connection pool:
+
+  - **Chunks of one step stay in order.** `db` is a pool, so un-awaited `pg_notify` calls can take different connections and arrive reversed. Publishes are chained per step; different steps stay independent.
+  - **A close never overtakes its chunks.** Close/retry frames ride the fact's transaction and land at commit, while chunks commit immediately on their own connections. Before emitting a close the adapter drains that step's publish chain, otherwise the channel shuts and in-flight chunks are discarded.
+
+  `postgresStore()` returns a `PostgresStoreHandle` with `ready()`, which resolves once both channels are actually receiving NOTIFY. A constructor cannot await `listen()`, and NOTIFY does not queue for a connection that is not yet listening, so chunks and events published in that window are lost rather than delayed — `await store.ready()` before starting work you intend to watch. It is total: with no `listener` there is nothing to wait for and it resolves immediately, so a consumer never branches on whether it wired one.
+
+  `core` exports `InMemoryStreamHub` and the buffer caps so adapters reuse one fan-out implementation instead of reimplementing subscriber buffering and close semantics. Chunks are capped at `MAX_CHUNK_BYTES` (7000, inside PostgreSQL's 8000-byte NOTIFY payload limit) and an oversized chunk throws from `ctx.emit` rather than being dropped silently.
+
+- 5887534: Non-cascading single-step rerun. `operator.retry(runId, stepId, { actor, scope: "step" })` resets ONLY the named step, leaving completed descendants untouched — the regenerate-one-output shape. `wf.replay(runId, { mode, from, scope })` takes the same control. `scope` defaults to `"cascade"`, so existing callers are unaffected.
+
+  Exposed as a control marker on the existing methods rather than a second `rerunStep` method: the two behaviors differ only in which steps the reset covers, and both call sites now resolve that through one `resetSetOf(flow, stepId, scope)` so they cannot drift apart.
+
+  Under `"step"` the descendants keep outputs derived from the step's PREVIOUS output. That is the contract, not a bug — callers who need a consistent run want `"cascade"`.
+
+  The origin `step.reset` fact now carries `scope` for an isolated rerun (omitted for `"cascade"`, so existing facts keep their shape). Recording the operator's intent beats inferring it: a leaf step has no descendants, so a cascading retry on a leaf is otherwise indistinguishable from an isolated one.
+
+- 37086c5: Live run-event subscription (nagi#16 Layer 1). `wf.watchRun(runId, handler)` and `wf.watchRuns(handler)` push `RunEvent`s — flow started/completed/failed/canceled, step started/completed/failed/retried/skipped — as the facts that produce them commit. Both return a disposer; `watchRun` also disposes itself once the run reaches a terminal event, so watching many runs does not leak a handler each.
+
+  The transport lives on the **Store** (`Store.events`), not in core, and that placement is forced rather than stylistic: `flow.canceled(cause: "concurrency")` and `flow.started` are minted inside the adapter, in the same transaction as the row writes. A core-side decorator would silently miss supersession — a terminal event, and one of the most important things an observer wants. Both adapters now publish from where those facts are actually written, and the shared fan-out (`InMemoryRunEventHub`) is exported from core so neither reimplements subscriber bookkeeping.
+
+  On Postgres, events ride the fact's transaction: PostgreSQL holds a `NOTIFY` until commit, so an observer hears about a fact only once it is durable, and a rolled-back attempt announces nothing. `postgresStore()`'s `listener` option now powers both this and streaming chunks — one LISTEN connection, two channels.
+
+  Not durable by design: a handler sees events from the moment it subscribes, and a restart starts over. Pair with `describe()` / `queryRuns()` to catch up. `watchRuns` does not filter — a live stream cannot honestly filter on `status` (the event _is_ the status change) and filtering on `input` would need a state load per event.
+
+  Stores without the transport throw from `watchRun` / `watchRuns` rather than returning a subscription that silently never fires. On Postgres the events channel shares the store's one LISTEN connection, so `await store.ready()` before starting a run you mean to watch — events published before the socket is live are lost, not delayed.
+
 ## 0.1.1-rc.20
 
 ### Patch Changes
