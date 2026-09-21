@@ -103,6 +103,53 @@ If you override `pgmqQueue({ visibilityTimeoutMs })` or
 otherwise every step longer than the visibility timeout is redelivered before
 its first lease extension (defaults: 40s interval, 120s visibility).
 
+## Streaming steps on Postgres
+
+`b.streamingTask` needs a `stream` transport on the store. The in-memory store
+always has one; `postgresStore()` has one only when given a `listener`,
+and `nagi()` refuses to register a streaming flow without it.
+
+nagi does not open the listening connection itself — Kysely hides the driver, and
+this package does not depend on `pg`. Wire one:
+
+```ts
+const client = new pg.Client({ connectionString });
+await client.connect();
+
+const store = postgresStore({
+  db,
+  listener: {
+    async listen(channel, onNotify) {
+      client.on("notification", (m) => {
+        if (m.channel === channel && m.payload) onNotify(m.payload);
+      });
+      await client.query(`LISTEN "${channel}"`);
+      return () => client.end();
+    },
+  },
+});
+
+await store.ready(); // both channels live; safe to start runs
+```
+
+Operational limits:
+
+- Chunks are capped at 7000 bytes serialized (PostgreSQL's NOTIFY payload limit
+  is 8000). An oversized chunk throws from `ctx.emit`, failing the step, rather
+  than vanishing. Stream references, not payloads.
+- Chunks published before `LISTEN` is established are lost. NOTIFY does not queue
+  for a connection that is not yet listening. Chunks are ephemeral by design —
+  a subscriber that reconnects sees the stream from that point on.
+- `postgresStore()` cannot await `listen()` from a constructor, so the socket
+  goes live shortly after the call returns. **`await store.ready()` before
+  starting work you intend to watch** — it resolves once both channels are
+  receiving. A process that boots its store long before its first run never
+  notices; one that builds a store and immediately starts a run loses the head
+  of the stream, silently and in full order, which reads like a truncated
+  response rather than a race.
+- Chunks never enter the fact log, so they are not replayed. A replayed step
+  re-runs and re-emits.
+
 ## Retention and superseded runs
 
 A canceled run's `canceled_by_run_id` names the run that superseded it.

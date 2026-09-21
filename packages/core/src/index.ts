@@ -102,6 +102,11 @@ export {
   selectExpired,
   selectPruneBatch,
 } from "./store-policy";
+export {
+  InMemoryStreamHub,
+  STREAM_REPLAY_BUFFER_CAP,
+  STREAM_SUBSCRIBER_BUFFER_CAP,
+} from "./stream-hub";
 // Explicit public type surface (not `export type *`): a new type in types.ts is
 // internal-by-default, and any change to the public surface shows up as a diff.
 export type {

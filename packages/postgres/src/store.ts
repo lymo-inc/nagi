@@ -31,6 +31,8 @@ import type {
   StepRunStatus,
   StepView,
   Store,
+  StreamEvent,
+  StreamTransport,
   TimedOutSignal,
   Tx,
 } from "@nagi-js/core";
@@ -43,12 +45,24 @@ import {
   decodeRunCursor,
   encodeRunCursor,
   factEffects,
+  InMemoryStreamHub,
+  isTerminalRun,
   NagiConcurrencyConflictError,
   projectRunState,
   rowDeltaOf,
+  stepStateOf,
+  stepStatusOf,
 } from "@nagi-js/core";
 import type { Kysely } from "kysely";
 import { sql } from "kysely";
+import {
+  applyFrame,
+  decodeFrame,
+  encodeFrame,
+  MAX_CHUNK_BYTES,
+  type StreamFrame,
+  type StreamListener,
+} from "./stream";
 import { uuidv7 } from "./uuidv7";
 
 const DEFAULT_LEASE_MS: Millis = 60_000;
@@ -59,11 +73,22 @@ export interface PostgresStoreOpts<DB = unknown> {
   readonly schema?: string;
   readonly leaseMs?: Millis;
   readonly notifyChannel?: string;
+  // The LISTEN connection carrying `b.streamingTask` chunks. Without it the
+  // store exposes no stream transport and nagi() refuses to register a
+  // streaming flow. See StreamListener for why it is injected.
+  readonly listener?: StreamListener;
+}
+
+// `listen()` is async and a constructor cannot await it, so a freshly built
+// store is not yet receiving NOTIFY. Callers that start work and subscribe in
+// the same breath MUST await ready() first.
+export interface PostgresStoreHandle extends Store {
+  ready(): Promise<void>;
 }
 
 export function postgresStore<DB = unknown>(
   opts: PostgresStoreOpts<DB>,
-): Store {
+): PostgresStoreHandle {
   return new PostgresStore(opts);
 }
 
@@ -72,6 +97,16 @@ class PostgresStore<DB = unknown> implements Store {
   private readonly schema: string;
   private readonly leaseMs: Millis;
   private readonly notifyChannel: string | undefined;
+  private readonly streamChannel: string;
+  // Until LISTEN is live NOTIFY delivers nothing here — it never queues for a
+  // connection that is not yet listening — so chunks published before then are
+  // gone, not delayed. Total rather than optional: with no listener there is
+  // simply nothing to wait for.
+  private readonly listening: Promise<void>;
+  // Left UNASSIGNED when no listener is supplied: under
+  // exactOptionalPropertyTypes an absent property and one set to undefined are
+  // different things, and Store declares `stream?`.
+  readonly stream?: StreamTransport;
 
   constructor(opts: PostgresStoreOpts<DB>) {
     if (!SCHEMA_RE.test(opts.schema ?? "nagi")) {
@@ -83,6 +118,138 @@ class PostgresStore<DB = unknown> implements Store {
     this.schema = opts.schema ?? "nagi";
     this.leaseMs = opts.leaseMs ?? DEFAULT_LEASE_MS;
     this.notifyChannel = opts.notifyChannel;
+    // SCHEMA_RE already bounded this to an identifier, so the channel name is
+    // safe and stays inside PostgreSQL's 63-byte limit.
+    this.streamChannel = `${this.schema}_stream`;
+    let listening: Promise<void> = Promise.resolve();
+    if (opts.listener !== undefined) {
+      const hub = new InMemoryStreamHub();
+      const streamListening = opts.listener.listen(
+        this.streamChannel,
+        (payload) => {
+          const frame = decodeFrame(payload);
+          if (frame !== null) applyFrame(hub, frame);
+        },
+      );
+      this.stream = this.makeStreamTransport(hub);
+
+      listening = streamListening.then(() => undefined);
+    }
+    this.listening = listening;
+    // ready() reports a failed LISTEN by rejecting, but nothing forces a caller
+    // to ask. This keeps an unobserved failure from surfacing as an unhandled
+    // rejection while leaving this.listening itself rejected for those who do.
+    void this.listening.catch(() => undefined);
+  }
+
+  // Resolves once this process is actually receiving NOTIFY on the stream
+  // channel.
+  ready(): Promise<void> {
+    return this.listening;
+  }
+
+  private makeStreamTransport(hub: InMemoryStreamHub): StreamTransport {
+    return {
+      subscribeStream: (
+        runId: RunId,
+        stepId: StepId,
+        opts?: { readonly replayBuffered?: boolean },
+      ): AsyncIterable<StreamEvent<Json>> => {
+        // Register with the hub SYNCHRONOUSLY, before any await. An earlier cut
+        // resolved the durable state first and subscribed after, which dropped
+        // every chunk published during that round-trip — the worker emits as
+        // soon as it claims the step.
+        const live = hub.subscribeStream(runId, stepId, opts);
+
+        // The step may already be settled, in which case no close frame is ever
+        // coming (this process was not listening when it fired) and the iterator
+        // would hang. Resolve that off the critical path and close the channel
+        // if so; closeOk is a no-op on an already-closed one.
+        void (async () => {
+          try {
+            await this.listening;
+            const state = await this.loadRunState(runId);
+            const status = stepStatusOf(stepStateOf(state, stepId));
+            if (
+              isTerminalRun(state) ||
+              status === "completed" ||
+              status === "failed" ||
+              status === "canceled" ||
+              status === "skipped"
+            ) {
+              hub.closeOk(runId, stepId);
+            }
+          } catch {
+            /* a failed liveness probe must not tear down the subscription */
+          }
+        })();
+
+        return live;
+      },
+
+      publishChunk: (runId: RunId, stepId: StepId, chunk: Json): void => {
+        const frame = encodeFrame({
+          k: "chunk",
+          r: runId,
+          s: stepId,
+          c: chunk,
+        });
+        const size = byteLength(frame);
+        if (size > MAX_CHUNK_BYTES) {
+          throw new Error(
+            `@nagi-js/postgres: streaming chunk for step "${stepId}" is ${size} bytes, over the ${MAX_CHUNK_BYTES}-byte NOTIFY limit. Emit smaller chunks, or carry the payload elsewhere and emit a reference.`,
+          );
+        }
+        // Deliberately NOT on a transaction: chunks must reach subscribers
+        // while the step is still running, and PostgreSQL holds a NOTIFY issued
+        // inside a transaction until that transaction commits.
+        this.notifyStream(`${runId}::${stepId}`, frame);
+      },
+    };
+  }
+
+  // Chunk order is the whole point of a token stream, and `db` is a POOL: two
+  // un-awaited pg_notify calls can take different connections and arrive
+  // reversed. So publishes for one step are chained — each waits for the
+  // previous — while different steps stay independent. The chain is still
+  // fire-and-forget to the caller, per the StreamTransport contract.
+  private readonly publishTails = new Map<string, Promise<void>>();
+
+  // Waits for in-flight chunk publishes: one step's chain, or every chain of a
+  // run when the whole run is closing.
+  private async drainPublishes(
+    runId: RunId,
+    stepId: StepId | undefined,
+  ): Promise<void> {
+    if (stepId !== undefined) {
+      await this.publishTails.get(`${runId}::${stepId}`);
+      return;
+    }
+    const prefix = `${runId}::`;
+    await Promise.all(
+      [...this.publishTails.entries()]
+        .filter(([k]) => k.startsWith(prefix))
+        .map(([, tail]) => tail),
+    );
+  }
+
+  private notifyStream(key: string, frame: string): void {
+    const prev = this.publishTails.get(key) ?? Promise.resolve();
+    const next: Promise<void> = prev
+      .then(async () => {
+        await sql`SELECT pg_notify(${this.streamChannel}, ${frame})`.execute(
+          this.db,
+        );
+      })
+      .catch(() => {
+        /* chunks are ephemeral; a lost one never corrupts the run */
+      })
+      .finally(() => {
+        // Self-cleaning: drop the entry once this step's chain has drained, so
+        // a long-lived process does not accumulate one per step ever streamed.
+        if (this.publishTails.get(key) === next) this.publishTails.delete(key);
+      });
+    this.publishTails.set(key, next);
   }
 
   private t(table: string): string {
@@ -685,6 +852,29 @@ class PostgresStore<DB = unknown> implements Store {
     await this.insertFact(trx, runId, fact);
     const delta = rowDeltaOf(fact);
     if (delta !== null) await this.applyRowDelta(trx, runId, delta);
+    await this.notifyStreamClose(trx, runId, fact);
+  }
+
+  // Stream close/retry events ride the SAME transaction as the fact that caused
+  // them. That is the opposite of publishChunk on purpose: PostgreSQL holds a
+  // NOTIFY until commit, so a subscriber is told the step is finished only once
+  // the fact is durable, and a rolled-back attempt never announces anything.
+  private async notifyStreamClose(
+    trx: Kysely<DB>,
+    runId: RunId,
+    fact: Fact,
+  ): Promise<void> {
+    if (this.stream === undefined) return;
+    const frame = closeFrameOf(runId, fact);
+    if (frame === null) return;
+    // Chunks go out on their own connections and commit immediately; this frame
+    // rides `trx` and lands at commit. Without draining the step's publish chain
+    // first, a close can overtake chunks still in flight and truncate the
+    // stream — the channel closes and the stragglers are discarded.
+    await this.drainPublishes(runId, frame.k === "run" ? undefined : frame.s);
+    await sql`SELECT pg_notify(${this.streamChannel}, ${encodeFrame(frame)})`.execute(
+      trx,
+    );
   }
 
   private applyRowDelta(
@@ -1307,4 +1497,31 @@ function isUniqueViolation(err: unknown): boolean {
     if (typeof c === "string" && c === "23505") return true;
   }
   return false;
+}
+
+// Mirrors InMemoryStore.appendFact's hub wiring, so both adapters close streams
+// on exactly the same facts. Returns null for facts that do not affect a stream.
+function closeFrameOf(runId: RunId, fact: Fact): StreamFrame | null {
+  switch (fact.kind) {
+    case "step.completed":
+      return { k: "ok", r: runId, s: fact.stepId };
+    case "step.failed":
+      // Only written on terminal failure (retries use step.retried).
+      return { k: "err", r: runId, s: fact.stepId, e: fact.error };
+    case "step.retried":
+      // The retry event carries the NEXT attempt number.
+      return { k: "retry", r: runId, s: fact.stepId, a: fact.attempt + 1 };
+    case "flow.completed":
+    case "flow.failed":
+    case "flow.canceled":
+      // Close every still-open channel so a subscriber to a skipped or
+      // never-emitting step never hangs.
+      return { k: "run", r: runId };
+    default:
+      return null;
+  }
+}
+
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length;
 }

@@ -183,8 +183,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         throw new NagiRuntimeError(
           `Flow "${f.id}" has a streaming step "${stepId}" (b.streamingTask), ` +
             `but the store has no \`stream\` transport — it cannot carry ` +
-            `ephemeral chunks. Use a store that exposes \`stream\` (e.g. the ` +
-            `in-memory store) or remove the streaming step.`,
+            `ephemeral chunks. The in-memory store always exposes one; ` +
+            `postgresStore() needs a \`listener\`. Otherwise remove ` +
+            `the streaming step.`,
         );
       }
     }
