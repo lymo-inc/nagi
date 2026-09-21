@@ -34,6 +34,32 @@ describe("uuidv7", () => {
     expect(b < c).toBe(true);
   });
 
+  it("sorts in creation order within a single millisecond", () => {
+    // The fact table is read back with ORDER BY fact_id, so this IS the fact
+    // log's append order. Purely random low bits used to reverse same-ms pairs.
+    // rand_a is 12 bits seeded in its low half, so ordering is guaranteed for
+    // at least 2048 ids per millisecond — orders of magnitude more than a run
+    // writes. Beyond that the counter saturates and only uniqueness holds.
+    const ids = Array.from({ length: 2_000 }, () => uuidv7(1_700_000_000_000));
+    expect(ids).toEqual([...ids].sort());
+  });
+
+  it("keeps same-millisecond ids unique even past the counter's headroom", () => {
+    // Uniqueness rides on the 62 random bits of rand_b, never on the counter.
+    const ids = new Set(
+      Array.from({ length: 20_000 }, () => uuidv7(1_700_000_000_001)),
+    );
+    expect(ids.size).toBe(20_000);
+  });
+
+  it("still sorts across millisecond boundaries", () => {
+    const a = uuidv7(1_700_000_000_010);
+    const b = uuidv7(1_700_000_000_010);
+    const c = uuidv7(1_700_000_000_011);
+    expect(a < b).toBe(true);
+    expect(b < c).toBe(true);
+  });
+
   it("survives a million-call uniqueness smoke without obvious collisions", () => {
     const seen = new Set<string>();
     for (let i = 0; i < 10_000; i++) {
