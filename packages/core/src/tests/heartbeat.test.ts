@@ -197,14 +197,11 @@ describe("worker visibility heartbeat", () => {
     try {
       const runId = await wf.start(f, {});
 
-      const start = Date.now();
-      while (Date.now() - start < 3_000) {
-        if (isTerminalRun(await store.loadRunState(runId))) break;
-        await new Promise((r) => setTimeout(r, 5));
-      }
-
-      const state = await store.loadRunState(runId);
-      expect(isTerminalRun(state)).toBe(true);
+      await vi.waitFor(
+        async () =>
+          expect(isTerminalRun(await store.loadRunState(runId))).toBe(true),
+        { timeout: 3_000, interval: 5 },
+      );
       expect(runs).toBe(1);
       expect(extendSpy).toHaveBeenCalled();
       for (const call of extendSpy.mock.calls) {

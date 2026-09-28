@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import { InMemoryStore } from "../memory";
 import type { RunId } from "../types";
@@ -97,12 +97,13 @@ describe("wf.describe", () => {
     const runId = await h.wf.start(f, {});
     const dispatching = h.drainOnce(1);
 
-    const start = Date.now();
-    while (Date.now() - start < 2_000) {
-      const s = await h.store.loadRunState(runId);
-      if (s.steps["slow"]?.tag === "running") break;
-      await new Promise((r) => setTimeout(r, 2));
-    }
+    await vi.waitFor(
+      async () =>
+        expect((await h.store.loadRunState(runId)).steps["slow"]?.tag).toBe(
+          "running",
+        ),
+      { timeout: 2_000, interval: 2 },
+    );
 
     const desc = await h.wf.describe(runId);
     expect(desc).not.toBeNull();

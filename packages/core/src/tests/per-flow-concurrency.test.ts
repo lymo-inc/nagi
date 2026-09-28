@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
@@ -77,14 +77,14 @@ describe("worker maxConcurrencyPerFlow", () => {
     // The bystander completes WHILE the hogs are still wedged — the cap held
     // a slot open for it.
     try {
-      const deadline = Date.now() + 5_000;
-      for (;;) {
-        const s = await store.loadRunState(bystanderRun);
-        if (s.phase.tag === "completed") break;
-        if (Date.now() > deadline)
-          throw new Error("bystander starved: cap did not hold a slot open");
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      await vi.waitFor(
+        async () =>
+          expect(
+            (await store.loadRunState(bystanderRun)).phase.tag,
+            "bystander starved: cap did not hold a slot open",
+          ).toBe("completed"),
+        { timeout: 5_000, interval: 10 },
+      );
       expect(maxConcurrentHogs).toBeLessThanOrEqual(3);
     } finally {
       releaseHogs();

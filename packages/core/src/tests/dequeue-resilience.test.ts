@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
@@ -53,18 +53,6 @@ const noop = flow({
   build: (b) => ({ s: b.task({ run: async () => ({ ok: true }) }) }),
 });
 
-async function waitFor(
-  predicate: () => Promise<boolean>,
-  message: string,
-): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  for (;;) {
-    if (await predicate()) return;
-    if (Date.now() > deadline) throw new Error(message);
-    await new Promise((r) => setTimeout(r, 10));
-  }
-}
-
 // The outage this guards: one rejected pgmq.read terminated run(), every flow
 // stopped being scheduled, and the process stayed healthy enough that nothing
 // noticed for 37h.
@@ -92,9 +80,13 @@ describe("worker.run dequeue resilience", () => {
     const loop = worker.run();
 
     try {
-      await waitFor(
-        async () => (await store.loadRunState(runId)).phase.tag === "completed",
-        "run never completed: the loop died on the dequeue failure",
+      await vi.waitFor(
+        async () =>
+          expect(
+            (await store.loadRunState(runId)).phase.tag,
+            "run never completed: the loop died on the dequeue failure",
+          ).toBe("completed"),
+        { timeout: 5_000, interval: 10 },
       );
     } finally {
       ac.abort();
@@ -133,9 +125,13 @@ describe("worker.run dequeue resilience", () => {
       settled = true;
     });
 
-    await waitFor(
-      async () => queue.dequeueCalls >= 3,
-      "loop stopped polling during a sustained outage",
+    await vi.waitFor(
+      () =>
+        expect(
+          queue.dequeueCalls,
+          "loop stopped polling during a sustained outage",
+        ).toBeGreaterThanOrEqual(3),
+      { timeout: 5_000, interval: 10 },
     );
     expect(settled).toBe(false);
 
