@@ -55,6 +55,63 @@ DOC-03 (`storeContract` + `OPERATIONS.md`; setup prerequisites still
 undocumented), A-02 (`4a0da4a`: ordered within one process, not across
 processes). Everything else below is still open.
 
+Landed 2026-09-28: C-07 #75, C-10 + C-11 remainders #76, A-07 + A-09 + D-08
+#77, D-05 #81, D-04 #82, D-06 #80, DOC-03 #84, and the flaky `sweepLeases`
+contract case #79. A-08 is in review (#83).
+
+### Recommended resolutions (2026-09-28)
+
+The core items below sit in modules that the in-flight consolidation
+(one termination path, one read model, fact consequences in core, migration
+`0009_step_run_per_step`) is rewriting. Build them on top of it once it lands.
+
+- **C-01b** Enqueue a start's first steps inside the start transaction
+  (`tryStartRun` takes the queue, as `sweepLeases` does), not a sweeper, and
+  re-seed a subflow child on re-attach. The OTel adapter must then tolerate a
+  step span starting before its flow span (resolve the flow context by
+  `runId` lazily); the staged path already has that ordering.
+- **C-06** A terminal flow fact applies only while the run is pending or
+  running: guard the fold, and make the stores' terminal write conditional so
+  the losing writer learns it lost. The loser fires no hooks, cascades
+  nothing, and is reported through `onLog`. Implement inside the single
+  termination path.
+- **C-08** A canceled step on a live run is neither success nor a reason to
+  end the run: dependents stay blocked, `flowTermination` never counts it as
+  success, and the run waits for `operator.retry`, which already recovers it.
+  Surface the stall in `describe()` and `onLog`. Ending the run as canceled
+  would make it unrecoverable, since a canceled run cannot reopen.
+- **C-09** Fence by attempt end to end: admission drops a message whose
+  attempt is below the step's current attempt; lease release is
+  attempt-scoped (in the in-flight refactor) and also happens on
+  `step.retried`; settle is conditional on the claim token; the parent settle
+  is conditional on the parent still awaiting that child.
+- **A-02** Add a nullable `seq bigint` column and set its default to a new
+  sequence (`ADD COLUMN`, then `SET DEFAULT nextval(...)`: no table rewrite, no
+  backfill), and read with `ORDER BY seq NULLS FIRST, fact_id`. Pre-migration
+  rows keep their `fact_id` order and precede every new fact. In `uuidv7.ts`,
+  hold the last timestamp when the clock steps back instead of re-seeding.
+- **A-04** No new public hook: fire the existing `onStepError` with the
+  cancellation error when a step settles canceled, so the OTel adapter ends
+  the span; cap the span registry's size for spans whose run ends in another
+  process.
+- **A-05** Resolved by the in-flight refactor, which moves notifies into the
+  write path; verify when it lands.
+- **A-06** A migration after `0009` adding `(started_at DESC, run_id DESC)`
+  and `(flow_id, started_at DESC, run_id DESC)` on `workflow_run` with
+  `CREATE INDEX IF NOT EXISTS`; document pre-creating them `CONCURRENTLY`
+  under the same names on large tables, as for `0008`.
+- **D-09** Keep `GlobalFact` write-only: it is an audit trail of flow-hash
+  changes (one row per changed flow per deploy). Say so on the port; add a
+  read or retention only when a consumer needs one.
+- **D-03** Won't do: CI sets the database URL directly, so a skip guard would
+  not pay for itself.
+- **DIR-03** Not now: a consumer fake clock needs the in-memory adapters and
+  deadline timers on the injected clock plus new public API, against #42's
+  "one adapter is not a seam". Revisit when a consumer asks.
+- **DIR-06** Not now: runbook alerts work from `onLog`. Choose instruments
+  when a consumer needs metrics, derived from hooks and `onLog` rather than a
+  new core surface.
+
 **Correctness (core)**
 - **C-01b** `wf.start` enqueues the first steps *after* the run row commits
   (`runtime.ts` `startRunInternal` → `tryStartRun` then `dispatcher.advance`);
