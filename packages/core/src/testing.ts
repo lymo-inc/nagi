@@ -1051,19 +1051,26 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
-    name: "recordOnce / getOnce: first write wins; null when absent",
+    name: "recordOnce / getOnce: first write wins; miss when absent; a recorded null is a hit",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       const runId = rid();
-      eq(await s.getOnce(runId, "s", "scope"), null, "absent");
+      eq(await s.getOnce(runId, "s", "scope"), { tag: "miss" }, "absent");
       await s.recordOnce(runId, "s", "scope", { value: 1 });
       await s.recordOnce(runId, "s", "scope", { value: 2 });
       eq(
         await s.getOnce(runId, "s", "scope"),
-        { value: 1 },
+        { tag: "hit", value: { value: 1 } },
         "first write wins",
       );
-      eq(await s.getOnce(runId, "s", "other"), null, "scoped");
+      eq(await s.getOnce(runId, "s", "other"), { tag: "miss" }, "scoped");
+      await s.recordOnce(runId, "s", "nil", null);
+      await s.recordOnce(runId, "s", "nil", { value: 3 });
+      eq(
+        await s.getOnce(runId, "s", "nil"),
+        { tag: "hit", value: null },
+        "recorded null",
+      );
     },
   },
   {
@@ -1526,7 +1533,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         batchSize: 100,
         keepSummary: false,
       });
-      eq(await s.getOnce(runId, "gate", "scope"), null, "once gone");
+      eq(await s.getOnce(runId, "gate", "scope"), { tag: "miss" }, "once gone");
       await claimableAgain(s, runId, "gate", "pruneFacts");
       eq(await s.sweepSignalTimeouts({ now: new Date() }), [], "timer gone");
     },

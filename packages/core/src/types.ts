@@ -570,6 +570,10 @@ export type SettleSignalResult =
   | { readonly tag: "buffered" }
   | { readonly tag: "noop" };
 
+export type GetOnceResult =
+  | { readonly tag: "hit"; readonly value: Json }
+  | { readonly tag: "miss" };
+
 // A signal step the timer-sweep settled as failed (its deadline elapsed before
 // any signal arrived). Returned by Store.sweepSignalTimeouts so the caller can
 // advance each run — the store writes the step.failed fact, progression turns
@@ -717,7 +721,9 @@ export interface Store {
     scope: string,
     value: Json,
   ): Promise<void>;
-  getOnce(runId: RunId, stepId: StepId, scope: string): Promise<Json | null>;
+  // A recorded null MUST read back as a hit: presence, not the value, is what
+  // memoizes.
+  getOnce(runId: RunId, stepId: StepId, scope: string): Promise<GetOnceResult>;
 
   // On success, the returned fact MUST persist atomically with any tx writes
   // the body made; on step.completed the same scope MUST also persist the

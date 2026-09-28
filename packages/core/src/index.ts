@@ -147,6 +147,7 @@ export type {
   FlowRefUpdatedFact,
   FlowStartEvent,
   FlowStartedFact,
+  GetOnceResult,
   GlobalFact,
   InferSchemaInput,
   InferSchemaOutput,

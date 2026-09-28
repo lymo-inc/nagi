@@ -22,7 +22,7 @@ export function makeOnce({
   ): Promise<T> {
     const cached = await store.getOnce(runId, stepId, scope);
 
-    if (cached !== null) return cached as T;
+    if (cached.tag === "hit") return cached.value as T;
 
     const value = await fn();
 

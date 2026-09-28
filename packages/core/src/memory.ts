@@ -39,6 +39,7 @@ import type {
   Fact,
   FlowCanceledByConcurrencyFact,
   FlowStartedFact,
+  GetOnceResult,
   GlobalFact,
   Json,
   Millis,
@@ -487,8 +488,9 @@ export class InMemoryStore implements Store {
     runId: RunId,
     stepId: StepId,
     scope: string,
-  ): Promise<Json | null> {
-    return this.onces.get(`${runId}::${stepId}::${scope}`) ?? null;
+  ): Promise<GetOnceResult> {
+    const value = this.onces.get(`${runId}::${stepId}::${scope}`);
+    return value === undefined ? { tag: "miss" } : { tag: "hit", value };
   }
 
   async runStep<T extends Json>(

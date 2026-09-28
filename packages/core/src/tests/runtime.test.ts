@@ -351,6 +351,34 @@ describe("e2e: ctx primitives plumbed through dispatch", () => {
     expect(result.output("t")).toEqual({ first: 42, second: 42 });
   });
 
+  it("ctx.once memoizes a null result across a re-run of the step", async () => {
+    let calls = 0;
+    let attempts = 0;
+    const f = flow({
+      id: "ctx-once-null-e2e",
+      input: emptySchema(),
+      build: (b) => ({
+        t: b.task({
+          retry: { maxAttempts: 2, backoff: "fixed", initialDelayMs: 5 },
+          run: async ({ ctx }) => {
+            attempts++;
+            const v = await ctx.once("side-effect", async () => {
+              calls++;
+              return null;
+            });
+            if (attempts === 1) throw new Error("retry");
+            return { v };
+          },
+        }),
+      }),
+    });
+
+    const result = await runFlow(f, {});
+    expect(attempts).toBe(2);
+    expect(calls).toBe(1);
+    expect(result.output("t")).toEqual({ v: null });
+  });
+
   it("ctx.idempotencyKey is stable across retries of the same step", async () => {
     const seen: string[] = [];
     const f = flow({

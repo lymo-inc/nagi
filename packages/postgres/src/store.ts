@@ -5,6 +5,7 @@ import type {
   Fact,
   FlowCanceledByConcurrencyFact,
   FlowStartedFact,
+  GetOnceResult,
   GlobalFact,
   Json,
   Millis,
@@ -815,13 +816,16 @@ class PostgresStore<DB = unknown> implements Store {
     runId: RunId,
     stepId: StepId,
     scope: string,
-  ): Promise<Json | null> {
-    const r = await sql<{ value: Json | null }>`
+  ): Promise<GetOnceResult> {
+    const r = await sql<{ value: Json }>`
       SELECT value
         FROM ${sql.raw(this.t("dedupe"))}
        WHERE run_id = ${runId} AND step_id = ${stepId} AND scope = ${scope}
     `.execute(this.db);
-    return r.rows[0]?.value ?? null;
+    const row = r.rows[0];
+    return row === undefined
+      ? { tag: "miss" }
+      : { tag: "hit", value: row.value };
   }
 
   async runStep<T extends Json>(
