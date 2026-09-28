@@ -9,18 +9,26 @@ import {
   asStepMapWithDefs,
   attachDef,
   compact,
+  type EmitLog,
   getDef,
   type StepDef,
   setDef,
 } from "./internal";
 import { isTerminalRun } from "./state";
-import type { Clock, Flow, Json, RunState, Store } from "./types";
+import type {
+  Clock,
+  DriftPolicy,
+  Flow,
+  Json,
+  RunId,
+  RunState,
+  Store,
+} from "./types";
 
-// The one answer to "which Flow runs this run". A run pinned to a flowHash
-// this process did not register is `gone`; the arm says what the holder may
-// do about it. `live` is the flow registered under the same id on this code,
-// when there is one — replay borrows its handlers to synthesize against the
-// pinned snapshot; undefined ⇔ error.currentHash === null.
+// A run pinned to a flowHash this process cannot honor is `gone`; the arm says
+// what the holder may do about it. `live` is the flow registered under the
+// same id on this code, when there is one — synthesis borrows its handlers;
+// undefined ⇔ error.currentHash === null.
 export type FlowResolution =
   | { readonly kind: "current"; readonly flow: Flow }
   // Run still pending/running: the worker's snapshot-gone policy decides
@@ -59,6 +67,49 @@ export function requireCurrent(resolution: FlowResolution): Flow {
   throw resolution.error;
 }
 
+// The one answer to "which Flow runs this run", for every consumer: dispatch,
+// signals, the operator, lifecycle, cancel and replay.
+export type FlowOf = (runId: RunId) => Promise<FlowResolution>;
+
+// Under "synthesize" a drifted run, live or settled, resolves to its pinned
+// DAG with the live handlers attached; only a run nagi cannot honestly rebuild
+// stays gone. The policy is per call because replay({ allowDrift }) is a
+// per-call "synthesize" on a "freeze" runtime.
+export function makeFlowOf(deps: {
+  readonly registry: FlowRegistry;
+  readonly store: Store;
+  readonly emitLog: EmitLog;
+}): (runId: RunId, drift: DriftPolicy) => Promise<FlowResolution> {
+  const { registry, store, emitLog } = deps;
+  return async (runId, drift) => {
+    const resolution = registry.resolve(await store.loadRunState(runId));
+    if (resolution.kind === "current" || drift === "freeze") return resolution;
+    try {
+      return { kind: "current", flow: await registry.synthesize(resolution) };
+    } catch (err) {
+      if (!(err instanceof NagiRuntimeError)) throw err;
+      emitLog({
+        level: "warn",
+        msg: "flowOf: drift synthesis failed — treating run as snapshot-gone",
+        attrs: {
+          runId: resolution.error.runId,
+          flowId: resolution.error.flowId,
+          pinnedHash: resolution.error.pinnedHash,
+          error: err.message,
+        },
+      });
+      return resolution;
+    }
+  };
+}
+
+// `flowOf` with one run's answer fixed. Keyed by runId, so a flow a replay
+// synthesized for its own run never answers for a parent it wakes.
+export function pinRun(runId: RunId, flow: Flow, flowOf: FlowOf): FlowOf {
+  const pinned: FlowResolution = { kind: "current", flow };
+  return async (id) => (id === runId ? pinned : flowOf(id));
+}
+
 export async function registerFlows(deps: {
   readonly flows: ReadonlyArray<Flow>;
   readonly store: Store;
@@ -79,7 +130,19 @@ export async function registerFlows(deps: {
     for (const [stepId, step] of Object.entries(
       asStepMapWithDefs(flow.steps),
     )) {
-      if (getDef(step).kind === "streaming") streamingStepIds.add(stepId);
+      if (getDef(step).kind !== "streaming") continue;
+      // Chunks travel out-of-band, so a streaming step without a transport
+      // could never be carried. Checked before any snapshot is written.
+      if (store.stream === undefined) {
+        throw new NagiRuntimeError(
+          `Flow "${flow.id}" has a streaming step "${stepId}" (b.streamingTask), ` +
+            `but the store has no \`stream\` transport — it cannot carry ` +
+            `ephemeral chunks. The in-memory store always exposes one; ` +
+            `postgresStore() needs a \`listener\`. Otherwise remove ` +
+            `the streaming step.`,
+        );
+      }
+      streamingStepIds.add(stepId);
     }
   }
 
@@ -244,6 +307,11 @@ function synthesizeReplayFlow(dag: CanonicalDag, liveFlow: Flow): Flow {
     id: liveFlow.id,
     input: liveFlow.input,
     steps: synthesized,
-    ...compact({ output: liveFlow.output }),
+    ...compact({
+      output: liveFlow.output,
+      onStart: liveFlow.onStart,
+      onComplete: liveFlow.onComplete,
+      onError: liveFlow.onError,
+    }),
   };
 }

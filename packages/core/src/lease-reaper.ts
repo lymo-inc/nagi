@@ -1,6 +1,13 @@
+import { Facts } from "./facts";
 import { reapBackoff } from "./retry";
 import type { StepRunStatus } from "./run-view";
-import type { AttemptNumber, Millis, RunId, StepId } from "./types";
+import type {
+  AttemptNumber,
+  LeaseReapedFact,
+  Millis,
+  RunId,
+  StepId,
+} from "./types";
 
 export type ReaperDecision =
   | {
@@ -9,6 +16,7 @@ export type ReaperDecision =
     }
   | {
       readonly tag: "reap";
+      readonly fact: LeaseReapedFact;
       readonly nextAttempt: AttemptNumber;
       readonly backoffMs: Millis;
     };
@@ -51,7 +59,13 @@ export function decideExpiredLeaseAction(args: {
     return { tag: "skip", reason: "still-live" };
   }
   const nextAttempt = (lease.attempt + 1) as AttemptNumber;
-  return { tag: "reap", nextAttempt, backoffMs: reapBackoff(nextAttempt) };
+  const { runId, stepId, attempt } = lease;
+  return {
+    tag: "reap",
+    fact: Facts.leaseReaped({ runId, stepId, attempt, at: now, reapedAt: now }),
+    nextAttempt,
+    backoffMs: reapBackoff(nextAttempt),
+  };
 }
 
 export interface ReapedLease {

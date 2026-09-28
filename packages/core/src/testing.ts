@@ -1,5 +1,5 @@
 import { NagiConcurrencyConflictError } from "./errors";
-import { Facts } from "./facts";
+import { Facts, isRunEnd } from "./facts";
 import { InMemoryQueue } from "./memory";
 import { stepStateOf, stepStatusOf } from "./state";
 import type {
@@ -7,11 +7,15 @@ import type {
   Json,
   Millis,
   PrunableStatus,
+  Queue,
+  RunEventEnvelope,
   RunId,
   StandardSchemaV1,
   StepId,
   StepKind,
   Store,
+  StreamEvent,
+  Tx,
 } from "./types";
 
 export function passthroughSchema<T>(): StandardSchemaV1<T, T> {
@@ -25,8 +29,13 @@ export function passthroughSchema<T>(): StandardSchemaV1<T, T> {
 }
 
 export interface StoreContractHarness {
-  // MUST return an empty store whose claimStep lease lasts `leaseMs`.
+  // MUST return an empty store whose claimStep lease lasts `leaseMs`, with any
+  // `events` / `stream` transport it offers already live. Cases for a transport
+  // the store does not offer pass vacuously.
   makeStore(opts: { readonly leaseMs: Millis }): Promise<Store>;
+  // Runs `body` on a transaction the store's *OnTx methods accept, committing
+  // when it resolves.
+  withTx<T>(store: Store, body: (tx: Tx) => Promise<T>): Promise<T>;
 }
 
 export interface StoreContractCase {
@@ -164,7 +173,7 @@ async function endRun(
       : status === "failed"
         ? Facts.flowFailed(runId, { name: "E", message: "x" }, at)
         : Facts.flowCanceled(runId, { cause: "explicit", reason: "test" }, at);
-  await s.appendFact(runId, fact);
+  await s.endRun(runId, fact);
 }
 
 async function stepView(s: Store, runId: RunId, stepId: StepId) {
@@ -183,6 +192,64 @@ async function claimableAgain(
     (await s.claimStep(runId, stepId, A1)) !== null,
     `${what} must release the lease: claimStep at the same attempt still returns null`,
   );
+}
+
+const TRANSPORT_WAIT_MS = 5_000;
+
+// Transports may deliver asynchronously (Postgres: LISTEN/NOTIFY), so event and
+// stream assertions poll up to a deadline instead of reading once.
+async function eventually(cond: () => boolean, msg: string): Promise<void> {
+  const deadline = Date.now() + TRANSPORT_WAIT_MS;
+  while (!cond()) {
+    ok(Date.now() < deadline, msg);
+    await sleep(10);
+  }
+}
+
+function recordRuns(s: Store): readonly RunEventEnvelope[] | null {
+  if (s.events === undefined) return null;
+  const seen: RunEventEnvelope[] = [];
+  s.events.watchRuns((e) => seen.push(e));
+  return seen;
+}
+
+function typesFor(seen: readonly RunEventEnvelope[], runId: RunId): string[] {
+  return seen.filter((e) => e.runId === runId).map((e) => e.type);
+}
+
+async function drain(
+  stream: AsyncIterable<StreamEvent<Json>>,
+  what: string,
+): Promise<StreamEvent<Json>[]> {
+  const out: StreamEvent<Json>[] = [];
+  const iter = stream[Symbol.asyncIterator]();
+  for (;;) {
+    const next = await Promise.race([
+      iter.next(),
+      sleep(TRANSPORT_WAIT_MS).then(() => null),
+    ]);
+    if (next === null) {
+      await iter.return?.();
+      throw new StoreContractViolation(`${what}: the stream never closed`);
+    }
+    if (next.done === true) return out;
+    out.push(next.value);
+  }
+}
+
+function failingQueue(): Queue {
+  const fail = async (): Promise<never> => {
+    throw new Error("queue unavailable");
+  };
+  const q: Queue = {
+    enqueue: fail,
+    dequeue: fail,
+    ack: fail,
+    nack: fail,
+    extend: fail,
+    withTx: () => q,
+  };
+  return q;
 }
 
 export const storeContract: ReadonlyArray<StoreContractCase> = [
@@ -327,16 +394,60 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "endRun: a run ends once — of racing ends exactly one is admitted, and a later one (or one on a never-started run) is refused and writes nothing",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      await startRun(s, runId);
+      const won = await Promise.all([
+        s.endRun(
+          runId,
+          Facts.flowFailed(runId, { name: "E", message: "x" }, new Date()),
+        ),
+        s.endRun(
+          runId,
+          Facts.flowCanceled(
+            runId,
+            { cause: "explicit", reason: "race" },
+            new Date(),
+          ),
+        ),
+      ]);
+      eq(won.filter(Boolean).length, 1, "exactly one racing end is admitted");
+      const winner = won[0] === true ? "failed" : "canceled";
+
+      ok(
+        !(await s.endRun(runId, Facts.flowCompleted(runId, null, new Date()))),
+        "an end on an already-ended run must resolve false",
+      );
+      const state = await s.loadRunState(runId);
+      eq(
+        state.facts.filter(isRunEnd).length,
+        1,
+        "a refused end is not persisted",
+      );
+      eq(state.phase.tag, winner, "the fold keeps the winner's end");
+      eq((await s.describe(runId))?.run.status, winner, "so does the row");
+
+      const ghost = rid();
+      ok(
+        !(await s.endRun(ghost, Facts.flowCompleted(ghost, null, new Date()))),
+        "a run that never started cannot end",
+      );
+      eq((await s.loadRunState(ghost)).facts, [], "and nothing is written");
+    },
+  },
+  {
     // NagiCanceledError is public: a handler can name any run as its canceler
     // and classifyFailure turns that claim into a concurrency-cause fact. The
     // fact is the record; the VIEW must not present an unresolvable claim as a
     // reference, or every consumer's audit finds nagi#29's orphan.
-    name: "appendFact(flow.canceled): a canceler that never existed is not surfaced as a reference",
+    name: "endRun(flow.canceled): a canceler that never existed is not surfaced as a reference",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       const victim = rid();
       await startRun(s, victim);
-      await s.appendFact(
+      await s.endRun(
         victim,
         Facts.flowCanceledByConcurrency({
           runId: victim,
@@ -441,7 +552,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
-    name: "settleStep(step.completed): releases the lease — describe() drops lease.expiresAt and claimStep re-acquires",
+    name: "appendFact(step.completed): releases the lease — describe() drops lease.expiresAt and claimStep re-acquires",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       const runId = rid();
@@ -450,29 +561,27 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       ok((await s.claimStep(runId, "s", A1)) !== null, "claim");
       const live = await stepView(s, runId, "s");
       ok(live?.lease?.expiresAt instanceof Date, "lease visible while held");
-      await s.settleStep(
+      await s.appendFact(
         runId,
-        "s",
         Facts.stepCompleted(runId, "s", A1, { ok: 1 }, new Date()),
       );
       const done = await stepView(s, runId, "s");
       eq(done?.status, "completed", "status");
       eq(done?.output, { ok: 1 }, "output");
       eq(done?.lease, undefined, "lease gone from describe()");
-      await claimableAgain(s, runId, "s", "settleStep(step.completed)");
+      await claimableAgain(s, runId, "s", "appendFact(step.completed)");
     },
   },
   {
-    name: "settleStep(step.failed): releases the lease",
+    name: "appendFact(step.failed): releases the lease",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       const runId = rid();
       await startRun(s, runId);
       await startStep(s, runId, "s");
       ok((await s.claimStep(runId, "s", A1)) !== null, "claim");
-      await s.settleStep(
+      await s.appendFact(
         runId,
-        "s",
         Facts.stepFailed(
           runId,
           "s",
@@ -483,7 +592,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       );
       eq(await stepStatus(s, runId, "s"), "failed", "status");
       eq((await stepView(s, runId, "s"))?.lease, undefined, "lease");
-      await claimableAgain(s, runId, "s", "settleStep(step.failed)");
+      await claimableAgain(s, runId, "s", "appendFact(step.failed)");
     },
   },
   {
@@ -964,9 +1073,8 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       await startRun(s, settled);
       await startStep(s, settled, "s");
       ok((await s.claimStep(settled, "s", A1)) !== null, "claim settled");
-      await s.settleStep(
+      await s.appendFact(
         settled,
-        "s",
         Facts.stepCompleted(settled, "s", A1, null, new Date()),
       );
       await sleep(PAST_LEASE_MS);
@@ -1119,9 +1227,8 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       const runId = rid();
       await startRun(s, runId, { flowId: "f", input: { a: 1 } });
       await startStep(s, runId, "s");
-      await s.settleStep(
+      await s.appendFact(
         runId,
-        "s",
         Facts.stepCompleted(runId, "s", A1, 7, new Date()),
       );
       await endRun(s, runId, "completed");
@@ -1333,9 +1440,8 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         parent: { runId: parent, stepId: "sub" },
       });
       await startStep(s, parent, "sub", { kind: "subflow" });
-      await s.settleStep(
+      await s.appendFact(
         parent,
-        "sub",
         Facts.stepCompleted(
           parent,
           "sub",
@@ -1344,7 +1450,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
           new Date(),
         ),
       );
-      await s.appendFact(
+      await s.endRun(
         parent,
         Facts.flowCompleted(parent, { done: true }, new Date()),
       );
@@ -1374,6 +1480,147 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       eq(c?.run.children, [], "child has no children");
       eq(await s.listChildren(parent), [child], "listChildren");
       eq(await s.listChildren(child), [], "listChildren leaf");
+    },
+  },
+  {
+    name: "describe: a retried step is ONE view of its latest attempt, timestamped by its facts' `at`",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const flowId = fid();
+      const runId = rid();
+      const t = (n: number) => new Date(1_700_000_000_000 + n * 1000);
+      const error = { name: "E", message: "boom" };
+      await startRun(s, runId, { flowId, at: t(0) });
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A1, "task", t(1)),
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepRetried(runId, "s", A1, t(3), error, t(2)),
+      );
+      eq(
+        (await s.describe(runId))?.steps,
+        [
+          {
+            stepId: "s",
+            attempt: A1,
+            status: "running",
+            startedAt: t(1),
+            error,
+          },
+        ],
+        "backing off: the failed attempt, still running, with its error",
+      );
+
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A2, "task", t(3)),
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A1, "task", t(4)),
+      );
+      eq(
+        (await s.describe(runId))?.steps,
+        [{ stepId: "s", attempt: A2, status: "running", startedAt: t(3) }],
+        "attempt 2 supersedes attempt 1; a stale attempt-1 start changes nothing",
+      );
+      eq(
+        (await s.queryRuns({ where: { flowId, status: ["running"] } })).runs
+          .length,
+        1,
+        "a retry leaves the run running",
+      );
+
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A2, { v: 2 }, t(5)),
+      );
+      await endRun(s, runId, "completed", t(6));
+      const d = await s.describe(runId);
+      eq(
+        d?.steps,
+        [
+          {
+            stepId: "s",
+            attempt: A2,
+            status: "completed",
+            startedAt: t(3),
+            completedAt: t(5),
+            output: { v: 2 },
+          },
+        ],
+        "one view per step",
+      );
+      eq(d?.run.startedAt, t(0), "run startedAt");
+      eq(d?.run.completedAt, t(6), "run completedAt");
+      const [summary] = (
+        await s.queryRuns({ where: { flowId, status: ["completed"] } })
+      ).runs;
+      eq(summary?.completedAt, t(6), "queryRuns completedAt");
+    },
+  },
+  {
+    name: "describe: a skipped step settles its view; a settled step changes only by reset",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const t = (n: number) => new Date(1_700_000_000_000 + n * 1000);
+      const skip = (stepId: StepId, at: Date) =>
+        s.appendFact(
+          runId,
+          Facts.stepSkipped({ runId, stepId, reason: "manual", at }),
+        );
+      await startRun(s, runId, { at: t(0) });
+      await skip("never", t(1));
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "inflight", A1, "task", t(2)),
+      );
+      await skip("inflight", t(3));
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "inflight", A1, { late: true }, t(4)),
+      );
+      eq(
+        (await s.describe(runId))?.steps,
+        [
+          {
+            stepId: "inflight",
+            attempt: A1,
+            status: "skipped",
+            startedAt: t(2),
+            completedAt: t(3),
+          },
+          {
+            stepId: "never",
+            attempt: 0,
+            status: "skipped",
+            completedAt: t(1),
+          },
+        ],
+        "skipped views; the late completion is ignored",
+      );
+
+      await s.appendFact(
+        runId,
+        Facts.stepReset({ runId, stepId: "inflight", at: t(5) }),
+      );
+      eq(
+        (await s.describe(runId))?.steps.map((st) => st.stepId),
+        ["never"],
+        "a reset step has no view until it restarts",
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "inflight", A1, "task", t(6)),
+      );
+      eq(
+        await stepView(s, runId, "inflight"),
+        { stepId: "inflight", attempt: A1, status: "running", startedAt: t(6) },
+        "restarted",
+      );
     },
   },
   {
@@ -1455,11 +1702,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       const old = new Date(1_700_000_000_000);
       await startRun(s, runId, { flowId, input: { keep: 1 }, at: old });
       await startStep(s, runId, "s");
-      await s.settleStep(
-        runId,
-        "s",
-        Facts.stepCompleted(runId, "s", A1, null, old),
-      );
+      await s.appendFact(runId, Facts.stepCompleted(runId, "s", A1, null, old));
       await endRun(s, runId, "completed", old);
       await s.pruneFacts({
         olderThan: new Date(1_700_000_100_000),
@@ -1529,6 +1772,242 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       eq(await s.getOnce(runId, "gate", "scope"), null, "once gone");
       await claimableAgain(s, runId, "gate", "pruneFacts");
       eq(await s.sweepSignalTimeouts({ now: new Date() }), [], "timer gone");
+    },
+  },
+  {
+    name: "tryStartRunOnTx: starts the run on the caller's tx; a second call for the same runId is a no-op",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const fact = Facts.flowStarted({
+        runId,
+        flowId: fid(),
+        input: { x: 1 },
+        at: new Date(),
+      });
+      const first = await h.withTx(s, (tx) =>
+        s.tryStartRunOnTx(tx, runId, fact),
+      );
+      eq(first, { started: true, canceled: [] }, "first start");
+      const again = await h.withTx(s, (tx) =>
+        s.tryStartRunOnTx(tx, runId, { ...fact, input: { x: 2 } }),
+      );
+      eq(again, { started: false, canceled: [] }, "second start");
+      const state = await s.loadRunState(runId);
+      eq(state.phase.tag, "running", "running after commit");
+      eq(state.input, { x: 1 }, "input unchanged");
+      eq((await s.describe(runId))?.run.status, "running", "read model");
+    },
+  },
+  {
+    name: "tryStartRunOnTx: with concurrency, cancels the prior active run on the same (flowId, key) and returns its fact",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const flowId = fid();
+      const a = rid();
+      const b = rid();
+      await startRun(s, a, { flowId, concurrencyKey: "k" });
+      const res = await h.withTx(s, (tx) =>
+        s.tryStartRunOnTx(
+          tx,
+          b,
+          Facts.flowStarted({ runId: b, flowId, input: {}, at: new Date() }),
+          { key: "k", mode: "cancel-in-progress" },
+        ),
+      );
+      ok(res.started, "b started");
+      eq(
+        res.canceled.map((c) => [c.runId, c.fact.canceledByRunId]),
+        [[a, b]],
+        "a canceled by b",
+      );
+      eq((await s.loadRunState(a)).phase.tag, "canceled", "a folds canceled");
+      eq((await s.describe(a))?.run.canceledByRunId, b, "describe(a)");
+    },
+  },
+  {
+    name: "events: watchRuns sees flow.started from both tryStartRun and tryStartRunOnTx",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const seen = recordRuns(s);
+      if (seen === null) return;
+      const own = rid();
+      const onTx = rid();
+      await startRun(s, own);
+      await h.withTx(s, (tx) =>
+        s.tryStartRunOnTx(
+          tx,
+          onTx,
+          Facts.flowStarted({
+            runId: onTx,
+            flowId: "f",
+            input: {},
+            at: new Date(),
+          }),
+        ),
+      );
+      await eventually(
+        () => typesFor(seen, own).includes("flow.started"),
+        "tryStartRun must announce flow.started",
+      );
+      await eventually(
+        () => typesFor(seen, onTx).includes("flow.started"),
+        "tryStartRunOnTx must announce flow.started once its tx commits",
+      );
+    },
+  },
+  {
+    name: "events: watchRun sees step events in order and ends on the terminal event",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.events === undefined) return;
+      const runId = rid();
+      const seen: RunEventEnvelope[] = [];
+      s.events.watchRun(runId, (e) => seen.push(e));
+      await startRun(s, runId);
+      await startStep(s, runId, "s");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, { ok: 1 }, new Date()),
+      );
+      await s.appendFact(
+        runId,
+        Facts.matchArmSelected(runId, "m", "arm", new Date()),
+      );
+      await endRun(s, runId, "completed");
+      const want = [
+        "flow.started",
+        "step.started",
+        "step.completed",
+        "flow.completed",
+      ];
+      await eventually(() => seen.length >= want.length, "all four events");
+      eq(
+        seen.map((e) => e.type),
+        want,
+        "bookkeeping facts are not events",
+      );
+    },
+  },
+  {
+    name: "events: a superseded run announces flow.canceled naming its superseder",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const seen = recordRuns(s);
+      if (seen === null) return;
+      const flowId = fid();
+      const a = rid();
+      const b = rid();
+      await startRun(s, a, { flowId, concurrencyKey: "k" });
+      await startRun(s, b, { flowId, concurrencyKey: "k" });
+      await eventually(
+        () => seen.some((e) => e.runId === a && e.type === "flow.canceled"),
+        "a's cancellation is announced",
+      );
+      eq(
+        seen.find((e) => e.runId === a && e.type === "flow.canceled"),
+        {
+          type: "flow.canceled",
+          cause: "concurrency",
+          canceledByRunId: b,
+          runId: a,
+        },
+        "cancel event",
+      );
+    },
+  },
+  {
+    name: "stream: a subscriber receives published chunks, then closes on step.completed",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.stream === undefined) return;
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s", { kind: "streaming" });
+      const events = drain(s.stream.subscribeStream(runId, "s"), "completed");
+      s.stream.publishChunk(runId, "s", "a");
+      s.stream.publishChunk(runId, "s", "b");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, null, new Date()),
+      );
+      eq(
+        await events,
+        [
+          { kind: "chunk", chunk: "a" },
+          { kind: "chunk", chunk: "b" },
+        ],
+        "chunks in order, then closed",
+      );
+    },
+  },
+  {
+    name: "stream: step.failed closes with the error; a run end closes a step that never emitted",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.stream === undefined) return;
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "bad", { kind: "streaming" });
+      await startStep(s, runId, "quiet", { kind: "streaming" });
+      const bad = drain(s.stream.subscribeStream(runId, "bad"), "failed");
+      const quiet = drain(s.stream.subscribeStream(runId, "quiet"), "run end");
+      const error = { name: "E", message: "x" };
+      await s.appendFact(
+        runId,
+        Facts.stepFailed(runId, "bad", A1, error, new Date()),
+      );
+      eq(await bad, [{ kind: "error", error }], "error event, then closed");
+      await endRun(s, runId, "canceled");
+      eq(await quiet, [], "closed by the run end");
+    },
+  },
+  {
+    name: "stream: subscribing to an already-settled step closes instead of hanging",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.stream === undefined) return;
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s", { kind: "streaming" });
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, null, new Date()),
+      );
+      eq(
+        await drain(s.stream.subscribeStream(runId, "s"), "settled step"),
+        [],
+        "empty and closed",
+      );
+    },
+  },
+  {
+    name: "sweepLeases: a failing enqueue leaves nothing half-reaped — the lease stays reapable and no lease.reaped is written",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s");
+      ok((await s.claimStep(runId, "s", A1)) !== null, "claim");
+      await sleep(PAST_LEASE_MS);
+      await rejects(
+        s.sweepLeases({ now: new Date(), queue: failingQueue() }),
+        "the enqueue failure surfaces",
+      );
+      eq(
+        (await s.loadRunState(runId)).facts.filter(
+          (f) => f.kind === "lease.reaped",
+        ).length,
+        0,
+        "no lease.reaped",
+      );
+      eq(
+        (
+          await s.sweepLeases({ now: new Date(), queue: new InMemoryQueue() })
+        ).map((r) => r.runId),
+        [runId],
+        "the next sweep still reaps it",
+      );
     },
   },
 ];

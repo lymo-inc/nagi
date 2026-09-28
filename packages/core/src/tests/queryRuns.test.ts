@@ -58,7 +58,7 @@ async function seedRuns(
                 canceledByRunId: runId,
                 concurrencyKey: "k",
               };
-      await store.appendFact(runId, tFact);
+      await store.endRun(runId, tFact);
     }
     runIds.push(runId);
   }

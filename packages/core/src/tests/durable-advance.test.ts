@@ -27,9 +27,8 @@ describe("durable advance after settle", () => {
 
     // Simulate a crash between the step settling and advance() enqueuing the
     // next step: the fact commits, but nothing ever runs advance.
-    await h.store.settleStep(
+    await h.store.appendFact(
       runId,
-      "a",
       Facts.stepCompleted(runId, "a", 1 as AttemptNumber, { v: 1 }, new Date()),
     );
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
+import { isRunEnd } from "../facts";
 import { InMemoryStore } from "../memory";
 import {
   descendantsOf,
@@ -14,7 +15,10 @@ const RUN: RunId = "run-test" as RunId;
 
 async function projectFacts(facts: readonly Fact[]): Promise<RunState> {
   const store = new InMemoryStore();
-  for (const fact of facts) await store.appendFact(RUN, fact);
+  for (const fact of facts) {
+    if (isRunEnd(fact)) await store.endRun(RUN, fact);
+    else await store.appendFact(RUN, fact);
+  }
   return store.loadRunState(RUN);
 }
 

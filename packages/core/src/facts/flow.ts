@@ -60,11 +60,17 @@ export type CancelArgs = DistributiveOmit<
   "kind" | "runId" | "at"
 >;
 
-export type FlowFact =
-  | FlowStartedFact
-  | FlowCompletedFact
-  | FlowFailedFact
-  | FlowCanceledFact;
+export type RunEndFact = FlowCompletedFact | FlowFailedFact | FlowCanceledFact;
+
+export type FlowFact = FlowStartedFact | RunEndFact;
+
+export function isRunEnd(fact: { readonly kind: string }): fact is RunEndFact {
+  return (
+    fact.kind === "flow.completed" ||
+    fact.kind === "flow.failed" ||
+    fact.kind === "flow.canceled"
+  );
+}
 
 // Lives in the global log, not a run's; it never folds into a RunState.
 export interface FlowRefUpdatedFact {
@@ -145,7 +151,9 @@ export const flowFacts = {
   },
 } as const;
 
-function runCancelCause(fact: FlowCanceledFact): RunCancelCause {
+export function runCancelCause(
+  fact: DistributiveOmit<FlowCanceledFact, "kind" | "runId" | "at">,
+): RunCancelCause {
   switch (fact.cause) {
     case "concurrency":
       return {
@@ -169,6 +177,9 @@ function runCancelCause(fact: FlowCanceledFact): RunCancelCause {
   }
 }
 
+const RELEASE_RUN = { tag: "release-run" } as const;
+const CLOSE_RUN = { tag: "close-run" } as const;
+
 export const flowKinds = {
   "flow.started": {
     fold: (draft, fact) => {
@@ -189,6 +200,9 @@ export const flowKinds = {
       codeVersion: fact.codeVersion ?? null,
       parent: fact.parent ?? null,
     }),
+    release: null,
+    stream: null,
+    event: (fact) => ({ type: "flow.started", flowId: fact.flowId }),
   },
   "flow.completed": {
     fold: (draft, fact) => {
@@ -200,6 +214,11 @@ export const flowKinds = {
       output: fact.output,
       completedAt: fact.at,
     }),
+    release: () => RELEASE_RUN,
+    // Closes every still-open channel of the run, so a subscriber to a skipped
+    // or never-emitting step never hangs.
+    stream: () => CLOSE_RUN,
+    event: (fact) => ({ type: "flow.completed", output: fact.output }),
   },
   "flow.failed": {
     fold: (draft, fact) => {
@@ -211,6 +230,9 @@ export const flowKinds = {
       error: fact.error,
       completedAt: fact.at,
     }),
+    release: () => RELEASE_RUN,
+    stream: () => CLOSE_RUN,
+    event: (fact) => ({ type: "flow.failed", error: fact.error }),
   },
   "flow.canceled": {
     fold: (draft, fact) => {
@@ -223,5 +245,15 @@ export const flowKinds = {
         fact.cause === "concurrency" ? fact.canceledByRunId : null,
       completedAt: fact.at,
     }),
+    release: () => RELEASE_RUN,
+    stream: () => CLOSE_RUN,
+    event: (fact) =>
+      fact.cause === "concurrency"
+        ? {
+            type: "flow.canceled",
+            cause: "concurrency",
+            canceledByRunId: fact.canceledByRunId,
+          }
+        : { type: "flow.canceled", cause: fact.cause },
   },
 } satisfies KindTable<FlowFact>;

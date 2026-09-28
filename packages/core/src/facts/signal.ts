@@ -66,6 +66,9 @@ export const signalKinds = {
       delete draft.bufferedSignals[fact.stepId];
     },
     rows: null,
+    release: null,
+    stream: null,
+    event: null,
   },
   "signal.buffered": {
     // First buffered signal per step wins, mirroring the happy path where the
@@ -79,5 +82,8 @@ export const signalKinds = {
       }
     },
     rows: null,
+    release: null,
+    stream: null,
+    event: null,
   },
 } satisfies KindTable<SignalFact>;

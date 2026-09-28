@@ -1,28 +1,22 @@
 import type { Dispatcher } from "./dispatch";
-import {
-  NagiCanceledError,
-  NagiRuntimeError,
-  serializeError,
-  validationError,
-} from "./errors";
+import { NagiRuntimeError, validationError } from "./errors";
 import type { Hooks } from "./exec/hooks";
+import { endingRunOf } from "./exec/progression";
 import { Facts, foldRun } from "./facts";
-import type { FlowRegistry } from "./flows";
-import { compact, type EmitLog } from "./internal";
+import type { FlowOf, FlowRegistry } from "./flows";
+import { compact } from "./internal";
 import { deriveChildRunId } from "./run-id";
 import {
   nextTransition,
   type SkipDecision,
   type Transition,
 } from "./scheduler";
-import { isTerminalRun, runStatusOf, stepStateOf } from "./state";
+import { stepStateOf } from "./state";
 import type {
-  CancelArgs,
   Clock,
   ConcurrencyMode,
   Flow,
   FlowCanceledByConcurrencyFact,
-  FlowErrorEvent,
   FlowHooks,
   FlowStartEvent,
   FlowStartedFact,
@@ -30,7 +24,6 @@ import type {
   ParentRef,
   Queue,
   RunId,
-  SerializedError,
   StepId,
   Store,
   Tx,
@@ -41,13 +34,14 @@ export interface RunLifecycleDeps {
   readonly store: Store;
   readonly queue: Queue;
   readonly clock: Clock;
+  // By flow id: the live code a new run starts on.
   readonly registry: FlowRegistry;
+  readonly flowOf: FlowOf;
   readonly codeVersion: string;
   readonly queueForTx: (tx: Tx) => Queue;
   readonly hooks: Hooks;
   readonly flowHooks: FlowHooks | undefined;
-  readonly dispatcher: Pick<Dispatcher, "advance" | "propagateToParent">;
-  readonly emitLog: EmitLog;
+  readonly dispatcher: Pick<Dispatcher, "advance" | "settleSuperseded">;
 }
 
 // The one fork: the run row + flow.started fact either commit on their own or
@@ -75,8 +69,14 @@ export type InitialDispatch =
 
 // Post-commit effects of a started run, as data: applied exactly once by
 // applyEffects, immediately (own tx) or from the caller's applyOnCommit.
+export interface SupersededRun {
+  readonly runId: RunId;
+  readonly fact: FlowCanceledByConcurrencyFact;
+}
+
 export interface StartEffects {
-  readonly superseded: readonly FlowErrorEvent[];
+  readonly flow: Flow;
+  readonly superseded: readonly SupersededRun[];
   readonly started: FlowStartEvent;
   readonly dispatch: InitialDispatch;
 }
@@ -108,7 +108,6 @@ export interface RunLifecycle {
     readonly parent: ParentRef;
     readonly generation: number;
   }): Promise<RunId>;
-  cancelRunRecursive(runId: RunId, args: CancelArgs): Promise<void>;
 }
 
 type Concurrency = { readonly key: string; readonly mode: ConcurrencyMode };
@@ -119,7 +118,16 @@ const EXISTS: StagedStart = { kind: "exists" };
 const ADVANCE: InitialDispatch = { kind: "advance" };
 
 export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
-  const { store, queue, clock, registry, hooks, flowHooks, dispatcher } = deps;
+  const {
+    store,
+    queue,
+    clock,
+    registry,
+    flowOf,
+    hooks,
+    flowHooks,
+    dispatcher,
+  } = deps;
 
   function resolveBoundary(boundary: TxBoundary): {
     tryStart(
@@ -192,7 +200,8 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
     return {
       kind: "started",
       effects: {
-        superseded: canceled.map((c) => supersededEvent(flow.id, runId, c)),
+        flow,
+        superseded: canceled,
         started: {
           runId,
           flowId: flow.id,
@@ -206,16 +215,16 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
   }
 
   async function applyEffects(effects: StartEffects): Promise<void> {
-    const { superseded, started, dispatch } = effects;
-    const flow = registry.require(started.flowId);
+    // The staged run's flow is known, and its row may not yet be visible
+    // outside the caller's tx, so it is never re-resolved by runId here.
+    const { flow, superseded, started, dispatch } = effects;
 
-    for (const event of superseded) {
-      await hooks.fireHook(flow.onError, event, "flow.onError");
-      await hooks.fireHook(flowHooks?.onFlowError, event, "onFlowError");
-      await dispatcher.propagateToParent(event.runId, {
-        kind: "canceled",
-        error: event.error,
-      });
+    // A superseded run may be pinned to an older hash than the run replacing it.
+    for (const { runId, fact } of superseded) {
+      await dispatcher.settleSuperseded(
+        endingRunOf(runId, await flowOf(runId)),
+        fact,
+      );
     }
 
     await hooks.fireHook(flow.onStart, started, "flow.onStart");
@@ -312,46 +321,7 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
     return runId;
   }
 
-  async function cancelRunRecursive(
-    runId: RunId,
-    args: CancelArgs,
-  ): Promise<void> {
-    const state = await store.loadRunState(runId);
-    if (isTerminalRun(state)) {
-      deps.emitLog({
-        level: "info",
-        msg: "nagi: cancel skipped — run already terminal",
-        attrs: { runId, status: runStatusOf(state) },
-      });
-      return;
-    }
-    const flow = registry.get(state.flowId);
-    await store.appendFact(runId, Facts.flowCanceled(runId, args, clock.now()));
-    const error: SerializedError = {
-      name: "NagiCanceledError",
-      message: `Run ${runId} was canceled: ${args.reason}`,
-    };
-    if (flow !== undefined) {
-      const event = { runId, flowId: flow.id, error, at: clock.now() };
-      await hooks.fireHook(flow.onError, event, "flow.onError");
-      await hooks.fireHook(flowHooks?.onFlowError, event, "onFlowError");
-    }
-
-    for (const childId of await store.listChildren(runId)) {
-      await cancelRunRecursive(childId, {
-        cause: "explicit",
-        reason: `parent ${runId} canceled: ${args.reason}`,
-        note:
-          args.cause === "operator"
-            ? `cascade from operator ${args.actor} aborting parent ${runId}`
-            : `cascade from parent ${runId}`,
-      });
-    }
-
-    await dispatcher.propagateToParent(runId, { kind: "canceled", error });
-  }
-
-  return { start, stage, applyEffects, startChildRun, cancelRunRecursive };
+  return { start, stage, applyEffects, startChildRun };
 }
 
 function resolveRunId(runId: RunId | undefined): RunId {
@@ -372,17 +342,4 @@ function concurrencyOf(flow: Flow, input: Json): Concurrency | undefined {
     );
   }
   return { key, mode: flow.concurrency.mode };
-}
-
-function supersededEvent(
-  flowId: string,
-  canceledByRunId: RunId,
-  c: { readonly runId: RunId; readonly fact: FlowCanceledByConcurrencyFact },
-): FlowErrorEvent {
-  const cause = { canceledByRunId, concurrencyKey: c.fact.concurrencyKey };
-  const error: SerializedError = {
-    ...serializeError(new NagiCanceledError({ runId: c.runId, ...cause })),
-    cause,
-  };
-  return { runId: c.runId, flowId, error, at: c.fact.at };
 }

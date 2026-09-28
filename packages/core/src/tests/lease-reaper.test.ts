@@ -30,6 +30,15 @@ describe("decideExpiredLeaseAction", () => {
     if (decision.tag !== "reap") throw new Error("unreachable");
     expect(decision.nextAttempt).toBe(3);
     expect(decision.backoffMs).toBe(0);
+    expect(decision.fact).toEqual({
+      kind: "lease.reaped",
+      runId: RUN_ID,
+      stepId: STEP_ID,
+      attempt: 2,
+      at: now,
+      reapedAt: now,
+      reason: "expired",
+    });
   });
 
   it("skips a live (heartbeat-recent) lease", () => {

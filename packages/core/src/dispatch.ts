@@ -6,20 +6,21 @@ import {
 import { makeHooks } from "./exec/hooks";
 import { makeMessage } from "./exec/message";
 import { makeProgression } from "./exec/progression";
-import { type FlowResolution, requireCurrent } from "./flows";
+import { type FlowOf, requireCurrent } from "./flows";
 import type { EmitLog } from "./internal";
+import type { RunCancelCause, TerminalPhase } from "./state";
 import type {
+  CancelArgs,
   Clock,
   Flow,
+  FlowCanceledByConcurrencyFact,
   FlowHooks,
-  Json,
   Millis,
   ParentRef,
   Queue,
   QueueMessage,
   RetryPolicy,
   RunId,
-  SerializedError,
   Store,
   StreamTransport,
 } from "./types";
@@ -31,7 +32,8 @@ export interface HeartbeatConfig {
 }
 
 export interface DispatchDeps {
-  readonly resolveFlow: (runId: RunId) => Promise<FlowResolution>;
+  readonly flowOf: FlowOf;
+  // By flow id, for a subflow child about to start on this code.
   readonly lookupFlow: (flowId: string) => Flow | undefined;
   readonly startChildRun: (args: {
     readonly child: Flow;
@@ -46,15 +48,24 @@ export interface DispatchDeps {
   readonly hooks?: FlowHooks;
   readonly emitLog: EmitLog;
   readonly defaultRetry?: RetryPolicy;
-  readonly fireHooks?: boolean;
-  readonly cancelPollIntervalMs?: Millis;
+  readonly fireHooks: boolean;
   readonly heartbeat: HeartbeatConfig;
 }
 
-export type SubflowChildOutcome =
-  | { readonly kind: "completed"; readonly output: Json }
-  | { readonly kind: "failed"; readonly error: SerializedError }
-  | { readonly kind: "canceled"; readonly error: SerializedError };
+// The run being ended. "gone": its definition is unavailable (snapshot gone,
+// unregistered), so only the global hooks fire, not flow.onComplete/onError.
+export type EndingRun =
+  | { readonly kind: "resolved"; readonly runId: RunId; readonly flow: Flow }
+  | { readonly kind: "gone"; readonly runId: RunId; readonly flowId: string };
+
+// Explicit/operator cancels are excluded: they cascade to children, so they
+// only end a run through Dispatcher.cancel.
+export type RunEnd =
+  | Exclude<TerminalPhase, { readonly tag: "canceled" }>
+  | {
+      readonly tag: "canceled";
+      readonly cause: Extract<RunCancelCause, { readonly kind: "concurrency" }>;
+    };
 
 // "snapshot-gone" is a live run pinned to a flowHash this process did not
 // register: the message is left unsettled for the worker's policy. A terminal
@@ -69,10 +80,14 @@ export type DispatchResult =
 export interface Dispatcher {
   dispatchMessage(message: QueueMessage): Promise<DispatchResult>;
   advance(runId: RunId): Promise<void>;
-  propagateToParent(
-    childRunId: RunId,
-    outcome: SubflowChildOutcome,
+  terminate(run: EndingRun, end: RunEnd): Promise<void>;
+  // The store already committed the flow.canceled fact (tryStartRun's
+  // concurrency pass); only the post-terminal effects remain.
+  settleSuperseded(
+    run: EndingRun,
+    fact: FlowCanceledByConcurrencyFact,
   ): Promise<void>;
+  cancel(runId: RunId, args: CancelArgs): Promise<void>;
   // Fail any signal step whose timeout has elapsed, then advance the run so the
   // failure propagates to flow.failed. Returns the number of runs failed. The
   // store does the atomic fail+delete under its per-run lock; advance runs here,
@@ -93,7 +108,7 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
         // other failure path uses (handleStepError, markStepSettled) — so a
         // consumer's per-step error handling sees signal timeouts too.
         if (deps.hooks?.onStepError) {
-          const flow = requireCurrent(await deps.resolveFlow(runId));
+          const flow = requireCurrent(await deps.flowOf(runId));
           await hooks.fireHook(
             deps.hooks.onStepError,
             {
@@ -128,7 +143,9 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
   return {
     dispatchMessage: message.dispatchMessage,
     advance: progression.advance,
-    propagateToParent: progression.propagateToParent,
+    terminate: progression.terminate,
+    settleSuperseded: progression.settleSuperseded,
+    cancel: progression.cancel,
     sweepTimers,
   };
 }

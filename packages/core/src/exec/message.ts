@@ -9,15 +9,12 @@ import {
   type MatchDef,
   resolveNeeds,
   type StepDef,
-  type StreamingTaskDef,
   type SubflowDef,
   selectArm,
-  type TaskDef,
 } from "../internal";
 import { resolveRetry } from "../retry";
 import { deriveChildRunId } from "../run-id";
-import { stepStateOf } from "../scheduler";
-import { isAbortRequested, isTerminalRun, resolvedOf } from "../state";
+import { isAbortRequested, isTerminalRun, stepStateOf } from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
   classifyFailure,
@@ -54,25 +51,23 @@ type Admission =
   | { readonly tag: "recover" }
   | { readonly tag: "run"; readonly def: StepDef; readonly state: RunState };
 
-interface ExecuteTaskResult {
-  readonly output: Json;
-  readonly skipAdvance: boolean;
-}
-
 export interface MessageHandler {
   dispatchMessage(message: QueueMessage): Promise<DispatchResult>;
 }
 
-// Replay generation for a subflow step: the count of step.reset facts for it.
-// 0 on the original run, +1 per replay (nagi#6); unchanged by lease-reap,
-// redelivery, or retry. Used to key the deterministic child runId so a
-// re-dispatch re-attaches but a replay spawns fresh. See deriveChildRunId.
-function subflowGeneration(state: RunState, stepId: string): number {
-  let n = 0;
-  for (const f of state.facts) {
-    if (f.kind === "step.reset" && f.stepId === stepId) n++;
+// Start events surface the flow input only where the start is an
+// input-processing moment; signal/match start with null by contract.
+function startInput(def: StepDef, input: Json): Json {
+  switch (def.kind) {
+    case "task":
+    case "activity":
+    case "streaming":
+    case "subflow":
+      return input;
+    case "signal":
+    case "match":
+      return null;
   }
-  return n;
 }
 
 export function makeMessage(
@@ -87,7 +82,7 @@ export function makeMessage(
     message: QueueMessage,
   ): Promise<DispatchResult> {
     const { queue } = deps;
-    const resolution = await deps.resolveFlow(message.runId);
+    const resolution = await deps.flowOf(message.runId);
     let flow: Flow;
     switch (resolution.kind) {
       case "current":
@@ -220,15 +215,8 @@ export function makeMessage(
         new Date(startedAt.getTime() + def.timeoutMs),
       );
     }
-    // Start events surface the flow input only where the start is an
-    // input-processing moment; signal/match start with null by contract. Input
-    // is immutable after flow.started, so the admission snapshot is current.
-    const startCarriesInput =
-      def.kind === "task" ||
-      def.kind === "activity" ||
-      def.kind === "streaming" ||
-      def.kind === "subflow";
-    const input: Json = startCarriesInput ? state.input : null;
+    // Input is immutable after flow.started, so the admission snapshot is current.
+    const input = startInput(def, state.input);
     await fireStepLifecycle(
       handler?.onStart,
       deps.hooks?.onStepStart,
@@ -256,26 +244,9 @@ export function makeMessage(
 
     switch (def.kind) {
       case "task":
-      case "streaming": {
-        const { output, skipAdvance } = await executeTask({
-          def,
-          runId,
-          stepId,
-          attempt,
-          state,
-        });
-        return skipAdvance ? { tag: "parked" } : { tag: "completed", output };
-      }
-      case "activity": {
-        const { output, skipAdvance } = await executeActivity({
-          def,
-          runId,
-          stepId,
-          attempt,
-          state,
-        });
-        return skipAdvance ? { tag: "parked" } : { tag: "completed", output };
-      }
+      case "activity":
+      case "streaming":
+        return await executeHandler({ def, runId, stepId, attempt, state });
       case "signal": {
         // recordStarted just moved this signal step into awaitingSignal. If a
         // signal arrived early (the start/await race) it was parked as a
@@ -349,53 +320,40 @@ export function makeMessage(
     }
   }
 
-  async function runHandler(
-    def: HandlerDef,
-    args: {
-      input: unknown;
-      needs: Record<string, unknown>;
-      ctx: StepCtx<unknown>;
-      runId: RunId;
-      stepId: string;
-    },
+  // emit publishes out-of-band via the stream transport, never through `tx`:
+  // chunks must be visible before commit and never enter the fact log. Any
+  // emit after the body returns is a no-op.
+  async function withEmit(
+    runId: RunId,
+    stepId: string,
+    base: StepCtx<unknown>,
+    body: (ctx: StreamingStepCtx<unknown>) => Promise<Json>,
   ): Promise<Json> {
-    const { input, needs, ctx, runId, stepId } = args;
-    if (def.kind !== "streaming") {
-      return (await (def.run as TaskDef["run"])({ input, needs, ctx })) as Json;
-    }
-    // emit publishes out-of-band via the stream transport, never through `tx`:
-    // chunks must be visible before commit and never enter the fact log.
-    // emitActive makes any emit after the handler returns a no-op.
     let emitActive = true;
-    const streamingCtx: StreamingStepCtx<unknown> = {
-      ...ctx,
-      emit: async (chunk: Json) => {
-        if (emitActive)
-          deps.streamTransport?.publishChunk(runId, stepId, chunk);
-      },
-    };
     try {
-      return (await (def.run as StreamingTaskDef["run"])({
-        input,
-        needs,
-        ctx: streamingCtx,
-      })) as Json;
+      return await body({
+        ...base,
+        emit: async (chunk) => {
+          if (emitActive)
+            deps.streamTransport?.publishChunk(runId, stepId, chunk);
+        },
+      });
     } finally {
       emitActive = false;
     }
   }
 
-  async function executeTask(args: {
+  async function executeHandler(args: {
     def: HandlerDef;
     runId: RunId;
     stepId: string;
     attempt: number;
     state: RunState;
-  }): Promise<ExecuteTaskResult> {
+  }): Promise<Dispatched> {
     const { def, runId, stepId, attempt, state } = args;
     const { store, clock } = deps;
     const input = state.input;
-    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
+    const needs = resolveNeeds(def, state);
 
     const ac = new AbortController();
     const watcher = startCancelWatcher({
@@ -404,7 +362,7 @@ export function makeMessage(
       stepId,
       attempt,
       ac,
-      intervalMs: deps.cancelPollIntervalMs ?? CANCEL_POLL_INTERVAL_MS,
+      intervalMs: CANCEL_POLL_INTERVAL_MS,
     });
     // Shares the watcher's controller: one signal, two reasons.
     const deadline =
@@ -417,126 +375,62 @@ export function makeMessage(
             timeoutMs: def.timeoutMs,
             ac,
           });
-
-    try {
-      let stepAbortedHere = false;
-      const output = await store.runStep<Json>(
-        runId,
-        stepId,
-        attempt,
-        async (tx) => {
-          const ctx = makeStepCtx({
-            runId,
-            stepId,
-            attempt,
-            input,
-            store,
-            clock,
-            tx,
-            signal: ac.signal,
-            emitLog: deps.emitLog,
-          });
-          const out = await runHandler(def, {
-            input,
-            needs,
-            ctx,
-            runId,
-            stepId,
-          });
-          const postState = await store.loadRunState(runId);
-          const { fact, abortedHere } = resolveExecutionFact({
-            postState,
-            runId,
-            stepId,
-            attempt,
-            output: out,
-            at: clock.now(),
-          });
-          stepAbortedHere = abortedHere;
-          return { output: out, fact };
-        },
-      );
-      return { output, skipAdvance: stepAbortedHere };
-    } catch (err) {
-      throw unwrapDeadline(err, ac.signal);
-    } finally {
-      watcher.stop();
-      deadline?.stop();
-    }
-  }
-
-  // Like executeTask, but the handler runs OUTSIDE the durable transaction
-  // (RFC 0013). External-effect bodies (LLM/HTTP calls) must not hold a tx for
-  // minutes. The handler runs first with an activity ctx (no tx); only the
-  // terminal fact is then committed in a short runStep tx whose body does no
-  // work beyond resolving the fact. Cancel/abort/replay semantics are identical
-  // to executeTask because the same resolveExecutionFact + runStep path commits.
-  async function executeActivity(args: {
-    def: HandlerDef;
-    runId: RunId;
-    stepId: string;
-    attempt: number;
-    state: RunState;
-  }): Promise<ExecuteTaskResult> {
-    const { def, runId, stepId, attempt, state } = args;
-    const { store, clock } = deps;
-    const input = state.input;
-    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
-
-    const ac = new AbortController();
-    const watcher = startCancelWatcher({
-      store,
+    const ctxArgs = {
       runId,
       stepId,
       attempt,
-      ac,
-      intervalMs: deps.cancelPollIntervalMs ?? CANCEL_POLL_INTERVAL_MS,
-    });
-    // Shares the watcher's controller: one signal, two reasons.
-    const deadline =
-      def.timeoutMs === undefined
-        ? undefined
-        : startDeadline({
-            runId,
-            stepId,
-            attempt,
-            timeoutMs: def.timeoutMs,
-            ac,
-          });
+      input,
+      store,
+      clock,
+      signal: ac.signal,
+      emitLog: deps.emitLog,
+    };
 
-    try {
-      const ctx = makeActivityCtx({
+    let abortedHere = false;
+    const settle = async (output: Json) => {
+      const resolved = resolveExecutionFact({
+        postState: await store.loadRunState(runId),
         runId,
         stepId,
         attempt,
-        input,
-        store,
-        clock,
-        signal: ac.signal,
-        emitLog: deps.emitLog,
+        output,
+        at: clock.now(),
       });
-      const out = await runHandler(def, { input, needs, ctx, runId, stepId });
+      abortedHere = resolved.abortedHere;
+      return { output, fact: resolved.fact };
+    };
 
-      let stepAbortedHere = false;
-      const output = await store.runStep<Json>(
-        runId,
-        stepId,
-        attempt,
-        async () => {
-          const postState = await store.loadRunState(runId);
-          const { fact, abortedHere } = resolveExecutionFact({
-            postState,
-            runId,
-            stepId,
-            attempt,
-            output: out,
-            at: clock.now(),
-          });
-          stepAbortedHere = abortedHere;
-          return { output: out, fact };
-        },
+    const inTx = (body: (ctx: StepCtx<unknown>) => Promise<Json>) =>
+      store.runStep<Json>(runId, stepId, attempt, async (tx) =>
+        settle(await body(makeStepCtx({ ...ctxArgs, tx }))),
       );
-      return { output, skipAdvance: stepAbortedHere };
+
+    try {
+      let output: Json;
+      switch (def.kind) {
+        case "task":
+          output = await inTx((ctx) => def.run({ input, needs, ctx }));
+          break;
+        case "streaming":
+          output = await inTx((base) =>
+            withEmit(runId, stepId, base, (ctx) =>
+              def.run({ input, needs, ctx }),
+            ),
+          );
+          break;
+        // The body runs OUTSIDE the durable transaction (RFC 0013): an external
+        // effect must not hold a tx for minutes. Only the terminal fact commits,
+        // in a short runStep tx, through the same settle as a task.
+        case "activity": {
+          const ctx = makeActivityCtx(ctxArgs);
+          const out = await def.run({ input, needs, ctx });
+          output = await store.runStep<Json>(runId, stepId, attempt, () =>
+            settle(out),
+          );
+          break;
+        }
+      }
+      return abortedHere ? { tag: "parked" } : { tag: "completed", output };
     } catch (err) {
       throw unwrapDeadline(err, ac.signal);
     } finally {
@@ -563,7 +457,7 @@ export function makeMessage(
     // unchanged by lease-reap / redelivery, so every re-dispatch of the same
     // logical spawn re-derives the SAME child id (idempotent re-attach); a
     // replay (nagi#6) bumps it and gets a fresh child. See deriveChildRunId.
-    const generation = subflowGeneration(state, stepId);
+    const generation = state.resetCounts[stepId] ?? 0;
     const childRunId = await deriveChildRunId({ runId, stepId, generation });
 
     // Re-entrant: a re-dispatch (lease-reap, or recovery after a lost wake) of a
@@ -579,7 +473,7 @@ export function makeMessage(
     // First spawn, or re-attach to an in-flight child (deterministic id +
     // tryStartRun existence-check ⇒ idempotent), then park.
     const parentInput = state.input;
-    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
+    const needs = resolveNeeds(def, state);
     const childInput = def.buildInput({ input: parentInput, needs });
     await deps.startChildRun({
       child,
@@ -600,7 +494,7 @@ export function makeMessage(
     const { store, clock } = deps;
 
     const input = state.input;
-    const needs = resolveNeeds(def, (id) => resolvedOf(stepStateOf(state, id)));
+    const needs = resolveNeeds(def, state);
 
     const armId = selectArm(def, { input, needs });
 
@@ -670,9 +564,8 @@ export function makeMessage(
       }
       case "failed": {
         const at = clock.now();
-        await store.settleStep(
+        await store.appendFact(
           runId,
-          stepId,
           Facts.stepFailed(runId, stepId, attempt, error, at),
         );
         await fireStepLifecycle(
@@ -684,23 +577,20 @@ export function makeMessage(
         return { tag: "advance" };
       }
       case "flowCanceled": {
-        const at = clock.now();
-        // Settle the step as canceled (carries cancel error for trace) and
-        // terminate the run with flow.canceled (concurrency). The materialized
-        // workflow_run.canceled_by_run_id column populates from the fact's
-        // canceledByRunId via applyFactToMaterialized.
         await store.appendFact(
           runId,
-          Facts.stepCanceled(runId, stepId, attempt, at, error),
+          Facts.stepCanceled(runId, stepId, attempt, clock.now(), error),
         );
-        await store.appendFact(
-          runId,
-          Facts.flowCanceledByConcurrency({
-            runId,
-            at,
-            canceledByRunId: outcome.canceledByRunId,
-            concurrencyKey: outcome.concurrencyKey,
-          }),
+        await progression.terminate(
+          { kind: "resolved", runId, flow },
+          {
+            tag: "canceled",
+            cause: {
+              kind: "concurrency",
+              canceledByRunId: outcome.canceledByRunId,
+              concurrencyKey: outcome.concurrencyKey,
+            },
+          },
         );
         return { tag: "parked" };
       }

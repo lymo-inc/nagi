@@ -197,6 +197,33 @@ export const migrations: readonly Migration[] = [
         ON DELETE SET NULL;
     `,
   },
+  {
+    // step_run becomes one row per step (its latest attempt), updated in place.
+    // Of the per-attempt rows, a settled one wins, then the highest attempt —
+    // what the fold would have made of the same facts.
+    id: "0009_step_run_per_step",
+    sql: (schema) => `
+      DELETE FROM ${schema}.step_run s
+       USING (
+         SELECT run_id, step_id, attempt,
+                row_number() OVER (
+                  PARTITION BY run_id, step_id
+                  ORDER BY (status IN ('completed','failed','canceled','skipped')) DESC,
+                           attempt DESC
+                ) AS rn
+           FROM ${schema}.step_run
+       ) ranked
+       WHERE s.run_id = ranked.run_id
+         AND s.step_id = ranked.step_id
+         AND s.attempt = ranked.attempt
+         AND ranked.rn > 1;
+
+      ALTER TABLE ${schema}.step_run DROP CONSTRAINT IF EXISTS step_run_pkey;
+      ALTER TABLE ${schema}.step_run ADD CONSTRAINT step_run_pkey
+        PRIMARY KEY (run_id, step_id);
+      DROP INDEX IF EXISTS ${schema}.step_run_lookup_idx;
+    `,
+  },
 ];
 
 export interface MigrateOpts {

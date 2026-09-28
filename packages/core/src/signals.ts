@@ -6,7 +6,7 @@ import {
 } from "./errors";
 import type { Hooks } from "./exec/hooks";
 import { Facts } from "./facts";
-import type { FlowRegistry } from "./flows";
+import { type FlowOf, requireCurrent } from "./flows";
 import {
   asStepMapWithDefs,
   compact,
@@ -162,7 +162,7 @@ export interface SignalsDeps {
   readonly dispatcher: Dispatcher;
   readonly store: Store;
   readonly clock: Clock;
-  readonly registry: FlowRegistry;
+  readonly flowOf: FlowOf;
   readonly hooks: Hooks;
   readonly flowHooks?: FlowHooks;
   readonly emitLog: EmitLog;
@@ -171,16 +171,14 @@ export interface SignalsDeps {
 export function makeSignals(deps: SignalsDeps): {
   signal(runId: RunId, signalName: string, payload: unknown): Promise<void>;
 } {
-  const { dispatcher, store, clock, registry, hooks, flowHooks, emitLog } =
-    deps;
+  const { dispatcher, store, clock, flowOf, hooks, flowHooks, emitLog } = deps;
 
   async function signal(
     runId: RunId,
     signalName: string,
     payload: unknown,
   ): Promise<void> {
-    const runState = await store.loadRunState(runId);
-    const flow = registry.require(runState.flowId);
+    const flow = requireCurrent(await flowOf(runId));
     const resolved = resolveSignalStep(flow, signalName);
     if (resolved === null) {
       throw new NagiRuntimeError(

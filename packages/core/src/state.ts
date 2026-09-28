@@ -73,6 +73,11 @@ export type RunPhase =
   | { readonly tag: "failed"; readonly error: SerializedError }
   | { readonly tag: "canceled"; readonly cause: RunCancelCause };
 
+export type TerminalPhase = Exclude<
+  RunPhase,
+  { readonly tag: "pending" | "running" }
+>;
+
 export interface RunState {
   readonly runId: RunId;
   readonly flowId: string;
@@ -83,6 +88,8 @@ export interface RunState {
   readonly bufferedSignals: Readonly<
     Record<StepId, { readonly payload: Json; readonly signalName?: string }>
   >;
+  // step.reset facts folded per step; absent ⇔ never reset.
+  readonly resetCounts: Readonly<Record<StepId, number>>;
   // The source log this projection folded from, kept for introspection and
   // test/debug assertions; the engine reads the projection above, never this.
   readonly facts: readonly Fact[];

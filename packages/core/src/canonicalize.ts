@@ -1,16 +1,14 @@
 import {
-  type ActivityDef,
   asStepMapWithDefs,
   type Guard,
   getDef,
+  type HandlerDef,
   type MatchArmDef,
   type MatchDef,
   needsStepIds,
   type SignalDef,
   type StepDef,
-  type StreamingTaskDef,
   type SubflowDef,
-  type TaskDef,
 } from "./internal";
 import { DEFAULT_RETRY } from "./retry";
 import type {
@@ -98,18 +96,20 @@ async function canonicalizeStep(
 ): Promise<CanonicalStep> {
   const needs = [...needsStepIds(def)].sort();
   const base: CanonicalStep = { id, kind: def.kind, needs };
-  // A streaming step hashes as a task: chunks are ephemeral and never affect the
-  // flow hash, so only its task-shaped fields are canonicalized. An activity
-  // hashes like a task too (it differs only in execution, not in DAG shape).
-  if (
-    def.kind === "task" ||
-    def.kind === "activity" ||
-    def.kind === "streaming"
-  )
-    return canonicalizeTask(base, def);
-  if (def.kind === "signal") return canonicalizeSignal(base, def);
-  if (def.kind === "subflow") return canonicalizeSubflow(base, def);
-  return canonicalizeMatch(base, def);
+  switch (def.kind) {
+    // Streaming and activity hash like a task: chunks are ephemeral and the
+    // tx boundary is execution, not DAG shape. `kind` alone tells them apart.
+    case "task":
+    case "activity":
+    case "streaming":
+      return canonicalizeHandler(base, def);
+    case "signal":
+      return canonicalizeSignal(base, def);
+    case "subflow":
+      return canonicalizeSubflow(base, def);
+    case "match":
+      return canonicalizeMatch(base, def);
+  }
 }
 
 // Key insertion order is irrelevant to the flow hash: stableStringify sorts keys.
@@ -125,9 +125,9 @@ async function applyGuardAndTimeout(
     out.timeoutMs = def.timeoutMs;
 }
 
-async function canonicalizeTask(
+async function canonicalizeHandler(
   base: CanonicalStep,
-  def: TaskDef | ActivityDef | StreamingTaskDef,
+  def: HandlerDef,
 ): Promise<CanonicalStep> {
   const out: Mutable<CanonicalStep> = { ...base };
   await applyGuardAndTimeout(out, def);

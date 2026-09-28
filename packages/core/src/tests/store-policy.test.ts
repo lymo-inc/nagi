@@ -1,17 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { Facts } from "../facts";
+import { Facts, factConsequences } from "../facts";
 import {
   clampQueryLimit,
   compareRunOrder,
   decodeRunCursor,
   encodeRunCursor,
-  factEffects,
   isPastCursor,
   jsonContains,
   QUERY_RUNS_DEFAULT_LIMIT,
   QUERY_RUNS_MAX_LIMIT,
   selectExpired,
   selectPruneBatch,
+  supersede,
 } from "../store-policy";
 import type { AttemptNumber, Fact, RunId } from "../types";
 
@@ -153,9 +153,10 @@ describe("selectPruneBatch — eligibility, order, batch size", () => {
   });
 });
 
-describe("factEffects — the release table", () => {
+describe("factConsequences — the release table", () => {
+  const releaseOf = (fact: Fact) => factConsequences(fact).release;
   const releaseStep = (fact: Fact, timer: boolean) =>
-    expect(factEffects(fact)).toEqual({
+    expect(releaseOf(fact)).toEqual({
       tag: "release-step",
       stepId: "s",
       timer,
@@ -172,19 +173,27 @@ describe("factEffects — the release table", () => {
   });
 
   it("terminal run facts release the concurrency slot", () => {
-    expect(factEffects(Facts.flowCompleted(R, null, AT))).toEqual({
-      tag: "release-run",
-    });
+    for (const fact of [
+      Facts.flowCompleted(R, null, AT),
+      Facts.flowFailed(R, { name: "E", message: "" }, AT),
+      Facts.flowCanceled(R, { cause: "explicit", reason: "r" }, AT),
+    ]) {
+      expect(releaseOf(fact)).toEqual({ tag: "release-run" });
+    }
+  });
+
+  it("lease.reaped releases only the reaped attempt's lease", () => {
     expect(
-      factEffects(Facts.flowFailed(R, { name: "E", message: "" }, AT)),
-    ).toEqual({
-      tag: "release-run",
-    });
-    expect(
-      factEffects(
-        Facts.flowCanceled(R, { cause: "explicit", reason: "r" }, AT),
+      releaseOf(
+        Facts.leaseReaped({
+          runId: R,
+          stepId: "s",
+          attempt: A1,
+          at: AT,
+          reapedAt: AT,
+        }),
       ),
-    ).toEqual({ tag: "release-run" });
+    ).toEqual({ tag: "release-lease", stepId: "s", attempt: A1 });
   });
 
   it("everything else releases nothing", () => {
@@ -208,14 +217,79 @@ describe("factEffects — the release table", () => {
       Facts.signalReceived({ runId: R, stepId: "s", payload: null, at: AT }),
       Facts.signalBuffered({ runId: R, stepId: "s", payload: null, at: AT }),
       Facts.matchArmSelected(R, "s", "arm", AT),
-      Facts.leaseReaped({
-        runId: R,
-        stepId: "s",
-        attempt: A1,
-        at: AT,
-        reapedAt: AT,
-      }),
     ];
-    for (const fact of none) expect(factEffects(fact)).toEqual({ tag: "none" });
+    for (const fact of none) expect(releaseOf(fact)).toBeNull();
+  });
+});
+
+describe("factConsequences — stream effects", () => {
+  const streamOf = (fact: Fact) => factConsequences(fact).stream;
+  const error = { name: "E", message: "x" };
+
+  it("closes the step on completion or terminal failure, signals retry with the NEXT attempt", () => {
+    expect(streamOf(Facts.stepCompleted(R, "s", A1, null, AT))).toEqual({
+      tag: "close-ok",
+      stepId: "s",
+    });
+    expect(streamOf(Facts.stepFailed(R, "s", A1, error, AT))).toEqual({
+      tag: "close-error",
+      stepId: "s",
+      error,
+    });
+    expect(streamOf(Facts.stepRetried(R, "s", A1, AT, error, AT))).toEqual({
+      tag: "retry",
+      stepId: "s",
+      nextAttempt: 2,
+    });
+  });
+
+  it("closes the whole run on every terminal run fact, and nothing else", () => {
+    for (const fact of [
+      Facts.flowCompleted(R, null, AT),
+      Facts.flowFailed(R, error, AT),
+      Facts.flowCanceled(R, { cause: "explicit", reason: "r" }, AT),
+    ]) {
+      expect(streamOf(fact)).toEqual({ tag: "close-run" });
+    }
+    expect(streamOf(Facts.stepCanceled(R, "s", A1, AT))).toBeNull();
+    expect(streamOf(Facts.stepStarted(R, "s", A1, "task", AT))).toBeNull();
+  });
+});
+
+describe("supersede — cancel-in-progress", () => {
+  const start = Facts.flowStarted({
+    runId: "new" as RunId,
+    flowId: "f",
+    input: null,
+    at: AT,
+  });
+
+  it("cancels every prior with a concurrency fact naming the new run", () => {
+    const out = supersede({
+      start,
+      concurrency: { key: "k", mode: "cancel-in-progress" },
+      priors: ["a" as RunId, "b" as RunId],
+    });
+    expect(out).toEqual(
+      ["a", "b"].map((runId) => ({
+        runId,
+        fact: Facts.flowCanceledByConcurrency({
+          runId: runId as RunId,
+          canceledByRunId: "new" as RunId,
+          concurrencyKey: "k",
+          at: AT,
+        }),
+      })),
+    );
+  });
+
+  it("no priors, no cancellations", () => {
+    expect(
+      supersede({
+        start,
+        concurrency: { key: "k", mode: "cancel-in-progress" },
+        priors: [],
+      }),
+    ).toEqual([]);
   });
 });
