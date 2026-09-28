@@ -876,8 +876,8 @@ class PostgresStore<DB = unknown> implements Store {
   }
 
   // Mirrors nextStepRow (@nagi-js/core read-model): one row per step, a
-  // settled row changes only by reset, and a start or retry older than the
-  // row's attempt is stale.
+  // settled row changes only by reset, a start applies only for a newer
+  // attempt, and a retry only to the attempt in flight.
   private async applyStepDelta(
     trx: Kysely<DB>,
     runId: RunId,
@@ -891,15 +891,16 @@ class PostgresStore<DB = unknown> implements Store {
           ON CONFLICT (run_id, step_id) DO UPDATE
             SET attempt = EXCLUDED.attempt, status = 'running', started_at = EXCLUDED.started_at,
                 completed_at = NULL, output = NULL, error = NULL
-            WHERE s.status NOT IN ${SETTLED_STEP} AND s.attempt <= EXCLUDED.attempt
+            WHERE s.status NOT IN ${SETTLED_STEP} AND s.attempt < EXCLUDED.attempt
         `.execute(trx);
         return;
       case "backoff":
         await sql`
           UPDATE ${sql.raw(this.t("step_run"))}
-             SET attempt = ${delta.attempt}, error = ${jsonb(delta.error as unknown as Json)}
+             SET error = ${jsonb(delta.error as unknown as Json)}
            WHERE run_id = ${runId} AND step_id = ${delta.stepId}
-             AND status NOT IN ${SETTLED_STEP} AND attempt <= ${delta.attempt}
+             AND status NOT IN ${SETTLED_STEP} AND error IS NULL
+             AND attempt = ${delta.attempt}
         `.execute(trx);
         return;
       case "completed":

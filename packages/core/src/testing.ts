@@ -1571,6 +1571,79 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "step attempts only move forward, in loadRunState and describe alike: a newer start supersedes a live attempt; a duplicate start, and a retry or abort for an attempt not in flight, change nothing",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const t = (n: number) => new Date(1_700_000_000_000 + n * 1000);
+      const error = { name: "E", message: "boom" };
+      const both = async (tag: string, attempt: AttemptNumber, at: Date) => {
+        eq(
+          stepStateOf(await s.loadRunState(runId), "s"),
+          { tag, attempt },
+          `loadRunState after ${at.toISOString()}`,
+        );
+        eq(
+          await stepView(s, runId, "s"),
+          { stepId: "s", attempt, status: "running", startedAt: at },
+          `describe after ${at.toISOString()}`,
+        );
+      };
+      await startRun(s, runId, { at: t(0) });
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A1, "task", t(1)),
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A1, "task", t(2)),
+      );
+      await both("running", A1, t(1));
+
+      // A lease reap re-dispatches at attempt+1 while attempt 1 still reads
+      // as running.
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A2, "task", t(3)),
+      );
+      await both("running", A2, t(3));
+
+      for (const attempt of [A1, 3 as AttemptNumber]) {
+        await s.appendFact(
+          runId,
+          Facts.stepRetried(runId, "s", attempt, t(9), error, t(4)),
+        );
+      }
+      await s.appendFact(
+        runId,
+        Facts.stepAbortRequested({
+          runId,
+          stepId: "s",
+          attempt: A1,
+          at: t(5),
+          actor: "op",
+        }),
+      );
+      await both("running", A2, t(3));
+
+      await s.appendFact(
+        runId,
+        Facts.stepAbortRequested({
+          runId,
+          stepId: "s",
+          attempt: A2,
+          at: t(6),
+          actor: "op",
+        }),
+      );
+      eq(
+        stepStateOf(await s.loadRunState(runId), "s"),
+        { tag: "aborting", attempt: A2 },
+        "an abort for the live attempt lands",
+      );
+    },
+  },
+  {
     name: "describe: a skipped step settles its view; a settled step changes only by reset",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
