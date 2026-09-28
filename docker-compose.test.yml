@@ -1,7 +1,8 @@
-# Vanilla Postgres for `@nagi-js/postgres` integration tests.
-# The store tests use unique per-test schemas (`nagi_test_<uuid7>`), so a single
-# container instance handles the full suite. No pgmq extension required — the
-# `@nagi-js/pgmq` package's own integration tests live elsewhere.
+# Postgres 16 with the pgmq extension, shared by the `@nagi-js/postgres` and
+# `@nagi-js/pgmq` integration suites. Store tests use unique per-test schemas
+# (`nagi_test_<uuid7>`) and queue tests unique per-test queues, so a single
+# container instance handles both suites. Keep the image in sync with the CI
+# integration service.
 #
 # Usage:
 #   pnpm db:up      # start
@@ -9,7 +10,7 @@
 #   pnpm db:down    # stop
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ghcr.io/pgmq/pg16-pgmq:v1.13.0
     container_name: nagi-test-postgres
     environment:
       POSTGRES_PASSWORD: postgres
@@ -22,4 +23,6 @@ services:
       timeout: 3s
       retries: 30
     tmpfs:
-      - /var/lib/postgresql/data
+      # The image runs as the postgres user (uid 999); initdb cannot chmod a
+      # root-owned tmpfs.
+      - /var/lib/postgresql/data:uid=999,gid=999
