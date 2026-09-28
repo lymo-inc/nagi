@@ -1,8 +1,96 @@
 # Operations runbook
 
-Triage and recovery for nagi runs, using the built-in API — no hand-run SQL.
-Every recipe here previously existed only as incident folklore; the API calls
-are the supported path.
+Setup prerequisites, then triage and recovery for nagi runs. Recovery uses the
+built-in API — no hand-run SQL. Every recipe here previously existed only as
+incident folklore; the API calls are the supported path.
+
+## Setup and prerequisites
+
+**Migrations.** Run `migrate(db, { schema })` from `@nagi-js/postgres` before
+the first `nagi()`, and again on every nagi upgrade before the new code serves
+traffic, with the same `schema` you pass to `postgresStore()` (default
+`nagi`). Unmigrated, `nagi()` rejects at boot when it registers flows
+(`relation "nagi.flow_snapshot" does not exist`).
+
+- Applied ids live in `<schema>.schema_migrations`; a rerun skips them and
+  returns `{ applied, skipped }`.
+- Each migration runs in its own transaction with its `schema_migrations`
+  insert: a failure rolls that migration back whole, and the next `migrate()`
+  retries it. The transaction also rules out `CREATE INDEX CONCURRENTLY`, so
+  index and constraint migrations lock `workflow_run` while they build. On a
+  large table, apply the equivalent yourself and record the id — the `0008`
+  recipe under [Retention and superseded runs](#retention-and-superseded-runs)
+  is the pattern.
+- No cross-process lock. Run it once per deploy, not from every replica's
+  startup; concurrent runs can race on the same migration, and the loser throws.
+- It opens with `CREATE SCHEMA IF NOT EXISTS <schema>`, which PostgreSQL checks
+  against `CREATE` on the database even when the schema exists
+  (`permission denied for database <db>`). Run it as a role that has it.
+
+**pgmq privileges.** `nagi()` awaits `queue.ensureSchema()` on every boot. For
+`pgmqQueue` that is `CREATE EXTENSION IF NOT EXISTS pgmq` then
+`SELECT pgmq.create(<queueName>)` (`pgmq.create_partitioned` with
+`partitioned: true`). The `@nagi-js/pgmq` 0.1.0 changelog says to run these
+out-of-band in production; doing so does not skip the boot call, so the app
+role still needs the privileges below. Checked on PostgreSQL 16 with pgmq
+1.13.0, default non-partitioned queue:
+
+- Extension already installed: `CREATE EXTENSION IF NOT EXISTS` is a
+  `NOTICE: extension "pgmq" already exists, skipping` — no privilege check, so
+  a role that could not have created it boots past it. Extension absent: the
+  role needs `CREATE` on the database (pgmq 1.13.0 ships `superuser = false`),
+  else boot fails with `permission denied for database <db>`.
+- `pgmq.create` is not `SECURITY DEFINER` and re-runs its `CREATE TABLE IF NOT
+  EXISTS` / `CREATE INDEX IF NOT EXISTS` / `INSERT INTO pgmq.meta ... ON
+  CONFLICT DO NOTHING` on every boot. PostgreSQL checks privileges before
+  "already exists", so every boot needs `USAGE` and `CREATE` on schema `pgmq`,
+  `INSERT` on `pgmq.meta`, and ownership of `pgmq.q_<queueName>` and
+  `pgmq.a_<queueName>`.
+
+Minimal setup: install the extension as a privileged role and let the app role
+create the queue on first boot. It then owns the queue tables, which also
+covers every queue operation and `inspectQueue`.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pgmq;  -- superuser, once per database
+GRANT USAGE, CREATE ON SCHEMA pgmq TO app;
+GRANT INSERT ON pgmq.meta TO app;
+```
+
+A queue pre-created by another role works at runtime on `USAGE` plus DML
+grants, but `nagi()` will not boot: `permission denied for schema pgmq`, then
+with `CREATE`, `must be owner of table q_nagi`. Add the grants above and
+`ALTER TABLE pgmq.q_nagi OWNER TO app` (same for `a_nagi`).
+
+**Custom `Queue` adapters.** Stores have an executable contract —
+`storeContract` from `@nagi-js/core/testing`; run it against any new store.
+Queues have no conformance suite. What core relies on (`Queue` in
+`packages/core/src/types.ts` and its callers):
+
+- A dequeued message stays invisible until `ack`, `nack` or visibility expiry,
+  then is redelivered (at-least-once; core dedupes). `extend(receipt, leaseMs)`
+  moves visibility to now + `leaseMs` (the heartbeat); `nack(receipt,
+  { delayMs })` makes it visible again after `delayMs`.
+- `readCount` counts every delivery, including nacks and lease expiries.
+  `attempt` is only what was stamped at enqueue; `nack` must not change it. The
+  snapshot-gone policy and poison-message triage key on `readCount`.
+- `flowId` passed to `enqueue` comes back on the message; drop it and the
+  message escapes `maxConcurrencyPerFlow`.
+- `withTx(tx)`, if present, MUST route every write through `tx` and nothing
+  else — `startStaged` and the Postgres lease sweep commit their enqueue with
+  store writes. Omit it rather than approximate it.
+- `ensureSchema()` is optional and must be idempotent: every `nagi()` awaits it
+  and fails fast on rejection. `inspect()` is optional; without it
+  `wf.inspectQueue` throws.
+
+**Postgres listener.** `postgresStore({ listener })` calls `listen()` once per
+channel (`<schema>_stream`, `<schema>_events`) at construction and never again,
+and `StreamListener` requires delivery of every NOTIFY until disposed.
+PostgreSQL does not queue NOTIFY for a connection that is not listening, so
+while the LISTEN connection is down notifications are lost and the store is
+not told. The listener must reconnect and re-LISTEN itself; see
+[Streaming steps on Postgres](#streaming-steps-on-postgres) for what a gap
+costs.
 
 ## Triage a stuck run
 
@@ -123,7 +211,9 @@ a subscription that never fires.
 What it is not:
 
 - **Not durable.** A handler sees events from the moment it subscribes; a
-  restart starts over. Catch up with `describe()` / `queryRuns()`, then watch.
+  restart starts over, and a dropped LISTEN connection loses the gap (see
+  [Streaming steps on Postgres](#streaming-steps-on-postgres)). Catch up with
+  `describe()` / `queryRuns()`, then watch.
   Events ride the same LISTEN connection as streaming chunks, so the same
   `await store.ready()` applies before starting a run you mean to watch.
 - **Not filtered.** `watchRuns` delivers every run this process observes.
@@ -164,6 +254,21 @@ const store = postgresStore({
 
 await store.ready(); // both channels live; safe to start runs
 ```
+
+This client never reconnects. When its connection drops, a bare `pg.Client`
+with no `error` listener crashes the process on the unhandled `error` event;
+with one, it silently stops delivering. In production, on `error`/`end` open a
+new client, re-`LISTEN` every channel `listen()` was called with, and route its
+notifications to the same `onNotify` callbacks. What was published during the
+gap stays lost:
+
+- Streaming: chunks in the gap are gone, and if the step's close frame falls
+  in it, an open `wf.subscribe()` iterator never ends. Subscribe again after
+  reconnecting — a new subscription checks durable state and closes at once
+  if the step has settled — and take the output from `describe()`.
+- Watching: events in the gap are gone, and a `watchRun` whose terminal event
+  was missed never stops on its own; call its disposer. Catch up with
+  `describe()` / `queryRuns()`.
 
 Operational limits:
 
