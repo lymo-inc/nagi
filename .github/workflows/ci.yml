@@ -35,7 +35,8 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16-alpine
+        # Keep in sync with docker-compose.test.yml.
+        image: ghcr.io/pgmq/pg16-pgmq:v1.13.0
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: nagi_test
@@ -48,6 +49,7 @@ jobs:
           --health-retries 20
     env:
       NAGI_POSTGRES_TEST_URL: postgres://postgres:postgres@localhost:5432/nagi_test
+      NAGI_PGMQ_TEST_URL: postgres://postgres:postgres@localhost:5432/nagi_test
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -58,3 +60,4 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm -F @nagi-js/core build
       - run: pnpm -F @nagi-js/postgres test
+      - run: pnpm -F @nagi-js/pgmq test

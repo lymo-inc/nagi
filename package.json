@@ -12,7 +12,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
-    "test:integration": "NAGI_POSTGRES_TEST_URL=postgres://postgres:postgres@localhost:5433/nagi_test pnpm -F @nagi-js/postgres test",
+    "test:integration": "NAGI_POSTGRES_TEST_URL=postgres://postgres:postgres@localhost:5433/nagi_test NAGI_PGMQ_TEST_URL=postgres://postgres:postgres@localhost:5433/nagi_test pnpm -F @nagi-js/postgres -F @nagi-js/pgmq test",
     "typecheck": "pnpm -r typecheck",
     "lint": "biome check --error-on-warnings .",
     "format": "biome format --write .",

@@ -50,7 +50,9 @@
     "kysely": "^0.29.0"
   },
   "devDependencies": {
-    "kysely": "^0.29.0"
+    "@types/pg": "^8.23.1",
+    "kysely": "^0.29.0",
+    "pg": "^8.23.0"
   },
   "repository": {
     "type": "git",
