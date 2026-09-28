@@ -946,8 +946,10 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       eq(msg?.stepId, "s", "re-enqueued stepId");
       eq(msg?.attempt, A2, "re-enqueued attempt");
       eq(msg?.flowId, flowId, "re-enqueued flowId");
-      await claimableAgain(s, runId, "s", "sweepLeases");
+      // Before re-claiming: the re-claim takes a fresh SHORT_LEASE_MS lease a
+      // slow runner can let expire before a later sweep.
       eq(await s.sweepLeases({ now: new Date(), queue }), [], "restart-safe");
+      await claimableAgain(s, runId, "s", "sweepLeases");
     },
   },
   {
