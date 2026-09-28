@@ -1,9 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { InMemoryStreamHub, STREAM_SUBSCRIBER_BUFFER_CAP } from "../stream-hub";
+import {
+  InMemoryStreamHub,
+  STREAM_CLOSED_KEYS_CAP,
+  STREAM_SUBSCRIBER_BUFFER_CAP,
+} from "../stream-hub";
 import type { AttemptNumber, Json, RunId, StepId, StreamEvent } from "../types";
 
 const RUN = "run-1" as RunId;
 const STEP = "gen" as StepId;
+
+// No public surface can tell a retained closed channel from a freed one, so
+// the leak tests read the hub's private maps.
+function held(hub: InMemoryStreamHub): { open: number; closed: string[] } {
+  const h = hub as unknown as {
+    channels: Map<string, unknown>;
+    closedKeys: Set<string>;
+  };
+  return { open: h.channels.size, closed: [...h.closedKeys] };
+}
 
 async function collect(
   iter: AsyncIterable<StreamEvent<Json>>,
@@ -248,6 +262,58 @@ describe("InMemoryStreamHub — close*/closeRun never create a channel (leak-fre
       { kind: "chunk", chunk: "y1" },
       { kind: "chunk", chunk: "y2" },
     ]);
+  });
+});
+
+describe("InMemoryStreamHub — closed channels are freed", () => {
+  it("signalRetry on a never-published step creates no channel (non-streaming retries)", () => {
+    const hub = new InMemoryStreamHub();
+    hub.signalRetry(RUN, STEP, 2 as AttemptNumber);
+    hub.closeOk(RUN, STEP);
+    hub.closeRun(RUN);
+    expect(held(hub)).toEqual({ open: 0, closed: [] });
+  });
+
+  const closers: Record<string, (hub: InMemoryStreamHub) => void> = {
+    closeOk: (hub) => hub.closeOk(RUN, STEP),
+    closeError: (hub) => hub.closeError(RUN, STEP, { name: "E", message: "m" }),
+    closeRun: (hub) => hub.closeRun(RUN),
+  };
+
+  for (const [name, close] of Object.entries(closers)) {
+    it(`${name} drops the channel; a late chunk neither reopens nor buffers`, async () => {
+      const hub = new InMemoryStreamHub();
+      const live = collect(hub.subscribeStream(RUN, STEP));
+      hub.publishChunk(RUN, STEP, "in-time");
+      close(hub);
+      expect((await live)[0]).toEqual({ kind: "chunk", chunk: "in-time" });
+      const afterClose = { open: 0, closed: [`${RUN}::${STEP}`] };
+      expect(held(hub)).toEqual(afterClose);
+
+      hub.publishChunk(RUN, STEP, "late");
+      hub.signalRetry(RUN, STEP, 2 as AttemptNumber);
+      expect(held(hub)).toEqual(afterClose);
+      expect(
+        await collect(hub.subscribeStream(RUN, STEP, { replayBuffered: true })),
+      ).toEqual([]);
+      expect(held(hub)).toEqual(afterClose);
+    });
+  }
+
+  it("remembers at most STREAM_CLOSED_KEYS_CAP closed keys, forgetting the oldest", () => {
+    const hub = new InMemoryStreamHub();
+    const overflow = 5;
+    const total = STREAM_CLOSED_KEYS_CAP + overflow;
+    for (let i = 0; i < total; i++) {
+      const run = `run-${i}` as RunId;
+      hub.publishChunk(run, STEP, i);
+      hub.closeOk(run, STEP);
+    }
+    const { open, closed } = held(hub);
+    expect(open).toBe(0);
+    expect(closed).toHaveLength(STREAM_CLOSED_KEYS_CAP);
+    expect(closed[0]).toBe(`run-${overflow}::${STEP}`);
+    expect(closed.at(-1)).toBe(`run-${total - 1}::${STEP}`);
   });
 });
 

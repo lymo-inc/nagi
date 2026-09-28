@@ -105,9 +105,14 @@ export function startCancelWatcher(args: {
 }): { readonly stop: () => void } {
   const { store, runId, stepId, attempt, ac, intervalMs } = args;
   let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let wake: (() => void) | undefined;
   void (async () => {
     while (!stopped) {
-      await new Promise((r) => setTimeout(r, intervalMs));
+      await new Promise<void>((r) => {
+        wake = r;
+        timer = setTimeout(r, intervalMs);
+      });
       if (stopped) return;
       try {
         const s = await store.loadRunState(runId);
@@ -127,8 +132,12 @@ export function startCancelWatcher(args: {
     }
   })();
   return {
+    // Clear the pending tick, or every settled step strands a timer on the
+    // event loop for up to intervalMs.
     stop: () => {
       stopped = true;
+      if (timer !== undefined) clearTimeout(timer);
+      wake?.();
     },
   };
 }

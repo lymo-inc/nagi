@@ -82,32 +82,64 @@ class Subscriber {
   }
 }
 
+// Closed keys are remembered so a chunk landing after its close (a handler that
+// outlives its step, a NOTIFY behind the close frame) is dropped instead of
+// reopening a channel nothing will ever close. Bounded because late chunks
+// trail their close closely; a late subscriber is already settled by the
+// adapters' durable liveness checks.
+export const STREAM_CLOSED_KEYS_CAP = 1024;
+
 interface Channel {
   readonly subscribers: Set<Subscriber>;
   readonly replay: StreamEvent<Json>[];
-  closed: boolean;
 }
 
+const EMPTY_CLOSED_STREAM: AsyncIterable<StreamEvent<Json>> = {
+  [Symbol.asyncIterator](): AsyncIterator<StreamEvent<Json>> {
+    return { next: async () => ({ value: undefined, done: true }) };
+  },
+};
+
 export class InMemoryStreamHub {
+  // Open channels only: closing one deletes it and records its key.
   private readonly channels = new Map<string, Channel>();
+  private readonly closedKeys = new Set<string>();
 
   private static key(runId: RunId, stepId: StepId): string {
     return `${runId}::${stepId}`;
   }
 
-  private getOrCreate(runId: RunId, stepId: StepId): Channel {
-    const key = InMemoryStreamHub.key(runId, stepId);
+  private openChannel(key: string): Channel | undefined {
+    if (this.closedKeys.has(key)) return undefined;
     let channel = this.channels.get(key);
     if (channel === undefined) {
-      channel = { subscribers: new Set(), replay: [], closed: false };
+      channel = { subscribers: new Set(), replay: [] };
       this.channels.set(key, channel);
     }
     return channel;
   }
 
+  // Returns the subscribers to end, or undefined when no channel was open.
+  private closeChannel(key: string): Subscriber[] | undefined {
+    const channel = this.channels.get(key);
+    if (channel === undefined) return undefined;
+    this.channels.delete(key);
+    this.closedKeys.add(key);
+    if (this.closedKeys.size > STREAM_CLOSED_KEYS_CAP) {
+      const oldest = this.closedKeys.values().next().value;
+      if (oldest !== undefined) this.closedKeys.delete(oldest);
+    }
+    const subs = [...channel.subscribers];
+    // An outstanding iterator still references its channel; don't let it pin
+    // the buffers.
+    channel.subscribers.clear();
+    channel.replay.length = 0;
+    return subs;
+  }
+
   publishChunk(runId: RunId, stepId: StepId, chunk: Json): void {
-    const channel = this.getOrCreate(runId, stepId);
-    if (channel.closed) return;
+    const channel = this.openChannel(InMemoryStreamHub.key(runId, stepId));
+    if (channel === undefined) return;
     const event: StreamEvent<Json> = { kind: "chunk", chunk };
     channel.replay.push(event);
     if (channel.replay.length > STREAM_REPLAY_BUFFER_CAP)
@@ -115,49 +147,37 @@ export class InMemoryStreamHub {
     for (const sub of channel.subscribers) sub.push(event);
   }
 
+  // NB: signalRetry and the close* methods are no-ops when no channel exists.
+  // Both adapters fire them for EVERY step — Postgres cluster-wide — including
+  // non-streaming ones, so creating a channel here would leak one per step.
   signalRetry(runId: RunId, stepId: StepId, attempt: AttemptNumber): void {
-    const channel = this.getOrCreate(runId, stepId);
-    if (channel.closed) return;
+    const channel = this.channels.get(InMemoryStreamHub.key(runId, stepId));
+    if (channel === undefined) return;
     // Reset replay so a late subscriber can't replay a superseded attempt.
     channel.replay.length = 0;
     const event: StreamEvent<Json> = { kind: "retry", attempt };
     for (const sub of channel.subscribers) sub.push(event);
   }
 
-  // NB: no-op when no channel exists. InMemoryStore.appendFact fires this for
-  // EVERY step.completed — including non-streaming steps that never published —
-  // so creating a channel here would leak one per such step. Closed-ness is
-  // authoritative in the durable facts, not the hub.
   closeOk(runId: RunId, stepId: StepId): void {
-    const channel = this.channels.get(InMemoryStreamHub.key(runId, stepId));
-    if (channel === undefined || channel.closed) return;
-    channel.closed = true;
-    channel.replay.length = 0;
-    for (const sub of channel.subscribers) sub.close();
-    channel.subscribers.clear();
+    const subs = this.closeChannel(InMemoryStreamHub.key(runId, stepId));
+    for (const sub of subs ?? []) sub.close();
   }
 
   closeError(runId: RunId, stepId: StepId, error: SerializedError): void {
-    const channel = this.channels.get(InMemoryStreamHub.key(runId, stepId));
-    if (channel === undefined || channel.closed) return;
-    channel.closed = true;
-    channel.replay.length = 0;
+    const subs = this.closeChannel(InMemoryStreamHub.key(runId, stepId));
     const event: StreamEvent<Json> = { kind: "error", error };
-    for (const sub of channel.subscribers) {
+    for (const sub of subs ?? []) {
       sub.push(event);
       sub.close();
     }
-    channel.subscribers.clear();
   }
 
   closeRun(runId: RunId): void {
     const prefix = `${runId}::`;
-    for (const [key, channel] of this.channels) {
-      if (!key.startsWith(prefix) || channel.closed) continue;
-      channel.closed = true;
-      channel.replay.length = 0;
-      for (const sub of channel.subscribers) sub.close();
-      channel.subscribers.clear();
+    for (const key of this.channels.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      for (const sub of this.closeChannel(key) ?? []) sub.close();
     }
   }
 
@@ -166,17 +186,8 @@ export class InMemoryStreamHub {
     stepId: StepId,
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<Json>> {
-    const channel = this.getOrCreate(runId, stepId);
-
-    if (channel.closed) {
-      return {
-        [Symbol.asyncIterator](): AsyncIterator<StreamEvent<Json>> {
-          return {
-            next: async () => ({ value: undefined, done: true }),
-          };
-        },
-      };
-    }
+    const channel = this.openChannel(InMemoryStreamHub.key(runId, stepId));
+    if (channel === undefined) return EMPTY_CLOSED_STREAM;
 
     const sub = new Subscriber();
     if (opts?.replayBuffered === true) {
