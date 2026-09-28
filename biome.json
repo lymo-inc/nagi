@@ -37,7 +37,6 @@
       "!!**/build",
       "!!**/node_modules",
       "!!**/generated",
-      "!!**/.turbo",
       "!!**/.git",
       "!!**/.changeset/*.md",
       "!!**/*.generated.ts"

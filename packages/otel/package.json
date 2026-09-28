@@ -51,7 +51,6 @@
   },
   "devDependencies": {
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/resources": "^1.30.0",
     "@opentelemetry/sdk-trace-base": "^1.30.0"
   },
   "repository": {

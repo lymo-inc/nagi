@@ -49,6 +49,9 @@
   "peerDependencies": {
     "kysely": "^0.29.0"
   },
+  "devDependencies": {
+    "kysely": "^0.29.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lymo-inc/nagi.git",
