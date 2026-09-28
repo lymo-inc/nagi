@@ -417,6 +417,50 @@ describe("streamingTask — INVARIANT GUARDS", () => {
   });
 });
 
+describe("streamingTask — the stream hub holds nothing once a run finishes", () => {
+  it("frees the streaming step's channel and never opens one for a retried non-streaming step", async () => {
+    let flakyCalls = 0;
+    const f = flow({
+      id: "stream-hub-freed",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const gen = b.streamingTask<Record<string, never>, string, string>({
+          run: async ({ ctx }) => {
+            await ctx.emit("tok");
+            return "fin";
+          },
+        });
+        const flaky = b.task({
+          retry: { maxAttempts: 2, backoff: "fixed", initialDelayMs: 0 },
+          run: async () => {
+            flakyCalls += 1;
+            if (flakyCalls === 1) throw new Error("transient");
+            return "ok";
+          },
+        });
+        return { gen, flaky };
+      },
+    });
+
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    const events = collect(h.wf.subscribe<string>(runId, "gen" as StepId));
+    await h.drain();
+    expect(chunks(await events)).toEqual(["tok"]);
+    const result = await h.waitForEnd(runId);
+    expect(result.status).toBe("completed");
+    expect(result.factCount("step.retried")).toBe(1);
+
+    const hub = (
+      h.store as unknown as {
+        streamHub: { channels: Map<string, unknown>; closedKeys: Set<string> };
+      }
+    ).streamHub;
+    expect(hub.channels.size).toBe(0);
+    expect([...hub.closedKeys]).toEqual([`${runId}::gen`]);
+  });
+});
+
 describe("streamingTask — capability gating (D4)", () => {
   it("registering a streaming flow against a store without `stream` throws at nagi()", async () => {
     const f = flow({
