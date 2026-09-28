@@ -1,6 +1,6 @@
 # RFC 0011 — Extract `nextTransition` from the `advance` loop
 
-- **Status:** Accepted (2026-05-21, Jay) — implementation in progress
+- **Status:** Accepted (2026-05-21, Jay) — shipped to `main` in `f926424` (2026-05-21).
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking:** Tier 2 core-simplification pass (follow-up to `c4e1459 feat: implement rfcs`)

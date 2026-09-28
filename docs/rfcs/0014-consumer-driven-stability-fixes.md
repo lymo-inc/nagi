@@ -1,6 +1,6 @@
 # RFC 0014: consumer-driven stability fixes (N1–N12)
 
-- **Status:** APPROVED (Jay, 2026-05-28 JST). Decisions log §6 COMPLETE (11/11). Implementation IN PROGRESS.
+- **Status:** APPROVED (Jay, 2026-05-28 JST). Decisions log §6 COMPLETE (11/11). Shipped to `main` in `3b8e7a9` (2026-05-29).
 - **Date:** 2026-05-28 (JST)
 - **Author:** Claude (Jay-supervised synthesis from 3-agent parallel pipeline)
 - **Decision owner:** Jay

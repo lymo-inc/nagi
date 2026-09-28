@@ -3,7 +3,7 @@
 - **RFC:** `docs/rfcs/0019-streaming-task.md` (Accepted 2026-05-21, Jay — decisions resolved via grill)
 - **Tracking:** lymo-inc/nagi#12 (note: RFC doc number 0019 ≠ issue #12; see Caveats)
 - **Author of impl:** Claude, paired with Jay (2026-05-21 JST) — built via a parallel-subagent pipeline (3 research agents → RFC → grill → 3 implementation agents, diffs reviewed incrementally)
-- **Status:** **Phases A–D complete + tested. Whole `@nagi-js/core` suite green (50 files · 743 tests · typecheck clean) as of 2026-05-22**, composing with your committed core refactor (`e451bfd`) and uncommitted RFC 0020 (onLog). **Not committed / no PR** — the working tree intermixes #12 with your RFC 0020 work in shared files; sequencing is your call (see "Caveats").
+- **Status:** Phases A–D shipped to `main` in `5cbca32` (2026-05-22). The notes below describe the working tree at handoff time.
 
 ## What landed (in the working tree)
 

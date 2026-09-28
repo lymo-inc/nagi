@@ -1,6 +1,6 @@
 # RFC 0021 — Core internal reorganization: split `dispatch.ts`, split `types.ts` + curate the door
 
-- **Status:** Implemented in the working tree (2026-05-23) — not committed (Jay sequences). Accepted 2026-05-23, Jay.
+- **Status:** Accepted 2026-05-23, Jay — shipped to `main` in `f52d698` (2026-05-23).
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-23 (JST)
 - **Tracking:** Follow-up to the `@nagi-js/core` interface/module redesign. Slices §1 (needs default-to-`T` + `optional()`), §2 (fact ownership), §3 (Store dedup + `StreamTransport`) are **implemented in the working tree**; this RFC covers the held slices §4 and §5, plus the §1 follow-up to remove `cascade` (Part C).

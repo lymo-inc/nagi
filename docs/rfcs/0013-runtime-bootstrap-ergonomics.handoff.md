@@ -3,9 +3,7 @@
 - **RFC:** `docs/rfcs/0013-runtime-bootstrap-ergonomics.md` (Accepted 2026-05-21, Jay — decisions resolved via grill)
 - **Tracking:** lymo-inc/nagi#17
 - **Author of impl:** Claude, paired with Jay (2026-05-21 JST)
-- **Status:** Implemented + tested. **Not committed / no PR** — the working tree
-  intermixes #17 with your concurrent #18 / #20 / fold-parent-link work in shared
-  files; sequencing is your call (see "Caveats").
+- **Status:** Shipped to `main` in `3334319` (2026-05-21). The notes below describe the working tree at handoff time.
 
 ## What landed (in the working tree)
 

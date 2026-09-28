@@ -3,7 +3,7 @@
 - **RFC:** `docs/rfcs/0010-otel-subflow-span-linkage.md`
 - **Issue:** lymo-inc/nagi#10 (follow-up to the shipped subflow runtime)
 - **Author of impl:** Claude, dispatched by Jay (2026-05-20 JST)
-- **Status:** Implemented + tested in `@nagi-js/otel` (54/54 pass). Awaiting Jay's decision on PR strategy (see "Caveats").
+- **Status:** Shipped to `main` in `f926424` (2026-05-21). The notes below describe the working tree at handoff time.
 
 ## What landed
 

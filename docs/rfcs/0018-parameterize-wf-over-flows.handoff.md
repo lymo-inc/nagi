@@ -3,7 +3,7 @@
 - **RFC:** `docs/rfcs/0018-parameterize-wf-over-flows.md`
 - **Tracking issue:** #18
 - **Author:** Claude (paired with @jay)
-- **Status:** Implemented + green locally — **NOT committed, NOT PR'd** (Jay sequences; see Caveats)
+- **Status:** Shipped to `main` in `3334319` (2026-05-21). The notes below describe the working tree at handoff time.
 - **Date:** 2026-05-21 (JST)
 
 ## ⚠ Sequencing caveat — read first

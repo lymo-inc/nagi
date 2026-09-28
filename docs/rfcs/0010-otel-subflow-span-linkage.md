@@ -1,6 +1,6 @@
 # RFC 0010 — OTel parent-span linkage for subflow runs
 
-- **Status:** Implemented (2026-05-21 JST) — `@nagi-js/otel` 54/54 tests pass, typecheck clean. See `0010-otel-subflow-span-linkage.handoff.md`.
+- **Status:** Implemented — shipped to `main` in `f926424` (2026-05-21). See `0010-otel-subflow-span-linkage.handoff.md`.
 - **Author:** @jay (lymo-inc)
 - **Created:** 2026-05-20 (JST)
 - **Tracking issue:** lymo-inc/nagi#10 (follow-up — main runtime shipped in `c4e1459`)

@@ -14,12 +14,12 @@ request a plan for it.
 
 | Plan | Title | Priority | Effort | Depends on | Issue | Status |
 |------|-------|----------|--------|------------|-------|--------|
-| 001  | Add CI and make lint/verify/release gate on tests | P1 | S | — | [#43](https://github.com/lymo-inc/nagi/issues/43) | IN PROGRESS |
-| 002  | Re-drive a run on redelivery so a lost `advance` self-heals | P1 | S | 001 (soft) | [#44](https://github.com/lymo-inc/nagi/issues/44) | IN PROGRESS |
-| 003  | PGMQ default visibility timeout above the heartbeat; lease expiry on the DB clock | P1 | S | 001 (soft) | [#45](https://github.com/lymo-inc/nagi/issues/45) | IN PROGRESS |
-| 004  | Clear a step's buffered signal on delivery and on `step.reset` | P1 | S | — | [#46](https://github.com/lymo-inc/nagi/issues/46) | DONE — reviewed & approved 2026-09-04; branch `advisor/004-clear-buffered-signals` @ `e0d1c7c` (worktree `.claude/worktrees/agent-a4bcaefdd8a8f3c83`), not merged |
-| 005  | Fault-isolate each run in the signal-timeout sweep | P1 | S | — | [#47](https://github.com/lymo-inc/nagi/issues/47) | IN PROGRESS |
-| 006  | Reopen a completed/failed run on `step.reset` (replay / operator.retry finish the job) | P1 | M | 004 | [#48](https://github.com/lymo-inc/nagi/issues/48) | IN PROGRESS (on top of 004's branch) |
+| 001  | Add CI and make lint/verify/release gate on tests | P1 | S | — | [#43](https://github.com/lymo-inc/nagi/issues/43) | DONE — PR #56 (`33516d7`) |
+| 002  | Re-drive a run on redelivery so a lost `advance` self-heals | P1 | S | 001 (soft) | [#44](https://github.com/lymo-inc/nagi/issues/44) | DONE — PR #57 (`4d4b178`) |
+| 003  | PGMQ default visibility timeout above the heartbeat; lease expiry on the DB clock | P1 | S | 001 (soft) | [#45](https://github.com/lymo-inc/nagi/issues/45) | DONE — PR #60 (`7867f5c`) |
+| 004  | Clear a step's buffered signal on delivery and on `step.reset` | P1 | S | — | [#46](https://github.com/lymo-inc/nagi/issues/46) | DONE — PR #58 (`0d1203c`) |
+| 005  | Fault-isolate each run in the signal-timeout sweep | P1 | S | — | [#47](https://github.com/lymo-inc/nagi/issues/47) | DONE — PR #59 (`eff6275`) |
+| 006  | Reopen a completed/failed run on `step.reset` (replay / operator.retry finish the job) | P1 | M | 004 | [#48](https://github.com/lymo-inc/nagi/issues/48) | DONE — PR #61 (`6d9c0c5`) |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale — finding fixed independently or approach abandoned)
 
@@ -43,6 +43,17 @@ warning · `pnpm audit --prod` clean · no CI.
 ## Backlog — vetted findings without a plan yet
 
 Ordered roughly by leverage. IDs are stable; ask for "a plan for C-06" etc.
+
+Re-triaged against `3897fc9` on 2026-09-28. Resolved since the audit:
+C-05 (`bbeeef7`), D-07 (`b10921c`), DIR-01 (`d468140`), DIR-02 (`c1e0331`),
+DIR-04 (`b35291a`), DIR-05 (`37086c5`), DOC-01 (RFC status lines refreshed
+in the same change as this note).
+Partly resolved: C-10 (`b10921c` fixed leases, sweep and prune; stream-hub
+channels still leak), C-11 (`179d3e7` fixed `runUntilEmpty`), D-03 (CI runs
+the suite, `describe()` covered by `storeContract`; still skips silently),
+DOC-03 (`storeContract` + `OPERATIONS.md`; setup prerequisites still
+undocumented), A-02 (`4a0da4a`: ordered within one process, not across
+processes). Everything else below is still open.
 
 **Correctness (core)**
 - **C-01b** `wf.start` enqueues the first steps *after* the run row commits

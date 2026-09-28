@@ -2,7 +2,7 @@
 
 - **RFC:** `docs/rfcs/0011-next-transition-state-machine.md` (Accepted 2026-05-21, Jay)
 - **Author of impl:** Claude, paired with Jay (2026-05-21 JST)
-- **Status:** Implemented + tested. **Not committed / no PR** — working tree is a multi-feature pile that needs Jay's sequencing decision (see "Caveats").
+- **Status:** Shipped to `main` in `f926424` (2026-05-21). The notes below describe the working tree at handoff time.
 
 ## What landed (in the working tree)
 
