@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
@@ -157,12 +157,11 @@ describe("activity steps", () => {
 
     try {
       const runId = await wf.start(f, {});
-      const start = Date.now();
-      while (Date.now() - start < 3_000) {
-        if (isTerminalRun(await store.loadRunState(runId))) break;
-        await new Promise((r) => setTimeout(r, 5));
-      }
-      expect(isTerminalRun(await store.loadRunState(runId))).toBe(true);
+      await vi.waitFor(
+        async () =>
+          expect(isTerminalRun(await store.loadRunState(runId))).toBe(true),
+        { timeout: 3_000, interval: 5 },
+      );
       expect(runs).toBe(1);
     } finally {
       ac.abort();

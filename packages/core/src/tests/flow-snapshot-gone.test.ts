@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import { NagiSnapshotDriftError } from "../errors";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
@@ -247,12 +247,11 @@ describe("NagiFlowSnapshotGoneError", () => {
     const worker = wfA.worker({ pollIntervalMs: 1, signal: ac.signal });
     const done = worker.run();
     try {
-      const start = Date.now();
-      while (Date.now() - start < 2_000) {
-        const s = await store.loadRunState(runId);
-        if (s.phase.tag === "completed") break;
-        await new Promise((r) => setTimeout(r, 5));
-      }
+      await vi.waitFor(
+        async () =>
+          expect((await store.loadRunState(runId)).phase.tag).toBe("completed"),
+        { timeout: 2_000, interval: 5 },
+      );
     } finally {
       ac.abort();
       await done;

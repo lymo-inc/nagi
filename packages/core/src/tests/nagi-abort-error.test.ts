@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import { type CancelArgs, NagiAbortError, type RunId } from "../index";
 import { makeHarness, passthroughSchema } from "./test-helpers";
@@ -105,12 +105,13 @@ describe("NagiAbortError shape (N12, D10=A)", () => {
     const h = await makeHarness(f);
     const firstRunId = await h.wf.start(f, { key: "k1" });
     const dispatching = h.drainOnce(1);
-    // Wait until a is observed running before superseding it.
-    for (let i = 0; i < 200; i++) {
-      const s = await h.store.loadRunState(firstRunId);
-      if (s.steps["a"]?.tag === "running") break;
-      await new Promise((r) => setTimeout(r, 5));
-    }
+    await vi.waitFor(
+      async () =>
+        expect((await h.store.loadRunState(firstRunId)).steps["a"]?.tag).toBe(
+          "running",
+        ),
+      { interval: 5 },
+    );
     await h.wf.start(f, { key: "k1" });
     release();
     await dispatching;

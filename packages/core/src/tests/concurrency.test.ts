@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import {
   NagiCanceledError,
@@ -306,10 +306,13 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
 
     const dispatching = h.drainOnce(1);
 
-    await waitFor(async () => {
-      const s = await h.store.loadRunState(firstRunId);
-      return s.steps["analyze"]?.tag === "running";
-    });
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await h.store.loadRunState(firstRunId)).steps["analyze"]?.tag,
+        ).toBe("running"),
+      { interval: 2 },
+    );
 
     await h.wf.start(f, { videoId: "v1" });
     const midState = await h.store.loadRunState(firstRunId);
@@ -358,10 +361,13 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     const firstRunId = await h.wf.start(f, { videoId: "v1" });
     const dispatching = h.drainOnce(1);
 
-    await waitFor(async () => {
-      const s = await h.store.loadRunState(firstRunId);
-      return s.steps["analyze"]?.tag === "running";
-    });
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await h.store.loadRunState(firstRunId)).steps["analyze"]?.tag,
+        ).toBe("running"),
+      { interval: 2 },
+    );
 
     await h.wf.start(f, { videoId: "v1" });
 
@@ -403,10 +409,13 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
 
     const firstRunId = await h.wf.start(f, { videoId: "v1" });
     const dispatching = h.drainOnce(1);
-    await waitFor(async () => {
-      const s = await h.store.loadRunState(firstRunId);
-      return s.steps["analyze"]?.tag === "running";
-    });
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await h.store.loadRunState(firstRunId)).steps["analyze"]?.tag,
+        ).toBe("running"),
+      { interval: 2 },
+    );
     await h.wf.start(f, { videoId: "v1" });
     barrier.release();
     await dispatching;
@@ -776,16 +785,4 @@ function createBarrier(): Barrier {
     release = r;
   });
   return { wait, release };
-}
-
-async function waitFor(
-  pred: () => Promise<boolean>,
-  timeoutMs = 1_000,
-): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (await pred()) return;
-    await new Promise((r) => setTimeout(r, 2));
-  }
-  throw new Error(`waitFor: timeout after ${timeoutMs}ms`);
 }
