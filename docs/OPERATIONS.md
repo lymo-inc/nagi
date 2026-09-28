@@ -21,8 +21,10 @@ traffic, with the same `schema` you pass to `postgresStore()` (default
   large table, apply the equivalent yourself and record the id — the `0008`
   recipe under [Retention and superseded runs](#retention-and-superseded-runs)
   is the pattern.
-- No cross-process lock. Run it once per deploy, not from every replica's
-  startup; concurrent runs can race on the same migration, and the loser throws.
+- Concurrent `migrate()` calls against the same schema serialize on a session
+  advisory lock (`nagi:migrate:<schema>`): the first applies, and the rest
+  wait, then skip. Running it from every replica's startup is safe; running it
+  once per deploy is still cheaper.
 - It opens with `CREATE SCHEMA IF NOT EXISTS <schema>`, which PostgreSQL checks
   against `CREATE` on the database even when the schema exists
   (`permission denied for database <db>`). Run it as a role that has it.

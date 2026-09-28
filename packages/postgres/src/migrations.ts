@@ -237,38 +237,47 @@ export async function migrate<DB>(
   const schema = opts.schema ?? "nagi";
   assertValidSchema(schema);
 
-  const applied: string[] = [];
-  const skipped: string[] = [];
+  // Session-level lock: it and the migrations must share one connection.
+  return db.connection().execute(async (conn) => {
+    const key = `nagi:migrate:${schema}`;
+    await sql`SELECT pg_advisory_lock(hashtext(${key}))`.execute(conn);
+    try {
+      const applied: string[] = [];
+      const skipped: string[] = [];
 
-  await sql
-    .raw(
-      `CREATE SCHEMA IF NOT EXISTS ${schema};
-       CREATE TABLE IF NOT EXISTS ${schema}.schema_migrations (
-         id         text        PRIMARY KEY,
-         applied_at timestamptz NOT NULL DEFAULT now()
-       );`,
-    )
-    .execute(db);
+      await sql
+        .raw(
+          `CREATE SCHEMA IF NOT EXISTS ${schema};
+           CREATE TABLE IF NOT EXISTS ${schema}.schema_migrations (
+             id         text        PRIMARY KEY,
+             applied_at timestamptz NOT NULL DEFAULT now()
+           );`,
+        )
+        .execute(conn);
 
-  for (const m of migrations) {
-    await db.transaction().execute(async (tx) => {
-      const existing = await sql<{ id: string }>`
-        SELECT id FROM ${sql.raw(`${schema}.schema_migrations`)}
-         WHERE id = ${m.id}
-      `.execute(tx);
-      if (existing.rows.length > 0) {
-        skipped.push(m.id);
-        return;
+      for (const m of migrations) {
+        await conn.transaction().execute(async (tx) => {
+          const existing = await sql<{ id: string }>`
+            SELECT id FROM ${sql.raw(`${schema}.schema_migrations`)}
+             WHERE id = ${m.id}
+          `.execute(tx);
+          if (existing.rows.length > 0) {
+            skipped.push(m.id);
+            return;
+          }
+          await sql.raw(m.sql(schema)).execute(tx);
+          await sql`
+            INSERT INTO ${sql.raw(`${schema}.schema_migrations`)} (id) VALUES (${m.id})
+          `.execute(tx);
+          applied.push(m.id);
+        });
       }
-      await sql.raw(m.sql(schema)).execute(tx);
-      await sql`
-        INSERT INTO ${sql.raw(`${schema}.schema_migrations`)} (id) VALUES (${m.id})
-      `.execute(tx);
-      applied.push(m.id);
-    });
-  }
 
-  return { applied, skipped };
+      return { applied, skipped };
+    } finally {
+      await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn);
+    }
+  });
 }
 
 function assertValidSchema(schema: string): void {
