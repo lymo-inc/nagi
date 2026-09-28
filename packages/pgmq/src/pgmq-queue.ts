@@ -18,6 +18,9 @@ const DEFAULT_QUEUE_NAME = "nagi";
 // DEFAULT_HEARTBEAT_LEASE_MS so a crashed worker's message and its store
 // lease become reclaimable at the same time.
 const DEFAULT_VISIBILITY_TIMEOUT_MS: Millis = 120_000;
+// pgmq's client rule (max 47 keeps archived_at_idx_<name> within 63 bytes);
+// stricter than the extension because inspect() splices it unquoted.
+const QUEUE_NAME_RE = /^[A-Za-z0-9_]{1,47}$/;
 
 export interface PgmqQueueOpts<DB = unknown> {
   readonly db: Kysely<DB>;
@@ -48,12 +51,17 @@ interface QueueConfig {
 }
 
 export function pgmqQueue<DB = unknown>(opts: PgmqQueueOpts<DB>): PgmqQueue {
+  const queueName = opts.queueName ?? DEFAULT_QUEUE_NAME;
+  if (!QUEUE_NAME_RE.test(queueName)) {
+    throw new Error(
+      `@nagi-js/pgmq: invalid queue name "${queueName}". Must match ${QUEUE_NAME_RE}.`,
+    );
+  }
   // Caller-installed Kysely plugins (notably CamelCasePlugin) rewrite the result
   // transformer, turning our internal `msg_id` reads into `msgId` and breaking
   // parseReceipt. Strip plugins from the executor used for our own SQL only —
   // the caller's `db` is untouched so their CamelCase reads still work.
   const db = stripPlugins(opts.db as unknown as Kysely<unknown>);
-  const queueName = opts.queueName ?? DEFAULT_QUEUE_NAME;
   const vtSeconds = Math.max(
     1,
     Math.ceil(
@@ -120,11 +128,12 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
     async dequeue({
       count,
     }: QueueDequeueOpts): Promise<readonly QueueMessage[]> {
+      // ::text: a consumer int8 parser would round msg_id past 2^53.
       const { rows } = await sql<{
-        msg_id: string | number | bigint;
+        msg_id: string;
         read_ct: number;
         message: unknown;
-      }>`SELECT msg_id, read_ct, message FROM pgmq.read(${queueName}, ${vtSeconds}::int, ${count}::int)`.execute(
+      }>`SELECT msg_id::text AS msg_id, read_ct, message FROM pgmq.read(${queueName}, ${vtSeconds}::int, ${count}::int)`.execute(
         executor,
       );
       return rows.map((row) =>
@@ -190,7 +199,7 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
 }
 
 function projectMessage(
-  rawMsgId: string | number | bigint,
+  msgId: string,
   raw: unknown,
   readCount: number,
 ): QueueMessage {
@@ -207,7 +216,7 @@ function projectMessage(
   }
   const envelope = raw as MessageEnvelope;
   return {
-    receipt: String(rawMsgId),
+    receipt: msgId,
     runId: envelope.runId as RunId,
     stepId: envelope.stepId as StepId,
     attempt: envelope.attempt as AttemptNumber,

@@ -7,6 +7,55 @@ import { createCapturingDb } from "./test-helpers";
 const runId = "run-1" as RunId;
 const stepId = "stepA" as StepId;
 
+describe("pgmqQueue queue name validation", () => {
+  it.each([
+    "nagi",
+    "a",
+    "_",
+    "0",
+    "my_queue_2",
+    "MyQueue",
+    "a".repeat(47),
+  ])("accepts %j", (queueName) => {
+    const fake = createCapturingDb();
+    expect(() => pgmqQueue({ db: fake.db, queueName })).not.toThrow();
+  });
+
+  it.each([
+    "",
+    "a".repeat(48),
+    "my-queue",
+    "my queue",
+    "my.queue",
+    "nagi; DROP TABLE users",
+    "nagi WHERE true --",
+    "x'y",
+    'x"y',
+    "nagi$1",
+    "nagi\n",
+    "nagï",
+  ])("rejects %j at construction, before any SQL", (queueName) => {
+    const fake = createCapturingDb();
+    expect(() => pgmqQueue({ db: fake.db, queueName })).toThrow(
+      /@nagi-js\/pgmq: invalid queue name/,
+    );
+    expect(fake.queries).toHaveLength(0);
+  });
+});
+
+describe("pgmqQueue.inspect", () => {
+  it("reads the queue's pgmq.q_<name> table", async () => {
+    const fake = createCapturingDb();
+    fake.enqueueRows([]);
+    const q = pgmqQueue({ db: fake.db, queueName: "audit" });
+
+    await q.inspect?.(runId);
+
+    expect(fake.queries[0]?.sql).toContain("FROM pgmq.q_audit");
+    expect(fake.queries[0]?.parameters).toEqual(["run-1"]);
+  });
+});
+
 describe("pgmqQueue.enqueue", () => {
   it("calls pgmq.send with default queue, attempt=1, zero delay", async () => {
     const fake = createCapturingDb();
@@ -68,11 +117,11 @@ describe("pgmqQueue.dequeue", () => {
     expect(query?.parameters).toEqual(["nagi", 120, 1]);
   });
 
-  it("projects rows to QueueMessage with receipt = String(msg_id)", async () => {
+  it("projects rows to QueueMessage with receipt = msg_id", async () => {
     const fake = createCapturingDb();
     fake.enqueueRows([
       { msg_id: "42", message: { runId: "r1", stepId: "s1", attempt: 1 } },
-      { msg_id: 99, message: { runId: "r2", stepId: "s2", attempt: 2 } },
+      { msg_id: "99", message: { runId: "r2", stepId: "s2", attempt: 2 } },
     ]);
     const q = pgmqQueue({ db: fake.db });
 
@@ -82,6 +131,22 @@ describe("pgmqQueue.dequeue", () => {
       { receipt: "42", runId: "r1", stepId: "s1", attempt: 1, payload: null },
       { receipt: "99", runId: "r2", stepId: "s2", attempt: 2, payload: null },
     ]);
+  });
+
+  it("reads msg_id as text so a bigint past 2^53 survives any int8 type parser", async () => {
+    const fake = createCapturingDb();
+    fake.enqueueRows([
+      {
+        msg_id: "9007199254740993",
+        message: { runId: "r1", stepId: "s1", attempt: 1 },
+      },
+    ]);
+    const q = pgmqQueue({ db: fake.db });
+
+    const messages = await q.dequeue({ count: 1 });
+
+    expect(fake.queries[0]?.sql).toContain("msg_id::text AS msg_id");
+    expect(messages[0]?.receipt).toBe("9007199254740993");
   });
 
   it("throws on a malformed envelope", async () => {
