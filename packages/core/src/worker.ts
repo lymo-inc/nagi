@@ -45,7 +45,7 @@ export function makeWorker(deps: WorkerDeps, config?: WorkerConfig): Worker {
 }
 
 class WorkerImpl implements Worker {
-  private inFlight = 0;
+  private readonly inFlight = new Set<Promise<void>>();
   private readonly concurrency: number;
   private readonly pollIntervalMs: Millis;
   private readonly dequeueBackoffMs: Backoff;
@@ -133,7 +133,7 @@ class WorkerImpl implements Worker {
       // so signal timeouts fire and dead leases are reaped on cadence
       // regardless of load.
       await this.runDueSweeps();
-      const slots = this.concurrency - this.inFlight;
+      const slots = this.concurrency - this.inFlight.size;
       if (slots <= 0) {
         await this.sleep(50);
         continue;
@@ -234,12 +234,12 @@ class WorkerImpl implements Worker {
   }
 
   private fire(msg: QueueMessage): void {
-    this.inFlight++;
     const release = this.trackFlow(msg);
-    void this.dispatchSafely(msg).finally(() => {
+    const dispatch = this.dispatchSafely(msg).finally(() => {
       release();
-      this.inFlight = Math.max(0, this.inFlight - 1);
+      this.inFlight.delete(dispatch);
     });
+    this.inFlight.add(dispatch);
   }
 
   private async dispatchSafely(msg: QueueMessage): Promise<void> {
@@ -341,8 +341,8 @@ class WorkerImpl implements Worker {
   }
 
   private async drain(): Promise<void> {
-    while (this.inFlight > 0) {
-      await this.deps.clock.sleep(50);
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled(this.inFlight);
     }
   }
 

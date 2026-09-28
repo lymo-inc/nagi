@@ -134,7 +134,7 @@ export function makeMessage(
     } catch (err) {
       outcome = await handleStepError({ flow, message, def, err });
     } finally {
-      heartbeat.stop();
+      await heartbeat.stop();
     }
 
     await interpret({ flow, message, def, startedAt, outcome });
@@ -434,7 +434,7 @@ export function makeMessage(
     } catch (err) {
       throw unwrapDeadline(err, ac.signal);
     } finally {
-      watcher.stop();
+      await watcher.stop();
       deadline?.stop();
     }
   }
