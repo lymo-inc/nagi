@@ -297,7 +297,9 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
 
     expect(await store.listChildren(parentId)).toEqual([]);
     expect((await store.loadRunState(childId)).facts).toEqual([]);
-    expect(await store.getOnce(childId, "s1", "scope")).toBeNull();
+    expect(await store.getOnce(childId, "s1", "scope")).toEqual({
+      tag: "miss",
+    });
     expect(await store.claimStep(childId, "s2", 1)).toBeTruthy();
   });
 });

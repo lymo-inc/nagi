@@ -115,11 +115,19 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     const store = postgresStore({ db, schema });
     const runId = `run-${uuidv7()}` as RunId;
 
-    expect(await store.getOnce(runId, "step", "scope")).toBeNull();
+    expect(await store.getOnce(runId, "step", "scope")).toEqual({
+      tag: "miss",
+    });
     await store.recordOnce(runId, "step", "scope", { value: 1 });
-    expect(await store.getOnce(runId, "step", "scope")).toEqual({ value: 1 });
+    expect(await store.getOnce(runId, "step", "scope")).toEqual({
+      tag: "hit",
+      value: { value: 1 },
+    });
     await store.recordOnce(runId, "step", "scope", { value: 2 });
-    expect(await store.getOnce(runId, "step", "scope")).toEqual({ value: 1 });
+    expect(await store.getOnce(runId, "step", "scope")).toEqual({
+      tag: "hit",
+      value: { value: 1 },
+    });
   });
 
   it("claimStep returns null on a live lease", async () => {
