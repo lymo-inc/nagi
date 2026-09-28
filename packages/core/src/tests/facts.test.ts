@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { type Fact, type FactKind, Facts, foldRun, rowDeltaOf } from "../facts";
+import {
+  type Fact,
+  type FactKind,
+  Facts,
+  factConsequences,
+  foldRun,
+} from "../facts";
 import type { RunId } from "../types";
 
 const runId = "run-facts" as RunId;
@@ -29,7 +35,7 @@ describe("foldRun on persisted logs", () => {
     const withForeign = foldRun(runId, [started, foreign]);
     const without = foldRun(runId, [started]);
     expect(withForeign.steps).toEqual(without.steps);
-    expect(rowDeltaOf(foreign)).toBeNull();
+    expect(rowsOf(foreign)).toBeNull();
   });
 
   it("keeps the prior step state on a contradictory fact", () => {
@@ -45,7 +51,9 @@ describe("foldRun on persisted logs", () => {
   });
 });
 
-describe("rowDeltaOf", () => {
+const rowsOf = (fact: Fact) => factConsequences(fact).rows;
+
+describe("factConsequences", () => {
   const stepId = "s";
   const error = { name: "E", message: "m" };
   const samples: { readonly [K in FactKind]: Extract<Fact, { kind: K }> } = {
@@ -73,14 +81,6 @@ describe("rowDeltaOf", () => {
       at,
     }),
     "match.arm-selected": Facts.matchArmSelected(runId, stepId, "a", at),
-    "once.recorded": {
-      kind: "once.recorded",
-      runId,
-      stepId,
-      scope: "x",
-      value: 1,
-      at,
-    },
     "signal.received": Facts.signalReceived({ runId, stepId, payload: 1, at }),
     "signal.buffered": Facts.signalBuffered({ runId, stepId, payload: 1, at }),
     "lease.reaped": Facts.leaseReaped({
@@ -94,7 +94,7 @@ describe("rowDeltaOf", () => {
 
   it("declares exactly the audit-only kinds as log-only", () => {
     const logOnly = Object.entries(samples)
-      .filter(([, fact]) => rowDeltaOf(fact) === null)
+      .filter(([, fact]) => rowsOf(fact) === null)
       .map(([kind]) => kind)
       .sort();
     expect(logOnly).toEqual([
@@ -103,38 +103,44 @@ describe("rowDeltaOf", () => {
       "signal.buffered",
       "signal.received",
       "step.abort-requested",
-      "step.retried",
     ]);
   });
 
   it("projects the run/step rows the read model needs", () => {
-    expect(rowDeltaOf(samples["flow.canceled"])).toEqual({
+    expect(rowsOf(samples["flow.canceled"])).toEqual({
       row: "run",
       status: "canceled",
       canceledByRunId: "other",
       completedAt: at,
     });
     expect(
-      rowDeltaOf(
-        Facts.flowCanceled(runId, { cause: "explicit", reason: "r" }, at),
-      ),
+      rowsOf(Facts.flowCanceled(runId, { cause: "explicit", reason: "r" }, at)),
     ).toEqual({
       row: "run",
       status: "canceled",
       canceledByRunId: null,
       completedAt: at,
     });
-    expect(rowDeltaOf(samples["step.canceled"])).toEqual({
+    expect(rowsOf(samples["step.canceled"])).toEqual({
       row: "step",
       status: "canceled",
       stepId,
       attempt: 1,
       error: null,
+      completedAt: at,
     });
-    expect(rowDeltaOf(samples["step.skipped"])).toEqual({
+    expect(rowsOf(samples["step.skipped"])).toEqual({
       row: "step",
       status: "skipped",
       stepId,
+      completedAt: at,
+    });
+    expect(rowsOf(samples["step.retried"])).toEqual({
+      row: "step",
+      status: "backoff",
+      stepId,
+      attempt: 1,
+      error,
     });
   });
 });

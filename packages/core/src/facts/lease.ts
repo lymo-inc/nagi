@@ -37,7 +37,18 @@ export const leaseFacts = {
 } as const;
 
 export const leaseKinds = {
-  // Audit-only: the reaper re-enqueues at attempt+1; the projection updates
-  // when the next attempt writes its step.started/step.failed.
-  "lease.reaped": { fold: () => {}, rows: null },
+  // The reaper re-enqueues at attempt+1; the projection updates when the next
+  // attempt writes its step.started/step.failed. Only the reaped attempt's
+  // lease goes: a newer attempt may already hold its own.
+  "lease.reaped": {
+    fold: () => {},
+    rows: null,
+    release: (fact) => ({
+      tag: "release-lease",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+    }),
+    stream: null,
+    event: null,
+  },
 } satisfies KindTable<LeaseFact>;

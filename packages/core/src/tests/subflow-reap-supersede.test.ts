@@ -99,7 +99,7 @@ describe("b.subflow — lease-reap does not self-supersede (prod-faithful)", () 
     // Simulate the child finishing while the in-process wake is LOST (a crash
     // between the child's terminal commit and propagateToParent): write the
     // child's terminal fact directly, so the parent stays awaitingChild.
-    await h.store.appendFact(
+    await h.store.endRun(
       childRunId,
       Facts.flowCompleted(childRunId, { y: 42 }, new Date()),
     );

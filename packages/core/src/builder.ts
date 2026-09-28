@@ -1,9 +1,10 @@
 import {
-  type ActivityDef,
   type ArmGuard,
   attachDef,
   compact,
   type Guard,
+  type HandlerDef,
+  type HandlerKind,
   type MatchArmDef,
   type MatchDef,
   type NeedRefDef,
@@ -14,9 +15,7 @@ import {
   peekDef,
   type SignalDef,
   type StepDef,
-  type StreamingTaskDef,
   type SubflowDef,
-  type TaskDef,
 } from "./internal";
 import type {
   ActivityConfig,
@@ -29,7 +28,7 @@ import type {
   InferSchemaOutput,
   Json,
   MatchArm,
-  MatchGuardConfig,
+  MatchArmOutput,
   NeedsMap,
   Optional,
   ResolvedConcurrency,
@@ -44,64 +43,28 @@ import type {
 } from "./types";
 
 function makeBuilder<Input>(): Builder<Input> {
-  function task<N extends NeedsMap, O>(
-    config: TaskConfig<Input, N, O>,
+  function handler<N extends NeedsMap, O>(
+    kind: HandlerKind,
+    config:
+      | TaskConfig<Input, N, O>
+      | ActivityConfig<Input, N, O>
+      | StreamingTaskConfig<Input, N, O, unknown>,
   ): Step<O> {
-    const def: TaskDef = {
-      kind: "task",
+    const def: HandlerDef = {
+      kind,
       needs: normalizeNeeds(config.needs),
-      run: config.run as TaskDef["run"],
+      run: config.run as HandlerDef["run"],
       ...compact({
         retry: config.retry,
         timeoutMs: config.timeoutMs,
-        when: config.when as TaskDef["when"],
+        when: config.when as HandlerDef["when"],
         onStart: config.onStart,
-        onComplete: config.onComplete as TaskDef["onComplete"],
+        onComplete: config.onComplete as HandlerDef["onComplete"],
         onError: config.onError,
         onRetry: config.onRetry,
       }),
     };
-    return attachDef<O>({ kind: "task", id: "" }, def);
-  }
-
-  function activity<N extends NeedsMap, O>(
-    config: ActivityConfig<Input, N, O>,
-  ): Step<O> {
-    const def: ActivityDef = {
-      kind: "activity",
-      needs: normalizeNeeds(config.needs),
-      run: config.run as ActivityDef["run"],
-      ...compact({
-        retry: config.retry,
-        timeoutMs: config.timeoutMs,
-        when: config.when as ActivityDef["when"],
-        onStart: config.onStart,
-        onComplete: config.onComplete as ActivityDef["onComplete"],
-        onError: config.onError,
-        onRetry: config.onRetry,
-      }),
-    };
-    return attachDef<O>({ kind: "activity", id: "" }, def);
-  }
-
-  function streamingTask<N extends NeedsMap, O, C = Json>(
-    config: StreamingTaskConfig<Input, N, O, C>,
-  ): Step<O> {
-    const def: StreamingTaskDef = {
-      kind: "streaming",
-      needs: normalizeNeeds(config.needs),
-      run: config.run as StreamingTaskDef["run"],
-      ...compact({
-        retry: config.retry,
-        timeoutMs: config.timeoutMs,
-        when: config.when as StreamingTaskDef["when"],
-        onStart: config.onStart,
-        onComplete: config.onComplete as StreamingTaskDef["onComplete"],
-        onError: config.onError,
-        onRetry: config.onRetry,
-      }),
-    };
-    return attachDef<O>({ kind: "streaming", id: "" }, def);
+    return attachDef<O>({ kind, id: "" }, def);
   }
 
   function signal<N extends NeedsMap, S extends StandardSchemaV1>(
@@ -139,31 +102,32 @@ function makeBuilder<Input>(): Builder<Input> {
     );
   }
 
-  function match(
-    config: MatchGuardConfig<Input, NeedsMap, StepMap>,
-  ): Step<unknown> {
+  function match<
+    N extends NeedsMap,
+    Arms extends ReadonlyArray<MatchArm<Input, N, StepMap>>,
+  >(config: {
+    readonly needs?: N;
+    readonly arms: Arms;
+  }): Step<MatchArmOutput<ReturnType<Arms[number]["build"]>>> {
     const needs = normalizeNeeds(config.needs);
-    const arms: PendingMatchArm[] = [];
-    for (let i = 0; i < config.arms.length; i++) {
-      const arm = config.arms[i] as MatchArm<Input, NeedsMap, StepMap>;
-      const nested = arm.build(makeBuilder<Input>()) as StepMap;
+    const arms: PendingMatchArm[] = config.arms.map((arm, i) => {
       const guard: ArmGuard = arm.otherwise
         ? { kind: "otherwise" }
         : { kind: "when", when: arm.when as Guard };
       const armId = guard.kind === "otherwise" ? "otherwise" : `arm${i}`;
-      arms.push({ id: armId, guard, nested });
-    }
+      return { id: armId, guard, nested: arm.build(makeBuilder<Input>()) };
+    });
     const def: PendingMatchDef = { kind: "match", needs, arms };
-    return attachDef<unknown>({ kind: "match", id: "" }, def);
+    return attachDef({ kind: "match", id: "" }, def);
   }
 
   return {
-    task,
-    activity,
-    streamingTask,
+    task: (config) => handler("task", config),
+    activity: (config) => handler("activity", config),
+    streamingTask: (config) => handler("streaming", config),
     signal,
     subflow,
-    match: match as Builder<Input>["match"],
+    match,
   };
 }
 

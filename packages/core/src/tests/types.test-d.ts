@@ -304,10 +304,6 @@ describe("Fact discriminated union", () => {
       case "signal.received":
         expectTypeOf(factEx.payload).toEqualTypeOf<Json>();
         break;
-      case "once.recorded":
-        expectTypeOf(factEx.scope).toBeString();
-        expectTypeOf(factEx.value).toEqualTypeOf<Json>();
-        break;
       case "match.arm-selected":
         expectTypeOf(factEx.arm).toBeString();
         break;

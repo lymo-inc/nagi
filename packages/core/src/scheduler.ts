@@ -1,3 +1,4 @@
+import { Facts } from "./facts";
 import {
   asStepMapWithDefs,
   getDef,
@@ -10,7 +11,7 @@ import {
   isStepTerminal,
   isTerminalRun,
   outputOf,
-  resolvedOf,
+  type SkipReason,
   stepStateOf,
 } from "./state";
 import type {
@@ -21,11 +22,8 @@ import type {
   RunState,
   SerializedError,
   StepId,
+  StepResetFact,
 } from "./types";
-
-export { stepStateOf };
-
-export type SkipReason = "when-false" | "transitive";
 
 export interface SkipDecision {
   readonly stepId: string;
@@ -86,9 +84,7 @@ function gateStep(def: StepDef, runState: RunState, input: unknown): StepGate {
 
   const when = def.kind === "match" ? undefined : def.when;
   if (when) {
-    const needs = resolveNeeds(def, (id) =>
-      resolvedOf(stepStateOf(runState, id)),
-    );
+    const needs = resolveNeeds(def, runState);
     if (!when({ input, needs })) return { kind: "skip", reason: "when-false" };
   }
 
@@ -300,6 +296,20 @@ export function resetSetOf(
   scope: ResetScope | undefined,
 ): readonly StepId[] {
   return scope === "step" ? [stepId] : descendantsOf(flow, stepId);
+}
+
+// The facts one reset writes: the origin carries the caller's audit fields,
+// every other step in the reset set records where the cascade came from.
+export function resetFactsOf(
+  flow: Flow,
+  origin: Omit<Parameters<typeof Facts.stepReset>[0], "cascadedFrom">,
+): readonly StepResetFact[] {
+  const { runId, stepId, at } = origin;
+  return resetSetOf(flow, stepId, origin.scope).map((id) =>
+    id === stepId
+      ? Facts.stepReset(origin)
+      : Facts.stepReset({ runId, stepId: id, at, cascadedFrom: stepId }),
+  );
 }
 
 export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {

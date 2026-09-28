@@ -1,5 +1,6 @@
-import { type Resolved, unwrap } from "./state";
+import { type RunState, resolvedOf, stepStateOf, unwrap } from "./state";
 import type {
+  ActivityCtx,
   Json,
   LogEntry,
   Millis,
@@ -9,10 +10,8 @@ import type {
   RetryPolicy,
   StandardSchemaV1,
   Step,
-  StepCtx,
   StepLifecycleHooks,
   StepMap,
-  StreamingStepCtx,
 } from "./types";
 
 export type EmitLog = (entry: LogEntry) => void;
@@ -76,26 +75,14 @@ export type ArmGuard =
   | { readonly kind: "when"; readonly when: Guard }
   | { readonly kind: "otherwise" };
 
-export interface TaskDef extends StepLifecycleHooks<Json> {
-  readonly kind: "task";
-  readonly needs: NeedsDefMap;
-  readonly retry?: RetryPolicy;
-  readonly timeoutMs?: Millis;
-  readonly when?: Guard;
-  readonly run: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-    ctx: StepCtx<unknown>;
-  }) => Promise<Json>;
-  readonly parentMatch?: ParentMatchRef;
-}
+export type HandlerKind = "task" | "activity" | "streaming";
 
-// Same shape as TaskDef; the difference is purely in execution — an activity's
-// body runs OUTSIDE the durable transaction (see RFC 0013). run() is typed with
-// the full StepCtx here for internal reuse; the public ActivityConfig narrows it
-// to ActivityCtx (no tx).
-export interface ActivityDef extends StepLifecycleHooks<Json> {
-  readonly kind: "activity";
+// One def for every step whose body runs on a worker slot. `kind` selects the
+// ctx the body receives — task: StepCtx (inside the step tx); activity: no tx,
+// body runs outside it (RFC 0013); streaming: StepCtx plus emit. run is typed
+// with the ctx all three share; exec/message.ts builds the right one per kind.
+export interface HandlerDef extends StepLifecycleHooks<Json> {
+  readonly kind: HandlerKind;
   readonly needs: NeedsDefMap;
   readonly retry?: RetryPolicy;
   readonly timeoutMs?: Millis;
@@ -103,21 +90,7 @@ export interface ActivityDef extends StepLifecycleHooks<Json> {
   readonly run: (args: {
     input: unknown;
     needs: Record<string, unknown>;
-    ctx: StepCtx<unknown>;
-  }) => Promise<Json>;
-  readonly parentMatch?: ParentMatchRef;
-}
-
-export interface StreamingTaskDef extends StepLifecycleHooks<Json> {
-  readonly kind: "streaming";
-  readonly needs: NeedsDefMap;
-  readonly retry?: RetryPolicy;
-  readonly timeoutMs?: Millis;
-  readonly when?: Guard;
-  readonly run: (args: {
-    input: unknown;
-    needs: Record<string, unknown>;
-    ctx: StreamingStepCtx<unknown>;
+    ctx: ActivityCtx<unknown>;
   }) => Promise<Json>;
   readonly parentMatch?: ParentMatchRef;
 }
@@ -167,15 +140,7 @@ export interface SubflowDef {
   readonly parentMatch?: ParentMatchRef;
 }
 
-export type StepDef =
-  | TaskDef
-  | ActivityDef
-  | StreamingTaskDef
-  | SignalDef
-  | MatchDef
-  | SubflowDef;
-
-export type HandlerDef = TaskDef | ActivityDef | StreamingTaskDef;
+export type StepDef = HandlerDef | SignalDef | MatchDef | SubflowDef;
 
 export const DEF = Symbol("nagi.def");
 
@@ -208,11 +173,16 @@ export function peekDef(
 }
 
 export function handlerDef(def: StepDef): HandlerDef | undefined {
-  return def.kind === "task" ||
-    def.kind === "activity" ||
-    def.kind === "streaming"
-    ? def
-    : undefined;
+  switch (def.kind) {
+    case "task":
+    case "activity":
+    case "streaming":
+      return def;
+    case "signal":
+    case "match":
+    case "subflow":
+      return undefined;
+  }
 }
 
 export function needsStepIds(def: StepDef): readonly string[] {
@@ -221,11 +191,11 @@ export function needsStepIds(def: StepDef): readonly string[] {
 
 export function resolveNeeds(
   def: StepDef,
-  loadResolved: (stepId: string) => Resolved,
+  state: RunState,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [localKey, ref] of Object.entries(def.needs)) {
-    const resolved = loadResolved(ref.step.id);
+    const resolved = resolvedOf(stepStateOf(state, ref.step.id));
     // A required need is gated on completion, so it always carries a value;
     // only optional needs surface the Resolved union to the handler.
     result[localKey] = ref.optional ? resolved : unwrap(resolved);

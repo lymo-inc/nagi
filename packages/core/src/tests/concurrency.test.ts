@@ -254,7 +254,7 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
 
     const runId = await h.wf.start(f, { videoId: "v1" });
 
-    await h.store.appendFact(runId, {
+    await h.store.endRun(runId, {
       kind: "flow.canceled",
       cause: "concurrency",
       runId,

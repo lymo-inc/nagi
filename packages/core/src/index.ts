@@ -13,6 +13,7 @@ export {
   diffSnapshots,
   type SnapshotChangedEdge,
   type SnapshotChangedField,
+  type SnapshotChangedFlowField,
   type SnapshotDiff,
 } from "./diff";
 export {
@@ -26,7 +27,14 @@ export {
   NagiStepTimeoutError,
   NagiValidationError,
 } from "./errors";
-export { type RowDelta, rowDeltaOf } from "./facts";
+export {
+  type FactConsequences,
+  factConsequences,
+  isRunEnd,
+  type Release,
+  type RowDelta,
+  type StreamEffect,
+} from "./facts";
 export {
   DEFAULT_REAPER_INTERVAL_MS,
   decideExpiredLeaseAction,
@@ -43,11 +51,7 @@ export { defaultSnapshotGonePolicy } from "./retry";
 // Reusable by Store adapters: the chunk fan-out is process-local machinery, not
 // a persistence concern, so every adapter drives this same hub rather than
 // reimplementing subscriber buffering and close semantics.
-export {
-  InMemoryRunEventHub,
-  isTerminalRunEvent,
-  runEventOf,
-} from "./run-events";
+export { InMemoryRunEventHub, isTerminalRunEvent } from "./run-events";
 export { RunId } from "./run-id";
 export type {
   RunDescription,
@@ -94,13 +98,12 @@ export {
 } from "./state";
 export { NagiAbortError } from "./step-exec";
 export {
+  admitsRunEnd,
   clampQueryLimit,
   compareRunOrder,
   DEFAULT_SWEEP_LIMIT,
   decodeRunCursor,
   encodeRunCursor,
-  type FactEffects,
-  factEffects,
   isPastCursor,
   jsonContains,
   type PruneCandidate,
@@ -109,15 +112,19 @@ export {
   type RunCursor,
   selectExpired,
   selectPruneBatch,
+  supersede,
 } from "./store-policy";
 export {
   InMemoryStreamHub,
+  isStreamOver,
   STREAM_REPLAY_BUFFER_CAP,
   STREAM_SUBSCRIBER_BUFFER_CAP,
 } from "./stream-hub";
 // Explicit public type surface (not `export type *`): a new type in types.ts is
 // internal-by-default, and any change to the public surface shows up as a diff.
 export type {
+  ActivityConfig,
+  ActivityCtx,
   AttemptNumber,
   BackoffStrategy,
   Builder,
@@ -161,13 +168,11 @@ export type {
   MatchArmOtherwise,
   MatchArmOutput,
   MatchArmSelectedFact,
-  MatchArmShape,
   MatchGuardConfig,
   Millis,
   NeedRef,
   NeedsMap,
   NeedsOutputs,
-  OnceRecordedFact,
   Operator,
   OperatorAuditOpts,
   OperatorRetryOpts,
@@ -192,6 +197,7 @@ export type {
   ResolvedConcurrency,
   ResolvedNeeds,
   RetryPolicy,
+  RunEndFact,
   RunEvent,
   RunEventEnvelope,
   RunEventTransport,
@@ -217,6 +223,7 @@ export type {
   StepFailedFact,
   StepId,
   StepKind,
+  StepLifecycleHooks,
   StepMap,
   StepOutput,
   StepResetFact,

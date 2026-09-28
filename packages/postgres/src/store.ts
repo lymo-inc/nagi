@@ -3,7 +3,6 @@ import type {
   ClaimToken,
   ConcurrencyMode,
   Fact,
-  FlowCanceledByConcurrencyFact,
   FlowStartedFact,
   GetOnceResult,
   GlobalFact,
@@ -16,8 +15,10 @@ import type {
   QueryRunsResult,
   Queue,
   ReapedLease,
+  Release,
   RowDelta,
   RunDescription,
+  RunEndFact,
   RunEventEnvelope,
   RunEventTransport,
   RunId,
@@ -34,12 +35,14 @@ import type {
   StepRunStatus,
   StepView,
   Store,
+  StreamEffect,
   StreamEvent,
   StreamTransport,
   TimedOutSignal,
   Tx,
 } from "@nagi-js/core";
 import {
+  admitsRunEnd,
   clampQueryLimit,
   DEFAULT_SWEEP_LIMIT,
   decideExpiredLeaseAction,
@@ -47,16 +50,14 @@ import {
   decideTimeout,
   decodeRunCursor,
   encodeRunCursor,
-  factEffects,
+  factConsequences,
   InMemoryRunEventHub,
   InMemoryStreamHub,
-  isTerminalRun,
+  isRunEnd,
+  isStreamOver,
   NagiConcurrencyConflictError,
   projectRunState,
-  rowDeltaOf,
-  runEventOf,
-  stepStateOf,
-  stepStatusOf,
+  supersede,
 } from "@nagi-js/core";
 import type { Kysely } from "kysely";
 import { sql } from "kysely";
@@ -72,6 +73,9 @@ import { uuidv7 } from "./uuidv7";
 
 const DEFAULT_LEASE_MS: Millis = 60_000;
 const SCHEMA_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+type StartResult = Awaited<ReturnType<Store["tryStartRun"]>>;
+const NOT_STARTED: StartResult = { started: false, canceled: [] };
 
 export interface PostgresStoreOpts<DB = unknown> {
   readonly db: Kysely<DB>;
@@ -193,15 +197,7 @@ class PostgresStore<DB = unknown> implements Store {
         void (async () => {
           try {
             await this.listening;
-            const state = await this.loadRunState(runId);
-            const status = stepStatusOf(stepStateOf(state, stepId));
-            if (
-              isTerminalRun(state) ||
-              status === "completed" ||
-              status === "failed" ||
-              status === "canceled" ||
-              status === "skipped"
-            ) {
+            if (isStreamOver(await this.loadRunState(runId), stepId)) {
               hub.closeOk(runId, stepId);
             }
           } catch {
@@ -281,12 +277,19 @@ class PostgresStore<DB = unknown> implements Store {
     return `${this.schema}.${table}`;
   }
 
-  async appendFact(runId: RunId, fact: Fact): Promise<void> {
+  async appendFact(
+    runId: RunId,
+    fact: Exclude<Fact, RunEndFact>,
+  ): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
-      await this.persistFact(trx, runId, fact);
-      await this.applyFactEffects(trx, runId, fact);
+      await this.writeFact(trx, runId, fact);
     });
-    await this.maybeNotify(runId);
+  }
+
+  async endRun(runId: RunId, fact: RunEndFact): Promise<boolean> {
+    return this.db
+      .transaction()
+      .execute((trx) => this.writeFact(trx, runId, fact));
   }
 
   async tryStartRun(
@@ -296,113 +299,21 @@ class PostgresStore<DB = unknown> implements Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
-  ): Promise<{
-    readonly started: boolean;
-    readonly canceled: ReadonlyArray<{
-      readonly runId: RunId;
-      readonly fact: FlowCanceledByConcurrencyFact;
-    }>;
-  }> {
-    if (concurrency === undefined) {
-      const started = await this.db.transaction().execute(async (trx) => {
-        const insert = await sql<{ run_id: string }>`
-          INSERT INTO ${sql.raw(this.t("workflow_run"))}
-            (run_id, flow_id, status, input, started_at, flow_hash, code_version, parent_run_id, parent_step_id)
-          VALUES
-            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
-          ON CONFLICT (run_id) DO NOTHING
-          RETURNING run_id
-        `.execute(trx);
-
-        if (insert.rows.length === 0) {
-          return false;
-        }
-        await this.insertFact(trx, runId, fact);
-        // flow.started bypasses persistFact — the run row and its first fact
-        // are written together — so the event is published here too.
-        await this.notifyRunEvent(trx, runId, fact);
-        return true;
-      });
-
-      if (started) {
-        await this.maybeNotify(runId);
+  ): Promise<StartResult> {
+    return this.db.transaction().execute(async (trx) => {
+      if (concurrency !== undefined) {
+        const lockText = `nagi:concurrency:${fact.flowId}:${concurrency.key}`;
+        await sql`SELECT pg_advisory_xact_lock(hashtext(${lockText}))`.execute(
+          trx,
+        );
       }
-      return { started, canceled: [] };
-    }
-
-    const result = await this.db.transaction().execute(async (trx) => {
-      const lockText = `nagi:concurrency:${fact.flowId}:${concurrency.key}`;
-      await sql`SELECT pg_advisory_xact_lock(hashtext(${lockText}))`.execute(
-        trx,
-      );
-
-      const existing = await sql<{ run_id: string }>`
-        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
-         WHERE run_id = ${runId}
-         LIMIT 1
-      `.execute(trx);
-      if (existing.rows.length > 0) {
-        return {
-          started: false,
-          canceled: [] as ReadonlyArray<{
-            runId: RunId;
-            fact: FlowCanceledByConcurrencyFact;
-          }>,
-        };
-      }
-
-      const others = await sql<{ run_id: string }>`
-        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
-         WHERE flow_id = ${fact.flowId}
-           AND concurrency_key = ${concurrency.key}
-           AND status IN ('pending', 'running')
-        FOR UPDATE
-      `.execute(trx);
-
-      const canceled: Array<{
-        runId: RunId;
-        fact: FlowCanceledByConcurrencyFact;
-      }> = [];
-      for (const row of others.rows) {
-        const priorRunId = row.run_id as RunId;
-        const cancelFact: FlowCanceledByConcurrencyFact = {
-          kind: "flow.canceled",
-          cause: "concurrency",
-          runId: priorRunId,
-          at: fact.at,
-          canceledByRunId: runId,
-          concurrencyKey: concurrency.key,
-        };
-        await this.persistFact(trx, priorRunId, cancelFact);
-        canceled.push({ runId: priorRunId, fact: cancelFact });
-      }
-
-      await sql`
-        INSERT INTO ${sql.raw(this.t("workflow_run"))}
-          (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key, parent_run_id, parent_step_id)
-        VALUES
-          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
-      `.execute(trx);
-      await this.insertFact(trx, runId, fact);
-      await this.notifyRunEvent(trx, runId, fact);
-      await this.linkSuperseder(
-        trx,
-        runId,
-        canceled.map((c) => c.runId),
-      );
-
-      return { started: true, canceled };
+      return this.startRetrying(trx, runId, fact, concurrency);
     });
-
-    if (result.started) {
-      await this.maybeNotify(runId);
-      for (const c of result.canceled) {
-        await this.maybeNotify(c.runId);
-      }
-    }
-    return result;
   }
 
+  // D6=A: no advisory lock under shared tx — the partial unique index on
+  // (flow_id, concurrency_key) WHERE status IN ('pending','running') is the
+  // load-bearing invariant.
   async tryStartRunOnTx(
     tx: Tx,
     runId: RunId,
@@ -411,103 +322,126 @@ class PostgresStore<DB = unknown> implements Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
-  ): Promise<{
-    readonly started: boolean;
-    readonly canceled: ReadonlyArray<{
-      readonly runId: RunId;
-      readonly fact: FlowCanceledByConcurrencyFact;
-    }>;
-  }> {
-    const trx = tx as unknown as Kysely<DB>;
+  ): Promise<StartResult> {
+    return this.startRetrying(
+      tx as unknown as Kysely<DB>,
+      runId,
+      fact,
+      concurrency,
+    );
+  }
 
+  // A start racing one that holds no advisory lock (the OnTx path) can lose to
+  // the partial unique index; it is retried once, and a second loss surfaces
+  // NagiConcurrencyConflictError. A failed statement aborts the whole tx, so
+  // each attempt runs under a savepoint the failure rolls back to: the retry
+  // runs, and a caller's tx stays usable, with no half-applied cancels.
+  private async startRetrying(
+    trx: Kysely<DB>,
+    runId: RunId,
+    fact: FlowStartedFact,
+    concurrency:
+      | { readonly key: string; readonly mode: ConcurrencyMode }
+      | undefined,
+  ): Promise<StartResult> {
     if (concurrency === undefined) {
-      const insert = await sql<{ run_id: string }>`
-        INSERT INTO ${sql.raw(this.t("workflow_run"))}
-          (run_id, flow_id, status, input, started_at, flow_hash, code_version, parent_run_id, parent_step_id)
-        VALUES
-          (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
-        ON CONFLICT (run_id) DO NOTHING
-        RETURNING run_id
-      `.execute(trx);
-
-      if (insert.rows.length === 0) {
-        return { started: false, canceled: [] };
-      }
-      await this.insertFact(trx, runId, fact);
-      return { started: true, canceled: [] };
+      return this.startIn(trx, runId, fact, undefined);
     }
-
-    // D6=A: no advisory lock under shared tx — the partial unique index on
-    // (flow_id, concurrency_key) WHERE status IN ('pending','running') is the
-    // load-bearing invariant. We retry the SELECT-prior + INSERT-new pass once
-    // on a unique-violation race; on a second violation we surface
-    // NagiConcurrencyConflictError so the caller can decide how to recover.
-    let attemptedRetry = false;
-    for (;;) {
-      const existing = await sql<{ run_id: string }>`
-        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
-         WHERE run_id = ${runId}
-         LIMIT 1
-      `.execute(trx);
-      if (existing.rows.length > 0) {
-        return { started: false, canceled: [] };
-      }
-
-      const others = await sql<{ run_id: string }>`
-        SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
-         WHERE flow_id = ${fact.flowId}
-           AND concurrency_key = ${concurrency.key}
-           AND status IN ('pending', 'running')
-        FOR UPDATE
-      `.execute(trx);
-
-      const canceled: Array<{
-        runId: RunId;
-        fact: FlowCanceledByConcurrencyFact;
-      }> = [];
-      for (const row of others.rows) {
-        const priorRunId = row.run_id as RunId;
-        const cancelFact: FlowCanceledByConcurrencyFact = {
-          kind: "flow.canceled",
-          cause: "concurrency",
-          runId: priorRunId,
-          at: fact.at,
-          canceledByRunId: runId,
-          concurrencyKey: concurrency.key,
-        };
-        await this.persistFact(trx, priorRunId, cancelFact);
-        canceled.push({ runId: priorRunId, fact: cancelFact });
-      }
-
+    for (let retried = false; ; retried = true) {
+      await sql`SAVEPOINT nagi_start_run`.execute(trx);
       try {
-        await sql`
-          INSERT INTO ${sql.raw(this.t("workflow_run"))}
-            (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key, parent_run_id, parent_step_id)
-          VALUES
-            (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrency.key}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
-        `.execute(trx);
+        const started = await this.startIn(trx, runId, fact, concurrency);
+        await sql`RELEASE SAVEPOINT nagi_start_run`.execute(trx);
+        return started;
       } catch (err) {
-        if (isUniqueViolation(err) && !attemptedRetry) {
-          attemptedRetry = true;
-          continue;
-        }
-        if (isUniqueViolation(err)) {
+        await sql`ROLLBACK TO SAVEPOINT nagi_start_run`.execute(trx);
+        if (!isUniqueViolation(err)) throw err;
+        if (retried) {
           throw new NagiConcurrencyConflictError({
             runId,
             flowId: fact.flowId,
             concurrencyKey: concurrency.key,
           });
         }
-        throw err;
       }
-      await this.insertFact(trx, runId, fact);
-      await this.linkSuperseder(
-        trx,
-        runId,
-        canceled.map((c) => c.runId),
-      );
-      return { started: true, canceled };
     }
+  }
+
+  private async startIn(
+    trx: Kysely<DB>,
+    runId: RunId,
+    fact: FlowStartedFact,
+    concurrency:
+      | { readonly key: string; readonly mode: ConcurrencyMode }
+      | undefined,
+  ): Promise<StartResult> {
+    if (concurrency === undefined) {
+      if (!(await this.insertRun(trx, runId, fact, null))) return NOT_STARTED;
+      await this.writeFact(trx, runId, fact);
+      return { started: true, canceled: [] };
+    }
+
+    // A refused start must cancel nothing, so the runId is checked before any
+    // prior is touched.
+    const existing = await sql<{ run_id: string }>`
+      SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
+       WHERE run_id = ${runId}
+       LIMIT 1
+    `.execute(trx);
+    if (existing.rows.length > 0) return NOT_STARTED;
+
+    const priors = await sql<{ run_id: string }>`
+      SELECT run_id FROM ${sql.raw(this.t("workflow_run"))}
+       WHERE flow_id = ${fact.flowId}
+         AND concurrency_key = ${concurrency.key}
+         AND status IN ('pending', 'running')
+      FOR UPDATE
+    `.execute(trx);
+    const canceled: Array<StartResult["canceled"][number]> = [];
+    for (const c of supersede({
+      start: fact,
+      concurrency,
+      priors: priors.rows.map((r) => r.run_id as RunId),
+    })) {
+      if (await this.writeFact(trx, c.runId, c.fact)) canceled.push(c);
+    }
+
+    if (!(await this.insertRun(trx, runId, fact, concurrency.key))) {
+      // Only reachable without the advisory lock: a same-runId start committed
+      // after the check above. Priors may already be canceled on this tx, so
+      // reporting "not started" would commit a cancel nobody asked for.
+      throw new NagiConcurrencyConflictError({
+        runId,
+        flowId: fact.flowId,
+        concurrencyKey: concurrency.key,
+      });
+    }
+    await this.writeFact(trx, runId, fact);
+    await this.linkSuperseder(
+      trx,
+      runId,
+      canceled.map((c) => c.runId),
+    );
+    return { started: true, canceled };
+  }
+
+  // The only workflow_run INSERT: the start paths claim the runId here, before
+  // the flow.started fact whose row delta this already is.
+  private async insertRun(
+    trx: Kysely<DB>,
+    runId: RunId,
+    fact: FlowStartedFact,
+    concurrencyKey: string | null,
+  ): Promise<boolean> {
+    const insert = await sql<{ run_id: string }>`
+      INSERT INTO ${sql.raw(this.t("workflow_run"))}
+        (run_id, flow_id, status, input, started_at, flow_hash, code_version, concurrency_key, parent_run_id, parent_step_id)
+      VALUES
+        (${runId}, ${fact.flowId}, 'running', ${jsonb(fact.input)}, ${fact.at}, ${fact.flowHash ?? null}, ${fact.codeVersion ?? null}, ${concurrencyKey}, ${fact.parent?.runId ?? null}, ${fact.parent?.stepId ?? null})
+      ON CONFLICT (run_id) DO NOTHING
+      RETURNING run_id
+    `.execute(trx);
+    return insert.rows.length > 0;
   }
 
   async loadRunState(runId: RunId): Promise<RunState> {
@@ -545,7 +479,7 @@ class PostgresStore<DB = unknown> implements Store {
     };
   }): Promise<SettleSignalResult> {
     const { runId, stepId, at, incoming } = args;
-    const result = await this.db
+    return this.db
       .transaction()
       .execute(async (trx): Promise<SettleSignalResult> => {
         // Serialize signal reconciliation per run so a wf.signal() call and the
@@ -562,17 +496,14 @@ class PostgresStore<DB = unknown> implements Store {
             return decision.result;
           case "buffer":
             if (decision.fact !== null)
-              await this.insertFact(trx, runId, decision.fact);
+              await this.writeFact(trx, runId, decision.fact);
             return decision.result;
           case "deliver":
-            await this.persistFact(trx, runId, decision.received);
-            await this.persistFact(trx, runId, decision.completed);
-            await this.applyFactEffects(trx, runId, decision.completed);
+            await this.writeFact(trx, runId, decision.received);
+            await this.writeFact(trx, runId, decision.completed);
             return decision.result;
         }
       });
-    await this.maybeNotify(runId);
-    return result;
   }
 
   async claimStep(
@@ -647,7 +578,6 @@ class PostgresStore<DB = unknown> implements Store {
           LEFT JOIN ${sql.raw(this.t("step_run"))} s
             ON s.run_id = l.run_id
            AND s.step_id = l.step_id
-           AND s.attempt = l.attempt
           LEFT JOIN ${sql.raw(this.t("workflow_run"))} r
             ON r.run_id = l.run_id
          WHERE l.expires_at < ${now}
@@ -679,22 +609,7 @@ class PostgresStore<DB = unknown> implements Store {
         });
         if (decision.tag === "skip") continue;
 
-        await sql`
-          DELETE FROM ${sql.raw(this.t("lease"))}
-           WHERE run_id = ${runId} AND step_id = ${stepId} AND attempt = ${attempt}
-        `.execute(trx);
-
-        const fact: Fact = {
-          kind: "lease.reaped",
-          runId,
-          stepId,
-          attempt,
-          at: now,
-          reapedAt: now,
-          reason: "expired",
-        };
-        await this.insertFact(trx, runId, fact);
-
+        await this.writeFact(trx, runId, decision.fact);
         await txQueue.enqueue(runId, stepId, {
           attempt: decision.nextAttempt,
           delayMs: decision.backoffMs,
@@ -775,8 +690,7 @@ class PostgresStore<DB = unknown> implements Store {
         await this.deleteTimer(trx, runId, stepId);
         if (decision.kind === "noop") return false;
 
-        await this.persistFact(trx, runId, decision.fact);
-        await this.applyFactEffects(trx, runId, decision.fact);
+        await this.writeFact(trx, runId, decision.fact);
         return decision.attempt;
       });
 
@@ -785,18 +699,6 @@ class PostgresStore<DB = unknown> implements Store {
       }
     }
     return timedOut;
-  }
-
-  async settleStep(
-    runId: RunId,
-    _stepId: StepId,
-    fact: StepCompletedFact | StepFailedFact,
-  ): Promise<void> {
-    await this.db.transaction().execute(async (trx) => {
-      await this.persistFact(trx, runId, fact);
-      await this.applyFactEffects(trx, runId, fact);
-    });
-    await this.maybeNotify(runId);
   }
 
   async recordOnce(
@@ -837,26 +739,49 @@ class PostgresStore<DB = unknown> implements Store {
       readonly fact: StepCompletedFact | StepFailedFact | StepCanceledFact;
     }>,
   ): Promise<T> {
-    const output = await this.db.transaction().execute(async (trx) => {
+    return this.db.transaction().execute(async (trx) => {
       const result = await body(trx as unknown as Tx);
-      await this.persistFact(trx, runId, result.fact);
-      await this.applyFactEffects(trx, runId, result.fact);
+      await this.writeFact(trx, runId, result.fact);
       return result.output;
     });
-
-    await this.maybeNotify(runId);
-    return output;
   }
 
-  private async insertFact(
+  // The one fact-write path: every consequence core declares for the fact
+  // lands on `trx` with it. NOTIFYs ride the same tx, and PostgreSQL holds them
+  // until commit, so an observer hears only about durable facts and a
+  // rolled-back write — including one on a caller's tx — announces nothing.
+  private async writeFact(
     trx: Kysely<DB>,
     runId: RunId,
     fact: Fact,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    if (isRunEnd(fact)) {
+      const run = await sql<{ status: RunStatus }>`
+        SELECT status FROM ${sql.raw(this.t("workflow_run"))}
+         WHERE run_id = ${runId}
+         FOR UPDATE
+      `.execute(trx);
+      if (!admitsRunEnd(run.rows[0]?.status)) return false;
+    }
     await sql`
       INSERT INTO ${sql.raw(this.t("fact"))} (run_id, fact_id, kind, at, payload)
       VALUES (${runId}, ${uuidv7()}, ${fact.kind}, ${fact.at}, ${jsonb(serializeFactPayload(fact))})
     `.execute(trx);
+    const { rows, release, stream, event } = factConsequences(fact);
+    if (rows !== null) await this.applyRowDelta(trx, runId, rows);
+    if (release !== null) await this.applyRelease(trx, runId, release);
+    if (stream !== null) await this.notifyStreamEffect(trx, runId, stream);
+    if (event !== null && this.eventHub !== undefined) {
+      const payload = JSON.stringify({ ...event, runId });
+      await sql`SELECT pg_notify(${this.eventChannel}, ${payload})`.execute(
+        trx,
+      );
+    }
+    // Identical payloads within one tx collapse into a single notification.
+    if (this.notifyChannel !== undefined) {
+      await sql`SELECT pg_notify(${this.notifyChannel}, ${runId})`.execute(trx);
+    }
+    return true;
   }
 
   // Victims are canceled BEFORE the superseder row exists: the partial unique
@@ -876,53 +801,21 @@ class PostgresStore<DB = unknown> implements Store {
     `.execute(trx);
   }
 
-  private async persistFact(
+  private async notifyStreamEffect(
     trx: Kysely<DB>,
     runId: RunId,
-    fact: Fact,
-  ): Promise<void> {
-    await this.insertFact(trx, runId, fact);
-    const delta = rowDeltaOf(fact);
-    if (delta !== null) await this.applyRowDelta(trx, runId, delta);
-    await this.notifyStreamClose(trx, runId, fact);
-    await this.notifyRunEvent(trx, runId, fact);
-  }
-
-  // Lifecycle events ride the fact's transaction: PostgreSQL holds a NOTIFY
-  // until commit, so an observer is told about a fact only once it is durable,
-  // and a rolled-back attempt announces nothing. This is also why the transport
-  // lives here rather than in core — flow.canceled(concurrency) and
-  // lease.reaped are minted inside this adapter and never reach core.
-  private async notifyRunEvent(
-    trx: Kysely<DB>,
-    runId: RunId,
-    fact: Fact,
-  ): Promise<void> {
-    if (this.eventHub === undefined) return;
-    const event = runEventOf(fact);
-    if (event === null) return;
-    const payload = JSON.stringify({ ...event, runId });
-    await sql`SELECT pg_notify(${this.eventChannel}, ${payload})`.execute(trx);
-  }
-
-  // Stream close/retry events ride the SAME transaction as the fact that caused
-  // them. That is the opposite of publishChunk on purpose: PostgreSQL holds a
-  // NOTIFY until commit, so a subscriber is told the step is finished only once
-  // the fact is durable, and a rolled-back attempt never announces anything.
-  private async notifyStreamClose(
-    trx: Kysely<DB>,
-    runId: RunId,
-    fact: Fact,
+    effect: StreamEffect,
   ): Promise<void> {
     if (this.stream === undefined) return;
-    const frame = closeFrameOf(runId, fact);
-    if (frame === null) return;
     // Chunks go out on their own connections and commit immediately; this frame
     // rides `trx` and lands at commit. Without draining the step's publish chain
     // first, a close can overtake chunks still in flight and truncate the
     // stream — the channel closes and the stragglers are discarded.
-    await this.drainPublishes(runId, frame.k === "run" ? undefined : frame.s);
-    await sql`SELECT pg_notify(${this.streamChannel}, ${encodeFrame(frame)})`.execute(
+    await this.drainPublishes(
+      runId,
+      effect.tag === "close-run" ? undefined : effect.stepId,
+    );
+    await sql`SELECT pg_notify(${this.streamChannel}, ${encodeFrame(frameOf(runId, effect))})`.execute(
       trx,
     );
   }
@@ -937,8 +830,6 @@ class PostgresStore<DB = unknown> implements Store {
         return this.applyRunDelta(trx, runId, delta);
       case "step":
         return this.applyStepDelta(trx, runId, delta);
-      case "once":
-        return this.insertOnce(trx, runId, delta);
     }
   }
 
@@ -949,25 +840,19 @@ class PostgresStore<DB = unknown> implements Store {
   ): Promise<void> {
     switch (delta.status) {
       case "running":
-        await sql`
-          INSERT INTO ${sql.raw(this.t("workflow_run"))}
-            (run_id, flow_id, status, input, started_at, flow_hash, code_version, parent_run_id, parent_step_id)
-          VALUES
-            (${runId}, ${delta.flowId}, 'running', ${jsonb(delta.input)}, ${delta.startedAt}, ${delta.flowHash}, ${delta.codeVersion}, ${delta.parent?.runId ?? null}, ${delta.parent?.stepId ?? null})
-          ON CONFLICT (run_id) DO NOTHING
-        `.execute(trx);
+        // Already written: insertRun claimed the runId before this fact.
         return;
       case "completed":
         await sql`
           UPDATE ${sql.raw(this.t("workflow_run"))}
-             SET status = 'completed', output = ${jsonb(delta.output)}, completed_at = ${delta.completedAt}
+             SET status = 'completed', output = ${jsonb(delta.output)}, error = NULL, completed_at = ${delta.completedAt}
            WHERE run_id = ${runId}
         `.execute(trx);
         return;
       case "failed":
         await sql`
           UPDATE ${sql.raw(this.t("workflow_run"))}
-             SET status = 'failed', error = ${jsonb(delta.error as unknown as Json)}, completed_at = ${delta.completedAt}
+             SET status = 'failed', output = NULL, error = ${jsonb(delta.error as unknown as Json)}, completed_at = ${delta.completedAt}
            WHERE run_id = ${runId}
         `.execute(trx);
         return;
@@ -978,7 +863,7 @@ class PostgresStore<DB = unknown> implements Store {
         // so the reference stays joinable (nagi#29).
         await sql`
           UPDATE ${sql.raw(this.t("workflow_run"))}
-             SET status = 'canceled',
+             SET status = 'canceled', output = NULL, error = NULL,
                  canceled_by_run_id = (
                    SELECT s.run_id FROM ${sql.raw(this.t("workflow_run"))} s
                     WHERE s.run_id = ${delta.canceledByRunId}
@@ -990,6 +875,9 @@ class PostgresStore<DB = unknown> implements Store {
     }
   }
 
+  // Mirrors nextStepRow (@nagi-js/core read-model): one row per step, a
+  // settled row changes only by reset, and a start or retry older than the
+  // row's attempt is stale.
   private async applyStepDelta(
     trx: Kysely<DB>,
     runId: RunId,
@@ -998,46 +886,51 @@ class PostgresStore<DB = unknown> implements Store {
     switch (delta.status) {
       case "running":
         await sql`
-          INSERT INTO ${sql.raw(this.t("step_run"))} (run_id, step_id, attempt, status, started_at)
+          INSERT INTO ${sql.raw(this.t("step_run"))} AS s (run_id, step_id, attempt, status, started_at)
           VALUES (${runId}, ${delta.stepId}, ${delta.attempt}, 'running', ${delta.startedAt})
-          ON CONFLICT (run_id, step_id, attempt) DO UPDATE
-            SET status = 'running', started_at = EXCLUDED.started_at
+          ON CONFLICT (run_id, step_id) DO UPDATE
+            SET attempt = EXCLUDED.attempt, status = 'running', started_at = EXCLUDED.started_at,
+                completed_at = NULL, output = NULL, error = NULL
+            WHERE s.status NOT IN ${SETTLED_STEP} AND s.attempt <= EXCLUDED.attempt
+        `.execute(trx);
+        return;
+      case "backoff":
+        await sql`
+          UPDATE ${sql.raw(this.t("step_run"))}
+             SET attempt = ${delta.attempt}, error = ${jsonb(delta.error as unknown as Json)}
+           WHERE run_id = ${runId} AND step_id = ${delta.stepId}
+             AND status NOT IN ${SETTLED_STEP} AND attempt <= ${delta.attempt}
         `.execute(trx);
         return;
       case "completed":
-        await this.upsertStepCompleted(
+        return this.settleStepRow(
           trx,
           runId,
-          delta.stepId,
+          delta,
           delta.attempt,
           delta.output,
+          null,
         );
-        return;
       case "failed":
-        await this.upsertStepFailed(
+        return this.settleStepRow(
           trx,
           runId,
-          delta.stepId,
+          delta,
           delta.attempt,
+          null,
           delta.error,
         );
-        return;
       case "canceled":
-        await this.upsertStepCanceled(
+        return this.settleStepRow(
           trx,
           runId,
-          delta.stepId,
+          delta,
           delta.attempt,
-          delta.error ?? undefined,
+          null,
+          delta.error,
         );
-        return;
       case "skipped":
-        await sql`
-          INSERT INTO ${sql.raw(this.t("step_run"))} (run_id, step_id, attempt, status)
-          VALUES (${runId}, ${delta.stepId}, 0, 'skipped')
-          ON CONFLICT (run_id, step_id, attempt) DO UPDATE SET status = 'skipped'
-        `.execute(trx);
-        return;
+        return this.settleStepRow(trx, runId, delta, null, null, null);
       case "reset": {
         // Reopen a completed/failed run (replay, operator.retry). Read the
         // identity first: after a unique violation the tx is aborted and no
@@ -1073,79 +966,31 @@ class PostgresStore<DB = unknown> implements Store {
     }
   }
 
-  private async insertOnce(
+  // `attempt` null keeps the row's attempt (0 when there is none): a skip
+  // records no attempt of its own.
+  private async settleStepRow(
     trx: Kysely<DB>,
     runId: RunId,
-    delta: Extract<RowDelta, { row: "once" }>,
+    delta: {
+      readonly stepId: StepId;
+      readonly status: "completed" | "failed" | "canceled" | "skipped";
+      readonly completedAt: Date;
+    },
+    attempt: AttemptNumber | null,
+    output: Json | null,
+    error: SerializedError | null,
   ): Promise<void> {
+    const outputJson = output === null ? null : jsonb(output);
+    const errorJson = error === null ? null : jsonb(error as unknown as Json);
     await sql`
-      INSERT INTO ${sql.raw(this.t("dedupe"))} (run_id, step_id, scope, value)
-      VALUES (${runId}, ${delta.stepId}, ${delta.scope}, ${jsonb(delta.value)})
-      ON CONFLICT (run_id, step_id, scope) DO NOTHING
-    `.execute(trx);
-  }
-
-  private async upsertStepCompleted(
-    trx: Kysely<DB>,
-    runId: RunId,
-    stepId: StepId,
-    attempt: AttemptNumber,
-    output: Json,
-  ): Promise<void> {
-    await sql`
-      INSERT INTO ${sql.raw(this.t("step_run"))}
-        (run_id, step_id, attempt, status, output, started_at, completed_at)
+      INSERT INTO ${sql.raw(this.t("step_run"))} AS s
+        (run_id, step_id, attempt, status, output, error, completed_at)
       VALUES
-        (${runId}, ${stepId}, ${attempt}, 'completed', ${jsonb(output)}, now(), now())
-      ON CONFLICT (run_id, step_id, attempt) DO UPDATE
-        SET status = 'completed', output = EXCLUDED.output, completed_at = now()
-    `.execute(trx);
-  }
-
-  private async upsertStepFailed(
-    trx: Kysely<DB>,
-    runId: RunId,
-    stepId: StepId,
-    attempt: AttemptNumber,
-    error: SerializedError,
-  ): Promise<void> {
-    await sql`
-      INSERT INTO ${sql.raw(this.t("step_run"))}
-        (run_id, step_id, attempt, status, error, started_at, completed_at)
-      VALUES
-        (${runId}, ${stepId}, ${attempt}, 'failed', ${jsonb(error as unknown as Json)}, now(), now())
-      ON CONFLICT (run_id, step_id, attempt) DO UPDATE
-        SET status = 'failed', error = EXCLUDED.error, completed_at = now()
-    `.execute(trx);
-  }
-
-  private async upsertStepCanceled(
-    trx: Kysely<DB>,
-    runId: RunId,
-    stepId: StepId,
-    attempt: AttemptNumber,
-    error: SerializedError | undefined,
-  ): Promise<void> {
-    const errorJson =
-      error === undefined ? null : jsonb(error as unknown as Json);
-    await sql`
-      INSERT INTO ${sql.raw(this.t("step_run"))}
-        (run_id, step_id, attempt, status, error, started_at, completed_at)
-      VALUES
-        (${runId}, ${stepId}, ${attempt}, 'canceled', ${errorJson}, now(), now())
-      ON CONFLICT (run_id, step_id, attempt) DO UPDATE
-        SET status = 'canceled', error = EXCLUDED.error, completed_at = now()
-    `.execute(trx);
-  }
-
-  private async deleteLease(
-    trx: Kysely<DB>,
-    runId: RunId,
-    stepId: StepId,
-  ): Promise<void> {
-    await sql`
-      DELETE FROM ${sql.raw(this.t("lease"))}
-       WHERE run_id = ${runId} AND step_id = ${stepId}
+        (${runId}, ${delta.stepId}, COALESCE(${attempt}::int, 0), ${delta.status}, ${outputJson}, ${errorJson}, ${delta.completedAt})
+      ON CONFLICT (run_id, step_id) DO UPDATE
+        SET attempt = COALESCE(${attempt}::int, s.attempt), status = EXCLUDED.status,
+            output = EXCLUDED.output, error = EXCLUDED.error, completed_at = EXCLUDED.completed_at
+        WHERE s.status NOT IN ${SETTLED_STEP}
     `.execute(trx);
   }
 
@@ -1160,25 +1005,29 @@ class PostgresStore<DB = unknown> implements Store {
     `.execute(trx);
   }
 
-  // The adapter's whole share of the release table: lease / timer rows. The
-  // concurrency slot needs no write — the partial unique index keys on status,
-  // which the materializer already set.
-  private async applyFactEffects(
+  private async applyRelease(
     trx: Kysely<DB>,
     runId: RunId,
-    fact: Fact,
+    release: Release,
   ): Promise<void> {
-    const effects = factEffects(fact);
-    if (effects.tag !== "release-step") return;
-    await this.deleteLease(trx, runId, effects.stepId);
-    if (effects.timer) await this.deleteTimer(trx, runId, effects.stepId);
-  }
-
-  private async maybeNotify(runId: RunId): Promise<void> {
-    if (!this.notifyChannel) return;
-    await sql`SELECT pg_notify(${this.notifyChannel}, ${runId})`.execute(
-      this.db,
-    );
+    switch (release.tag) {
+      case "release-step":
+        await sql`
+          DELETE FROM ${sql.raw(this.t("lease"))}
+           WHERE run_id = ${runId} AND step_id = ${release.stepId}
+        `.execute(trx);
+        if (release.timer) await this.deleteTimer(trx, runId, release.stepId);
+        return;
+      case "release-lease":
+        await sql`
+          DELETE FROM ${sql.raw(this.t("lease"))}
+           WHERE run_id = ${runId} AND step_id = ${release.stepId} AND attempt = ${release.attempt}
+        `.execute(trx);
+        return;
+      case "release-run":
+        // The partial unique index keys on status, which the row delta set.
+        return;
+    }
   }
 
   async upsertSnapshot(args: {
@@ -1530,6 +1379,8 @@ function reviveFact(kind: string, at: Date, payload: unknown): Fact {
   } as Fact;
 }
 
+const SETTLED_STEP = sql.raw("('completed', 'failed', 'canceled', 'skipped')");
+
 function jsonb(value: Json) {
   return sql`${JSON.stringify(value)}::jsonb`;
 }
@@ -1549,26 +1400,16 @@ function isUniqueViolation(err: unknown): boolean {
   return false;
 }
 
-// Mirrors InMemoryStore.appendFact's hub wiring, so both adapters close streams
-// on exactly the same facts. Returns null for facts that do not affect a stream.
-function closeFrameOf(runId: RunId, fact: Fact): StreamFrame | null {
-  switch (fact.kind) {
-    case "step.completed":
-      return { k: "ok", r: runId, s: fact.stepId };
-    case "step.failed":
-      // Only written on terminal failure (retries use step.retried).
-      return { k: "err", r: runId, s: fact.stepId, e: fact.error };
-    case "step.retried":
-      // The retry event carries the NEXT attempt number.
-      return { k: "retry", r: runId, s: fact.stepId, a: fact.attempt + 1 };
-    case "flow.completed":
-    case "flow.failed":
-    case "flow.canceled":
-      // Close every still-open channel so a subscriber to a skipped or
-      // never-emitting step never hangs.
+function frameOf(runId: RunId, effect: StreamEffect): StreamFrame {
+  switch (effect.tag) {
+    case "close-ok":
+      return { k: "ok", r: runId, s: effect.stepId };
+    case "close-error":
+      return { k: "err", r: runId, s: effect.stepId, e: effect.error };
+    case "retry":
+      return { k: "retry", r: runId, s: effect.stepId, a: effect.nextAttempt };
+    case "close-run":
       return { k: "run", r: runId };
-    default:
-      return null;
   }
 }
 

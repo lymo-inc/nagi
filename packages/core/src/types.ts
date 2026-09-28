@@ -3,6 +3,7 @@ import type {
   FlowCanceledByConcurrencyFact,
   FlowStartedFact,
   GlobalFact,
+  RunEndFact,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
@@ -271,21 +272,6 @@ export type MatchArm<Input, N extends NeedsMap, M extends StepMap> =
   | MatchArmGuard<Input, N, M>
   | MatchArmOtherwise<Input, M>;
 
-export type MatchArmShape<Input, N extends NeedsMap> =
-  | {
-      readonly when: (args: {
-        readonly input: NoInfer<Input>;
-        readonly needs: NoInfer<ResolvedNeeds<N>>;
-      }) => boolean;
-      readonly otherwise?: never;
-      readonly build: (b: Builder<Input>) => StepMap;
-    }
-  | {
-      readonly otherwise: true;
-      readonly when?: never;
-      readonly build: (b: Builder<Input>) => StepMap;
-    };
-
 export interface MatchGuardConfig<
   Input,
   N extends NeedsMap,
@@ -336,7 +322,7 @@ export interface Builder<Input = unknown> {
 
   match<
     N extends NeedsMap,
-    Arms extends ReadonlyArray<MatchArmShape<Input, N>>,
+    Arms extends ReadonlyArray<MatchArm<Input, N, StepMap>>,
   >(config: {
     readonly needs?: N;
     readonly arms: Arms;
@@ -488,6 +474,11 @@ export interface WorkerConfig {
   // (tests that drive the sweep explicitly). Checked by elapsed wall-clock each
   // loop iteration, so a fully-busy worker still sweeps on schedule.
   readonly timerSweepIntervalMs?: Millis;
+  // Cadence for the in-worker lease-reaper sweep (Store.sweepLeases), same
+  // elapsed-time check as timerSweepIntervalMs. Default 30s — stay ≤ ½ the
+  // store lease TTL so a crashed worker's step is re-dispatched within one TTL.
+  // 0 disables it (external/cron-driven reaping).
+  readonly reaperIntervalMs?: Millis;
   // Decides retry-vs-fail for a message whose run's flow snapshot is gone
   // (deploy replaced the flow while the run was in flight). Defaults to
   // defaultSnapshotGonePolicy. "retry" keeps the message alive for a
@@ -587,14 +578,22 @@ export interface TimedOutSignal {
 
 // Every MUST below is a case in `storeContract` (@nagi-js/core/testing); run it
 // against any new adapter. Decisions an adapter must not re-make are core pure
-// functions: decideSignal / decideTimeout / decideExpiredLeaseAction,
-// factEffects, the queryRuns cursor codec, selectExpired, selectPruneBatch.
+// functions: factConsequences, admitsRunEnd, supersede, decideSignal /
+// decideTimeout / decideExpiredLeaseAction, the queryRuns cursor codec,
+// selectExpired, selectPruneBatch.
 export interface Store {
-  // Persist a fact and apply factEffects (the leases / timers / concurrency
-  // slot it releases). Terminal step facts arrive through runStep / settleStep
-  // / settleSignal / sweepSignalTimeouts, which MUST apply the same table
-  // inside their own tx.
-  appendFact(runId: RunId, fact: Fact): Promise<void>;
+  // Every fact this Store writes, through any method, MUST get all of its
+  // factConsequences (rows, releases, stream close, run event) in the same
+  // transaction as the fact itself.
+  appendFact(runId: RunId, fact: Exclude<Fact, RunEndFact>): Promise<void>;
+
+  // The only way a run ends. MUST decide admitsRunEnd on the run's row status
+  // under the lock that serializes run ends, in the fact's own transaction:
+  // refused, nothing is written and this resolves false, so of any number of
+  // racing ends exactly one resolves true. Every write path, including the
+  // cancels tryStartRun makes, MUST apply the same refusal.
+  endRun(runId: RunId, fact: RunEndFact): Promise<boolean>;
+
   loadRunState(runId: RunId): Promise<RunState>;
 
   // Atomically reconcile a signal with its target step under a per-run lock.
@@ -704,15 +703,6 @@ export interface Store {
     readonly limit?: number;
   }): Promise<readonly TimedOutSignal[]>;
 
-  // Append a terminal step fact for a step that did not run under `runStep`
-  // (match/subflow promotions, operator-driven settles). The output travels on
-  // the StepCompletedFact, so there is no separate output store to keep in sync.
-  settleStep(
-    runId: RunId,
-    stepId: StepId,
-    fact: StepCompletedFact | StepFailedFact,
-  ): Promise<void>;
-
   // MUST be first-write-wins per (runId, stepId, scope); a later value is
   // ignored, never overwritten.
   recordOnce(
@@ -755,16 +745,23 @@ export interface Store {
 
   appendGlobalFact(fact: GlobalFact): Promise<void>;
 
+  // queryRuns, describe and pruneFacts MUST answer from the rows the facts'
+  // `rows` deltas materialize, applied as nextRunRow / nextStepRow do, never by
+  // re-deriving them from the log. Every timestamp is a fact's `at`, never the
+  // store's clock.
+
   // MUST order by (startedAt DESC, runId DESC) with cursors from
   // encodeRunCursor / decodeRunCursor and limits from clampQueryLimit, and
   // treat opts.where.input as JSONB containment (Postgres `@>`; jsonContains
   // is the reference).
   queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult>;
 
-  // MUST return null (never throw) for an unknown runId. The view reflects
-  // facts visible at call time (a run pruned with keepSummary keeps its
-  // summary and no steps); parent/children come from the parent_run_id column
-  // + a reverse lookup, not from a separate child registry.
+  // MUST return null (never throw) for an unknown runId. One StepView per
+  // step, its latest attempt: a retry supersedes the view in place, a settled
+  // step changes only by reset, and a reset step has no view until it restarts.
+  // A run pruned with keepSummary keeps its run view and no steps;
+  // parent/children come from the runs' parent link + a reverse lookup, not
+  // from a separate child registry.
   describe(runId: RunId): Promise<RunDescription>;
 
   listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>>;
@@ -785,7 +782,7 @@ export interface Store {
 }
 
 // A lifecycle projection of the fact log, for observers. Deliberately smaller
-// than Fact: leases, timers and once-records are execution bookkeeping, not
+// than Fact: leases, timers and arm selection are execution bookkeeping, not
 // things a UI or an operator subscribes to.
 export type RunEvent =
   | { readonly type: "flow.started"; readonly flowId: string }
@@ -832,8 +829,9 @@ export type RunEventEnvelope = RunEvent & { readonly runId: RunId };
 
 // Lifecycle fan-out. Lives on the Store for the same reason StreamTransport
 // does: some lifecycle facts — concurrency supersession and lease reaping —
-// are minted INSIDE the adapter's transaction and never pass through core, so
-// core cannot observe them from the outside without breaking that atomicity.
+// are written INSIDE the adapter's transaction, so only the Store sees them
+// commit. An event MUST be delivered only once its fact is durable: for a fact
+// written on the caller's tx (tryStartRunOnTx), no earlier than that commit.
 export interface RunEventTransport {
   // Stops when the returned disposer is called, or after the run reaches a
   // terminal event.
@@ -1000,6 +998,8 @@ export type ResetScope = "cascade" | "step";
 export interface ReplayOpts {
   readonly mode: ReplayMode;
   readonly allowDrift?: boolean;
+  // false drains a private in-memory queue: a crash mid-replay loses its
+  // pending messages, and the run MUST be recovered with mode "continue".
   readonly fireHooks?: boolean;
   readonly from?: StepId;
   // Only meaningful with `from`. Defaults to "cascade".

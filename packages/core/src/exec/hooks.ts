@@ -23,7 +23,7 @@ export function makeHooks(deps: DispatchDeps): Hooks {
     event: E,
     hookName: string,
   ): Promise<void> {
-    if (deps.fireHooks === false) return;
+    if (!deps.fireHooks) return;
     if (hook === undefined) return;
     try {
       await hook(event);

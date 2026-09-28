@@ -15,7 +15,7 @@ import type {
   StepId,
   StepKind,
 } from "../types";
-import type { FactBase, KindTable } from "./base";
+import type { FactBase, KindTable, Release } from "./base";
 import { foldStep } from "./base";
 
 export interface StepStartedFact extends FactBase {
@@ -90,13 +90,6 @@ export interface MatchArmSelectedFact extends FactBase {
   readonly arm: string;
 }
 
-export interface OnceRecordedFact extends FactBase {
-  readonly kind: "once.recorded";
-  readonly stepId: StepId;
-  readonly scope: string;
-  readonly value: Json;
-}
-
 export type StepFact =
   | StepStartedFact
   | StepCompletedFact
@@ -106,8 +99,7 @@ export type StepFact =
   | StepSkippedFact
   | StepResetFact
   | StepAbortRequestedFact
-  | MatchArmSelectedFact
-  | OnceRecordedFact;
+  | MatchArmSelectedFact;
 
 export const stepFacts = {
   stepStarted(
@@ -260,6 +252,10 @@ function startTarget(stepKind: StepKind, attempt: AttemptNumber): StepState {
   }
 }
 
+function releaseStep(stepId: StepId, timer: boolean): Release {
+  return { tag: "release-step", stepId, timer };
+}
+
 // Every transition is total: a pair that isn't a real transition keeps the
 // prior state, so the fold never throws on a contradictory log. Terminal facts
 // carry authoritative outcomes and settle a step from any non-terminal state.
@@ -278,6 +274,13 @@ export const stepKinds = {
       attempt: fact.attempt,
       startedAt: fact.at,
     }),
+    release: null,
+    stream: null,
+    event: (fact) => ({
+      type: "step.started",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+    }),
   },
   "step.completed": {
     fold: (draft, fact) =>
@@ -289,6 +292,15 @@ export const stepKinds = {
     rows: (fact) => ({
       row: "step",
       status: "completed",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+      output: fact.output,
+      completedAt: fact.at,
+    }),
+    release: (fact) => releaseStep(fact.stepId, true),
+    stream: (fact) => ({ tag: "close-ok", stepId: fact.stepId }),
+    event: (fact) => ({
+      type: "step.completed",
       stepId: fact.stepId,
       attempt: fact.attempt,
       output: fact.output,
@@ -304,6 +316,20 @@ export const stepKinds = {
     rows: (fact) => ({
       row: "step",
       status: "failed",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+      error: fact.error,
+      completedAt: fact.at,
+    }),
+    release: (fact) => releaseStep(fact.stepId, false),
+    // Only written on terminal failure (retries use step.retried).
+    stream: (fact) => ({
+      tag: "close-error",
+      stepId: fact.stepId,
+      error: fact.error,
+    }),
+    event: (fact) => ({
+      type: "step.failed",
       stepId: fact.stepId,
       attempt: fact.attempt,
       error: fact.error,
@@ -325,7 +351,11 @@ export const stepKinds = {
       stepId: fact.stepId,
       attempt: fact.attempt,
       error: fact.error ?? null,
+      completedAt: fact.at,
     }),
+    release: (fact) => releaseStep(fact.stepId, false),
+    stream: null,
+    event: null,
   },
   "step.retried": {
     fold: (draft, fact) =>
@@ -339,7 +369,25 @@ export const stepKinds = {
             }
           : prev,
       ),
-    rows: null,
+    rows: (fact) => ({
+      row: "step",
+      status: "backoff",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+      error: fact.error,
+    }),
+    release: null,
+    stream: (fact) => ({
+      tag: "retry",
+      stepId: fact.stepId,
+      nextAttempt: (fact.attempt + 1) as AttemptNumber,
+    }),
+    // Carries the attempt that FAILED; the next one is attempt + 1.
+    event: (fact) => ({
+      type: "step.retried",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+    }),
   },
   "step.skipped": {
     // An operator may skip an in-flight step, not just a pending one.
@@ -347,11 +395,25 @@ export const stepKinds = {
       foldStep(draft, fact.stepId, (prev) =>
         isStepTerminal(prev) ? prev : { tag: "skipped", reason: fact.reason },
       ),
-    rows: (fact) => ({ row: "step", status: "skipped", stepId: fact.stepId }),
+    rows: (fact) => ({
+      row: "step",
+      status: "skipped",
+      stepId: fact.stepId,
+      completedAt: fact.at,
+    }),
+    release: null,
+    stream: null,
+    event: (fact) => ({
+      type: "step.skipped",
+      stepId: fact.stepId,
+      reason: fact.reason,
+    }),
   },
   "step.reset": {
     fold: (draft, fact) => {
       draft.steps[fact.stepId] = PENDING;
+      draft.resetCounts[fact.stepId] =
+        (draft.resetCounts[fact.stepId] ?? 0) + 1;
       delete draft.selectedArms[fact.stepId];
       // A reset step must wait for a fresh signal, never replay the old one.
       delete draft.bufferedSignals[fact.stepId];
@@ -362,6 +424,9 @@ export const stepKinds = {
       }
     },
     rows: (fact) => ({ row: "step", status: "reset", stepId: fact.stepId }),
+    release: (fact) => releaseStep(fact.stepId, true),
+    stream: null,
+    event: null,
   },
   "step.abort-requested": {
     fold: (draft, fact) =>
@@ -373,20 +438,17 @@ export const stepKinds = {
           : prev,
       ),
     rows: null,
+    release: null,
+    stream: null,
+    event: null,
   },
   "match.arm-selected": {
     fold: (draft, fact) => {
       draft.selectedArms[fact.stepId] = fact.arm;
     },
     rows: null,
-  },
-  "once.recorded": {
-    fold: () => {},
-    rows: (fact) => ({
-      row: "once",
-      stepId: fact.stepId,
-      scope: fact.scope,
-      value: fact.value,
-    }),
+    release: null,
+    stream: null,
+    event: null,
   },
 } satisfies KindTable<StepFact>;

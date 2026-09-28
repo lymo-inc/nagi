@@ -6,6 +6,7 @@ import {
   NagiConcurrencyConflictError,
   nagi,
   type RunId,
+  type Tx,
   type Wf,
 } from "@nagi-js/core";
 import { passthroughSchema } from "@nagi-js/core/testing";
@@ -421,6 +422,75 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(canceledCount.rows[0]?.count).toBe("7");
   }, 30_000);
 
+  it("tryStartRunOnTx: a unique-violation retry runs inside the caller's tx, supersedes the racer, and leaves the tx committable", async () => {
+    const store = postgresStore({ db, schema });
+    const flowId = `pg-ontx-retry-${uuidv7()}`;
+    const concurrency = { key: "k", mode: "cancel-in-progress" } as const;
+    const startFact = (runId: RunId) => ({
+      kind: "flow.started" as const,
+      runId,
+      flowId,
+      input: null,
+      at: new Date(),
+    });
+    const a = `run-${uuidv7()}` as RunId;
+    const b = `run-${uuidv7()}` as RunId;
+
+    let aStarted!: () => void;
+    const aReady = new Promise<void>((r) => {
+      aStarted = r;
+    });
+    let commitA!: () => void;
+    const aGate = new Promise<void>((r) => {
+      commitA = r;
+    });
+    const txA = db.transaction().execute(async (trx) => {
+      await store.tryStartRunOnTx(
+        trx as unknown as Tx,
+        a,
+        startFact(a),
+        concurrency,
+      );
+      aStarted();
+      await aGate;
+    });
+    await aReady;
+
+    // B cannot see A's uncommitted row, so it finds no prior and its insert
+    // parks on A's index entry; A's commit turns that into a unique violation.
+    const txB = db.transaction().execute(async (trx) => {
+      const started = await store.tryStartRunOnTx(
+        trx as unknown as Tx,
+        b,
+        startFact(b),
+        concurrency,
+      );
+      const after = await sql<{ ok: number }>`SELECT 1 AS ok`.execute(trx);
+      return { started, ok: after.rows[0]?.ok };
+    });
+
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const waiting = await sql<{ c: number }>`
+        SELECT count(*)::int AS c FROM pg_stat_activity
+         WHERE wait_event_type = 'Lock'
+           AND query LIKE ${`%INSERT INTO ${schema}.workflow_run%`}
+      `.execute(db);
+      if ((waiting.rows[0]?.c ?? 0) > 0) break;
+      if (Date.now() > deadline) throw new Error("B never blocked on A");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    commitA();
+    await txA;
+
+    const { started, ok } = await txB;
+    expect(started.started).toBe(true);
+    expect(started.canceled.map((c) => c.runId)).toEqual([a]);
+    expect(ok).toBe(1);
+    expect(await loadStatus(db, schema, a)).toBe("canceled");
+    expect(await loadStatus(db, schema, b)).toBe("running");
+  }, 15_000);
+
   it("start() with a previously-used runId is an idempotent no-op", async () => {
     const f = flow({
       id: "pg-idempotent-replay",
@@ -610,14 +680,14 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         at: startedAt,
       });
       if (terminal === "completed") {
-        await store.appendFact(runId, {
+        await store.endRun(runId, {
           kind: "flow.completed",
           runId,
           at: new Date(startedAt.getTime() + 100),
           output: null,
         });
       } else if (terminal === "failed") {
-        await store.appendFact(runId, {
+        await store.endRun(runId, {
           kind: "flow.failed",
           runId,
           at: new Date(startedAt.getTime() + 100),
@@ -924,7 +994,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(skipped.some((r) => r.runId === parentRunId)).toBe(false);
 
       // Child terminal ⇒ next sweep reaps it (recovery / re-entrant wake).
-      await store.appendFact(childRunId, {
+      await store.endRun(childRunId, {
         kind: "flow.completed",
         runId: childRunId,
         output: { ok: true },
@@ -1235,21 +1305,21 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       });
       const at = new Date(args.completedAtMs);
       if (args.status === "completed") {
-        await store.appendFact(runId, {
+        await store.endRun(runId, {
           kind: "flow.completed",
           runId,
           at,
           output: null,
         });
       } else if (args.status === "failed") {
-        await store.appendFact(runId, {
+        await store.endRun(runId, {
           kind: "flow.failed",
           runId,
           at,
           error: { name: "E", message: "x" },
         });
       } else {
-        await store.appendFact(runId, {
+        await store.endRun(runId, {
           kind: "flow.canceled",
           cause: "concurrency",
           runId,

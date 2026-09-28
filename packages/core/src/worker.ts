@@ -5,12 +5,13 @@ import {
   makeDispatcher,
 } from "./dispatch";
 import { type NagiFlowSnapshotGoneError, serializeError } from "./errors";
-import { Facts } from "./facts";
+import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
 import {
   type Backoff,
   defaultSnapshotGonePolicy,
   dequeueBackoff,
 } from "./retry";
+import { isTerminalRun } from "./state";
 import type {
   Clock,
   Millis,
@@ -32,6 +33,13 @@ export interface WorkerDeps extends DispatchDeps {
   readonly clock: Clock;
 }
 
+interface Sweep {
+  readonly label: string;
+  readonly intervalMs: Millis;
+  readonly run: (now: Date) => Promise<unknown>;
+  lastAt: number;
+}
+
 export function makeWorker(deps: WorkerDeps, config?: WorkerConfig): Worker {
   return new WorkerImpl(deps, config);
 }
@@ -43,11 +51,10 @@ class WorkerImpl implements Worker {
   private readonly dequeueBackoffMs: Backoff;
   private readonly signal: AbortSignal | undefined;
   private readonly dispatcher: Dispatcher;
-  private readonly timerSweepIntervalMs: Millis;
+  private readonly sweeps: readonly Sweep[];
   private readonly snapshotGonePolicy: SnapshotGonePolicy;
   private readonly maxPerFlow: number | undefined;
   private readonly inFlightByFlow = new Map<string, number>();
-  private lastTimerSweepAt: number;
 
   constructor(
     private readonly deps: WorkerDeps,
@@ -64,11 +71,24 @@ class WorkerImpl implements Worker {
       config?.maxConcurrencyPerFlow !== undefined
         ? Math.max(1, config.maxConcurrencyPerFlow)
         : undefined;
-    this.timerSweepIntervalMs =
-      config?.timerSweepIntervalMs ?? DEFAULT_TIMER_SWEEP_INTERVAL_MS;
-    // Anchor the first sweep one interval out, like the lease-reaper sleeps
-    // before its first pass — no sweep storm at boot.
-    this.lastTimerSweepAt = this.deps.clock.now().getTime();
+    // Anchor each first sweep one interval out — no sweep storm at boot.
+    const bootAt = deps.clock.now().getTime();
+    const sweeps: Sweep[] = [
+      {
+        label: "signal-timeout",
+        intervalMs:
+          config?.timerSweepIntervalMs ?? DEFAULT_TIMER_SWEEP_INTERVAL_MS,
+        run: (now) => this.dispatcher.sweepTimers(now),
+        lastAt: bootAt,
+      },
+      {
+        label: "lease-reaper",
+        intervalMs: config?.reaperIntervalMs ?? DEFAULT_REAPER_INTERVAL_MS,
+        run: (now) => deps.store.sweepLeases({ now, queue: deps.queue }),
+        lastAt: bootAt,
+      },
+    ];
+    this.sweeps = sweeps.filter((s) => s.intervalMs > 0);
   }
 
   // Per-flow blast-radius bound (maxConcurrencyPerFlow). A message over its
@@ -110,8 +130,9 @@ class WorkerImpl implements Worker {
     while (!this.aborted()) {
       // Time-based, not idle-gated: a worker pinned at full concurrency still
       // reaches this each iteration (the slots-full branch loops every ~50ms),
-      // so signal timeouts fire on cadence regardless of load.
-      await this.maybeSweepTimers();
+      // so signal timeouts fire and dead leases are reaped on cadence
+      // regardless of load.
+      await this.runDueSweeps();
       const slots = this.concurrency - this.inFlight;
       if (slots <= 0) {
         await this.sleep(50);
@@ -299,24 +320,21 @@ class WorkerImpl implements Worker {
       msg: "worker.dispatch: flow snapshot gone — redelivery budget exhausted, failing run",
       attrs,
     });
-    const serialized = serializeError(err);
-    await this.deps.store.appendFact(
-      msg.runId,
-      Facts.flowFailed(msg.runId, serialized, this.deps.clock.now()),
-    );
-    // Best-effort: a parked parent subflow step is only woken by propagation.
-    // The parent's flow may be gone too (same deploy) — then its own messages
-    // meet this same policy, so swallow and log rather than block the ack.
     try {
-      await this.dispatcher.propagateToParent(msg.runId, {
-        kind: "failed",
-        error: serialized,
-      });
-    } catch (propagateErr) {
+      await this.dispatcher.terminate(
+        { kind: "gone", runId: msg.runId, flowId: err.flowId },
+        { tag: "failed", error: serializeError(err) },
+      );
+    } catch (terminateErr) {
+      // A failed fact write must not be acked away. Past it, the parent wake is
+      // best-effort: the parent's flow may be gone too (same deploy) — then its
+      // own messages meet this same policy — so log rather than block the ack.
+      const state = await this.deps.store.loadRunState(msg.runId);
+      if (!isTerminalRun(state)) throw terminateErr;
       this.deps.emitLog({
         level: "warn",
         msg: "worker.dispatch: snapshot-gone fail could not propagate to parent",
-        attrs: { ...attrs, error: String(propagateErr) },
+        attrs: { ...attrs, error: String(terminateErr) },
       });
     }
     await this.deps.queue.ack(msg.receipt);
@@ -328,24 +346,25 @@ class WorkerImpl implements Worker {
     }
   }
 
-  // Sweep elapsed signal timeouts on cadence. Runs inline in the dispatch loop
-  // (not fired concurrently) so two sweeps never overlap; at 30s with a handful
-  // of timers the cost is negligible. Errors are logged, never thrown — a failed
-  // sweep must not kill the worker; the next tick retries.
-  private async maybeSweepTimers(): Promise<void> {
-    if (this.timerSweepIntervalMs <= 0) return;
+  // Runs inline in the dispatch loop (not fired concurrently) so two passes of
+  // a sweep never overlap within a worker; across workers the store's sweeps
+  // are safe to race (row locks / take-before-await). Errors are logged, never
+  // thrown — a failed sweep must not kill the worker; the next tick retries.
+  private async runDueSweeps(): Promise<void> {
+    if (this.sweeps.length === 0) return;
     const now = this.deps.clock.now();
-    if (now.getTime() - this.lastTimerSweepAt < this.timerSweepIntervalMs)
-      return;
-    this.lastTimerSweepAt = now.getTime();
-    try {
-      await this.dispatcher.sweepTimers(now);
-    } catch (err) {
-      this.deps.emitLog({
-        level: "warn",
-        msg: "worker: signal-timeout sweep failed",
-        attrs: { error: String(err) },
-      });
+    for (const sweep of this.sweeps) {
+      if (now.getTime() - sweep.lastAt < sweep.intervalMs) continue;
+      sweep.lastAt = now.getTime();
+      try {
+        await sweep.run(now);
+      } catch (err) {
+        this.deps.emitLog({
+          level: "warn",
+          msg: `worker: ${sweep.label} sweep failed`,
+          attrs: { error: String(err) },
+        });
+      }
     }
   }
 

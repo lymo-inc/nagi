@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import type { Hooks } from "../exec/hooks";
 import { Facts } from "../facts";
-import { type FlowRegistry, registerFlows } from "../flows";
+import { type FlowRegistry, makeFlowOf, registerFlows } from "../flows";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import {
   makeRunLifecycle,
@@ -73,7 +73,7 @@ interface Fixture {
   readonly fired: string[];
   readonly txEnqueued: Array<{ tx: Tx; runId: RunId; stepId: StepId }>;
   readonly advance: ReturnType<typeof vi.fn>;
-  readonly propagateToParent: ReturnType<typeof vi.fn>;
+  readonly settleSuperseded: ReturnType<typeof vi.fn>;
 }
 
 async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
@@ -90,13 +90,15 @@ async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
     async fireStepLifecycle() {},
   };
   const advance = vi.fn(async () => {});
-  const propagateToParent = vi.fn(async () => {});
+  const settleSuperseded = vi.fn(async () => {});
   const registry = await registerFlows({ flows, store, clock });
   const lifecycle = makeRunLifecycle({
     store,
     queue,
     clock,
     registry,
+    flowOf: (runId) =>
+      makeFlowOf({ registry, store, emitLog: () => {} })(runId, "freeze"),
     codeVersion: "test",
     queueForTx: (tx): Queue => ({
       async enqueue(runId: RunId, stepId: StepId, opts?: QueueEnqueueOpts) {
@@ -110,8 +112,7 @@ async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
     }),
     hooks,
     flowHooks: undefined,
-    dispatcher: { advance, propagateToParent },
-    emitLog: () => {},
+    dispatcher: { advance, settleSuperseded },
   });
   return {
     lifecycle,
@@ -122,7 +123,7 @@ async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
     fired,
     txEnqueued,
     advance,
-    propagateToParent,
+    settleSuperseded,
   };
 }
 
@@ -168,14 +169,16 @@ const scenarios: readonly Scenario[] = [
     prior: true,
     expectDispatch: () => ({ kind: "enqueue", steps: ["analyze"] }),
     expectSuperseded: (prior) => [
-      expect.objectContaining({
+      {
         runId: prior,
-        flowId: "lc-concurrent",
-        error: expect.objectContaining({
-          name: "NagiCanceledError",
-          cause: { canceledByRunId: expect.any(String), concurrencyKey: "v1" },
+        fact: expect.objectContaining({
+          kind: "flow.canceled",
+          cause: "concurrency",
+          runId: prior,
+          canceledByRunId: "run-1",
+          concurrencyKey: "v1",
         }),
-      }),
+      },
     ],
     expectTxEnqueued: 0,
   },
@@ -202,9 +205,7 @@ const scenarios: readonly Scenario[] = [
     boundary: CALLER,
     prior: true,
     expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"], skip: [] }),
-    expectSuperseded: (prior) => [
-      expect.objectContaining({ runId: prior, flowId: "lc-concurrent" }),
-    ],
+    expectSuperseded: (prior) => [expect.objectContaining({ runId: prior })],
     expectTxEnqueued: 1,
   },
   {
@@ -294,7 +295,7 @@ describe("run lifecycle — start scenarios", () => {
       // Staging writes the row (+ tx-bound enqueue) and nothing else: no hooks,
       // no parent propagation, no own-tx enqueue until the effects are applied.
       expect(fx.fired).toEqual([]);
-      expect(fx.propagateToParent).not.toHaveBeenCalled();
+      expect(fx.settleSuperseded).not.toHaveBeenCalled();
       expect(fx.advance).not.toHaveBeenCalled();
       expect(fx.txEnqueued).toHaveLength(s.expectTxEnqueued);
       for (const e of fx.txEnqueued) expect(e.tx).toBe(FAKE_TX);
@@ -311,23 +312,15 @@ describe("run lifecycle — start scenarios", () => {
 
       await fx.lifecycle.applyEffects(effects);
 
-      const supersededHooks = effects.superseded.flatMap(() => [
-        "flow.onError",
-        "onFlowError",
-      ]);
-      expect(fx.fired).toEqual([
-        ...supersededHooks,
-        "flow.onStart",
-        "onFlowStart",
-      ]);
-      expect(fx.propagateToParent).toHaveBeenCalledTimes(
+      expect(fx.fired).toEqual(["flow.onStart", "onFlowStart"]);
+      expect(fx.settleSuperseded).toHaveBeenCalledTimes(
         effects.superseded.length,
       );
       for (const e of effects.superseded) {
-        expect(fx.propagateToParent).toHaveBeenCalledWith(e.runId, {
-          kind: "canceled",
-          error: e.error,
-        });
+        expect(fx.settleSuperseded).toHaveBeenCalledWith(
+          { kind: "resolved", runId: e.runId, flow: s.flow },
+          e.fact,
+        );
       }
       expect(fx.advance).toHaveBeenCalledTimes(
         effects.dispatch.kind === "advance" ? 1 : 0,

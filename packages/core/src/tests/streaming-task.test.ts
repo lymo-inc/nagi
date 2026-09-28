@@ -404,7 +404,7 @@ describe("streamingTask — INVARIANT GUARDS", () => {
     const collected = collect(store.stream.subscribeStream(runId, stepId));
     store.stream.publishChunk(runId, stepId, "live-chunk");
 
-    await store.appendFact(runId, {
+    await store.endRun(runId, {
       kind: "flow.completed",
       runId,
       output: null,

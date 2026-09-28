@@ -1,21 +1,27 @@
-import type { DispatchDeps, SubflowChildOutcome } from "../dispatch";
-import { Facts } from "../facts";
-import { requireCurrent } from "../flows";
+import type { DispatchDeps, EndingRun, RunEnd } from "../dispatch";
+import { NagiCanceledError } from "../errors";
+import { Facts, runCancelCause } from "../facts";
+import { type FlowResolution, requireCurrent } from "../flows";
 import {
   type MatchPromotion,
   nextTransition,
   type SkipDecision,
-  stepStateOf,
 } from "../scheduler";
 import {
   isTerminalRun,
   type RunCancelCause,
   runStatusOf,
+  stepStateOf,
   stepStatusOf,
+  type TerminalPhase,
 } from "../state";
 import type {
   AttemptNumber,
+  CancelArgs,
   Flow,
+  FlowCanceledByConcurrencyFact,
+  FlowCompletedFact,
+  FlowFailedFact,
   Json,
   RunId,
   RunState,
@@ -32,34 +38,24 @@ type StepSettlement =
 
 export interface Progression {
   advance(runId: RunId): Promise<void>;
-  propagateToParent(
-    childRunId: RunId,
-    outcome: SubflowChildOutcome,
+  terminate(run: EndingRun, end: RunEnd): Promise<void>;
+  settleSuperseded(
+    run: EndingRun,
+    fact: FlowCanceledByConcurrencyFact,
   ): Promise<void>;
+  cancel(runId: RunId, args: CancelArgs): Promise<void>;
   wakeParentFromChild(childRunId: RunId): Promise<void>;
 }
 
-// Reconstruct a child's subflow outcome from its PERSISTED terminal phase, for
-// the re-entrant wake path (a re-dispatched subflow step whose child already
-// finished). undefined ⇒ the child is not terminal yet, so there is nothing to
-// propagate. Mirrors the outcomes the in-process finalize/cancel paths pass.
-function subflowOutcomeOf(
-  childRunId: RunId,
-  child: RunState,
-): SubflowChildOutcome | undefined {
-  switch (child.phase.tag) {
-    case "completed":
-      return { kind: "completed", output: child.phase.output };
-    case "failed":
-      return { kind: "failed", error: child.phase.error };
-    case "canceled":
-      return {
-        kind: "canceled",
-        error: cancelCauseToError(childRunId, child.phase.cause),
-      };
-    default:
-      return undefined;
-  }
+// The one cause→error conversion: the flow-error hooks and a woken parent's
+// subflow step see the same error whichever path ended the run.
+function terminalErrorOf(
+  runId: RunId,
+  end: Exclude<TerminalPhase, { readonly tag: "completed" }>,
+): SerializedError {
+  return end.tag === "failed"
+    ? end.error
+    : cancelCauseToError(runId, end.cause);
 }
 
 function cancelCauseToError(
@@ -70,7 +66,7 @@ function cancelCauseToError(
     case "concurrency":
       return {
         name: "NagiCanceledError",
-        message: `Run ${runId} was canceled (superseded by ${cause.canceledByRunId})`,
+        message: new NagiCanceledError({ runId, ...cause }).message,
         cause: {
           canceledByRunId: cause.canceledByRunId,
           concurrencyKey: cause.concurrencyKey,
@@ -89,12 +85,41 @@ function cancelCauseToError(
   }
 }
 
+function endFact(
+  runId: RunId,
+  end: RunEnd,
+  at: Date,
+): FlowCompletedFact | FlowFailedFact | FlowCanceledByConcurrencyFact {
+  switch (end.tag) {
+    case "completed":
+      return Facts.flowCompleted(runId, end.output, at);
+    case "failed":
+      return Facts.flowFailed(runId, end.error, at);
+    case "canceled":
+      return Facts.flowCanceledByConcurrency({
+        runId,
+        at,
+        canceledByRunId: end.cause.canceledByRunId,
+        concurrencyKey: end.cause.concurrencyKey,
+      });
+  }
+}
+
+export function endingRunOf(
+  runId: RunId,
+  resolution: FlowResolution,
+): EndingRun {
+  return resolution.kind === "current"
+    ? { kind: "resolved", runId, flow: resolution.flow }
+    : { kind: "gone", runId, flowId: resolution.error.flowId };
+}
+
 export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
   const { fireHook } = hooks;
 
   async function advance(runId: RunId): Promise<void> {
     const { store, queue } = deps;
-    const flow = requireCurrent(await deps.resolveFlow(runId));
+    const flow = requireCurrent(await deps.flowOf(runId));
 
     for (let iter = 0; iter < MAX_ADVANCE_ITERS; iter++) {
       const runState = await store.loadRunState(runId);
@@ -105,10 +130,16 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
         case "waiting":
           return;
         case "complete":
-          await finalizeFlowCompletion({ flow, runId, output: t.output });
+          await terminate(
+            { kind: "resolved", runId, flow },
+            { tag: "completed", output: t.output },
+          );
           return;
         case "fail":
-          await finalizeFlowFailure({ flow, runId, error: t.error });
+          await terminate(
+            { kind: "resolved", runId, flow },
+            { tag: "failed", error: t.error },
+          );
           return;
         case "dispatch":
           await recordSkips(runId, t.skip);
@@ -128,10 +159,10 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
       name: "NagiCycleError",
       message: `advance exceeded ${MAX_ADVANCE_ITERS} iterations — likely a cycle or infinite skip loop in flow "${flow.id}"`,
     };
-    const finalState = await store.loadRunState(runId);
-    if (!isTerminalRun(finalState)) {
-      await finalizeFlowFailure({ flow, runId, error: cycleError });
-    }
+    await terminate(
+      { kind: "resolved", runId, flow },
+      { tag: "failed", error: cycleError },
+    );
   }
 
   async function recordSkips(
@@ -168,9 +199,8 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
       at,
     };
     if (settlement.kind === "complete") {
-      await deps.store.settleStep(
+      await deps.store.appendFact(
         runId,
-        stepId,
         Facts.stepCompleted(runId, stepId, attempt, settlement.output, at),
       );
       await fireHook(
@@ -179,9 +209,8 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
         "onStepComplete",
       );
     } else {
-      await deps.store.settleStep(
+      await deps.store.appendFact(
         runId,
-        stepId,
         Facts.stepFailed(runId, stepId, attempt, settlement.error, at),
       );
       await fireHook(
@@ -209,40 +238,88 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
     }
   }
 
-  async function finalizeFlowFailure(args: {
-    readonly flow: Flow;
-    readonly runId: RunId;
-    readonly error: SerializedError;
-  }): Promise<void> {
-    const { flow, runId, error } = args;
+  // Every run end is fact → flow hooks → parent wake, and only the writer
+  // whose fact the store admitted goes on to the hooks and the wake. terminate
+  // owns all three; settleSuperseded and cancel differ only in who writes the
+  // fact and (cancel) the child cascade before the wake.
+  async function terminate(run: EndingRun, end: RunEnd): Promise<void> {
+    const at = deps.clock.now();
+    if (!(await deps.store.endRun(run.runId, endFact(run.runId, end, at)))) {
+      deps.emitLog({
+        level: "info",
+        msg: "nagi: run end skipped — run already terminal",
+        attrs: { runId: run.runId, end: end.tag },
+      });
+      return;
+    }
+    await fireTerminalHooks(run, end, at);
+    await propagateToParent(run.runId, end);
+  }
+
+  async function settleSuperseded(
+    run: EndingRun,
+    fact: FlowCanceledByConcurrencyFact,
+  ): Promise<void> {
+    const end: TerminalPhase = { tag: "canceled", cause: runCancelCause(fact) };
+    await fireTerminalHooks(run, end, fact.at);
+    await propagateToParent(run.runId, end);
+  }
+
+  async function cancel(runId: RunId, args: CancelArgs): Promise<void> {
     const { store, clock } = deps;
-    await store.appendFact(runId, Facts.flowFailed(runId, error, clock.now()));
-    const event = { runId, flowId: flow.id, error, at: clock.now() };
-    await fireHook(flow.onError, event, "flow.onError");
+    const run = endingRunOf(runId, await deps.flowOf(runId));
+    const at = clock.now();
+    if (!(await store.endRun(runId, Facts.flowCanceled(runId, args, at)))) {
+      deps.emitLog({
+        level: "info",
+        msg: "nagi: cancel skipped — run already terminal",
+        attrs: { runId, status: runStatusOf(await store.loadRunState(runId)) },
+      });
+      return;
+    }
+    const end: TerminalPhase = { tag: "canceled", cause: runCancelCause(args) };
+    await fireTerminalHooks(run, end, at);
+
+    // Before the parent wake: this run is already terminal, so each child's
+    // own wake is a no-op, and a throwing wake cannot strand live children.
+    for (const childId of await store.listChildren(runId)) {
+      await cancel(childId, {
+        cause: "explicit",
+        reason: `parent ${runId} canceled: ${args.reason}`,
+        note:
+          args.cause === "operator"
+            ? `cascade from operator ${args.actor} aborting parent ${runId}`
+            : `cascade from parent ${runId}`,
+      });
+    }
+
+    await propagateToParent(runId, end);
+  }
+
+  async function fireTerminalHooks(
+    run: EndingRun,
+    end: TerminalPhase,
+    at: Date,
+  ): Promise<void> {
+    const { runId } = run;
+    const flow = run.kind === "resolved" ? run.flow : undefined;
+    const flowId = run.kind === "resolved" ? run.flow.id : run.flowId;
+    if (end.tag === "completed") {
+      const event = { runId, flowId, output: end.output, at };
+      await fireHook(flow?.onComplete, event, "flow.onComplete");
+      await fireHook(deps.hooks?.onFlowComplete, event, "onFlowComplete");
+      return;
+    }
+    const event = { runId, flowId, error: terminalErrorOf(runId, end), at };
+    await fireHook(flow?.onError, event, "flow.onError");
     await fireHook(deps.hooks?.onFlowError, event, "onFlowError");
-    await propagateToParent(runId, { kind: "failed", error });
   }
 
-  async function finalizeFlowCompletion(args: {
-    readonly flow: Flow;
-    readonly runId: RunId;
-    readonly output: Json;
-  }): Promise<void> {
-    const { flow, runId, output } = args;
-    const { store, clock } = deps;
-    await store.appendFact(
-      runId,
-      Facts.flowCompleted(runId, output, clock.now()),
-    );
-    const event = { runId, flowId: flow.id, output, at: clock.now() };
-    await fireHook(flow.onComplete, event, "flow.onComplete");
-    await fireHook(deps.hooks?.onFlowComplete, event, "onFlowComplete");
-    await propagateToParent(runId, { kind: "completed", output });
-  }
-
+  // Idempotent: only a parent step still awaitingChild is settled, so a
+  // second wake (re-entrant wakeParentFromChild, lease-reap) is a no-op.
   async function propagateToParent(
     childRunId: RunId,
-    outcome: SubflowChildOutcome,
+    end: TerminalPhase,
   ): Promise<void> {
     const { store } = deps;
     const childState = await store.loadRunState(childRunId);
@@ -281,7 +358,7 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
     }
     const attempt = parentStep.attempt;
 
-    const parentFlow = requireCurrent(await deps.resolveFlow(parentRunId));
+    const parentFlow = requireCurrent(await deps.flowOf(parentRunId));
 
     await markStepSettled({
       flow: parentFlow,
@@ -290,9 +367,9 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
       attempt,
       stepKind: "subflow",
       settlement:
-        outcome.kind === "completed"
-          ? { kind: "complete", output: { childRunId, output: outcome.output } }
-          : { kind: "fail", error: outcome.error },
+        end.tag === "completed"
+          ? { kind: "complete", output: { childRunId, output: end.output } }
+          : { kind: "fail", error: terminalErrorOf(childRunId, end) },
     });
 
     await advance(parentRunId);
@@ -300,15 +377,13 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
 
   // Re-entrant wake: a parked subflow step was re-dispatched (lease-reap, or a
   // recovery after a lost in-process wake) and its child is ALREADY terminal.
-  // Derive the outcome from the child's persisted phase and route it through
-  // the same guarded propagateToParent — idempotent with the in-process wake
-  // (the awaitingChild guard makes the loser a no-op).
+  // Wakes from the child's persisted phase through the same guarded
+  // propagateToParent as the in-process wake.
   async function wakeParentFromChild(childRunId: RunId): Promise<void> {
-    const child = await deps.store.loadRunState(childRunId);
-    const outcome = subflowOutcomeOf(childRunId, child);
-    if (outcome === undefined) return;
-    await propagateToParent(childRunId, outcome);
+    const { phase } = await deps.store.loadRunState(childRunId);
+    if (phase.tag === "pending" || phase.tag === "running") return;
+    await propagateToParent(childRunId, phase);
   }
 
-  return { advance, propagateToParent, wakeParentFromChild };
+  return { advance, terminate, settleSuperseded, cancel, wakeParentFromChild };
 }

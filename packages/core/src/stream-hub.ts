@@ -1,11 +1,20 @@
+import type { StreamEffect } from "./facts";
+import { isStepTerminal, isTerminalRun, stepStateOf } from "./state";
 import type {
   AttemptNumber,
   Json,
   RunId,
+  RunState,
   SerializedError,
   StepId,
   StreamEvent,
 } from "./types";
+
+// Durable facts decide whether a step's stream is over, not the hub, which may
+// never have held a channel for it (the close fired before anyone listened).
+export function isStreamOver(state: RunState, stepId: StepId): boolean {
+  return isTerminalRun(state) || isStepTerminal(stepStateOf(state, stepId));
+}
 
 export const STREAM_SUBSCRIBER_BUFFER_CAP = 256;
 
@@ -170,6 +179,23 @@ export class InMemoryStreamHub {
     for (const sub of subs ?? []) {
       sub.push(event);
       sub.close();
+    }
+  }
+
+  apply(runId: RunId, effect: StreamEffect): void {
+    switch (effect.tag) {
+      case "close-ok":
+        this.closeOk(runId, effect.stepId);
+        return;
+      case "close-error":
+        this.closeError(runId, effect.stepId, effect.error);
+        return;
+      case "retry":
+        this.signalRetry(runId, effect.stepId, effect.nextAttempt);
+        return;
+      case "close-run":
+        this.closeRun(runId);
+        return;
     }
   }
 

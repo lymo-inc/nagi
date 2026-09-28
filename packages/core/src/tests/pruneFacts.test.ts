@@ -54,7 +54,7 @@ async function seedRuns(
                 canceledByRunId: runId,
                 concurrencyKey: "k",
               };
-      await store.appendFact(runId, tFact);
+      await store.endRun(runId, tFact);
     }
     runIds.push(runId);
   }
@@ -274,7 +274,7 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
       at: new Date(1100),
       parent: { runId: parentId, stepId: "sub" },
     });
-    await store.settleStep(childId, "s1", {
+    await store.appendFact(childId, {
       kind: "step.completed",
       runId: childId,
       stepId: "s1",
@@ -284,7 +284,7 @@ describe("InMemoryStore.pruneFacts — secondary state cleanup", () => {
     });
     await store.recordOnce(childId, "s1", "scope", { recorded: true });
     await store.claimStep(childId, "s2", 1);
-    await store.appendFact(childId, {
+    await store.endRun(childId, {
       kind: "flow.completed",
       runId: childId,
       at: new Date(1500),

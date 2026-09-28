@@ -2,12 +2,11 @@ import { fingerprintFlows } from "./canonicalize";
 import { type DispatchDeps, makeDispatcher } from "./dispatch";
 import { NagiRuntimeError, validationError } from "./errors";
 import { makeHooks } from "./exec/hooks";
-import { type FlowResolution, registerFlows } from "./flows";
-import { asStepMapWithDefs, compact, getDef, makeEmit } from "./internal";
-import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
+import { type FlowOf, makeFlowOf, pinRun, registerFlows } from "./flows";
+import { compact, makeEmit } from "./internal";
 import { InMemoryClock } from "./memory";
 import { makeOperator } from "./operator";
-import { makeReplay } from "./replay";
+import { makeReplay, type ReplayScope } from "./replay";
 import { makeRunLifecycle } from "./run-lifecycle";
 import type { RunDescription } from "./run-view";
 import { makeSignals } from "./signals";
@@ -70,9 +69,7 @@ export interface NagiConfig {
   // park WITHOUT holding a slot. Timeout-less in-step waits have starved
   // entire worker pools in production.
   readonly leaseHoldWarnMs?: Millis;
-  // Lease-reaper sweep cadence. Default 30s — stay ≤ ½ the store lease TTL so
-  // a crashed worker is reaped within one TTL. 0 disables the reaper (tests,
-  // or external/cron-driven reaping).
+  /** @deprecated Set `WorkerConfig.reaperIntervalMs`; this is only its fallback. */
   readonly reaperIntervalMs?: Millis;
 }
 
@@ -116,8 +113,8 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
 
   // Staged transactional start (D5=B). The store run-row insert, flow.started
   // fact, and initial-step queue enqueue commit (or roll back) on the
-  // caller's `opts.tx`. Concurrency-supersession cancel hooks AND
-  // dispatcher.propagateToParent fire from applyOnCommit, which the caller
+  // caller's `opts.tx`. Concurrency-supersession cancel hooks AND the
+  // superseded runs' parent wakes fire from applyOnCommit, which the caller
   // MUST invoke after their tx commits. Idempotent: a second applyOnCommit
   // call is a no-op.
   startStaged<F extends TFlows[number]>(
@@ -199,23 +196,6 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     return events;
   };
 
-  // Streaming steps publish ephemeral chunks out-of-band, so without a transport
-  // they cannot be carried. Only scanned on the failure path.
-  if (streamTransport === undefined) {
-    for (const f of config.flows) {
-      for (const [stepId, step] of Object.entries(asStepMapWithDefs(f.steps))) {
-        if (getDef(step).kind !== "streaming") continue;
-        throw new NagiRuntimeError(
-          `Flow "${f.id}" has a streaming step "${stepId}" (b.streamingTask), ` +
-            `but the store has no \`stream\` transport — it cannot carry ` +
-            `ephemeral chunks. The in-memory store always exposes one; ` +
-            `postgresStore() needs a \`listener\`. Otherwise remove ` +
-            `the streaming step.`,
-        );
-      }
-    }
-  }
-
   const registry = await registerFlows({
     flows: config.flows,
     store: config.store,
@@ -227,85 +207,92 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
 
   const driftPolicy: DriftPolicy = config.driftPolicy ?? "freeze";
 
-  // The one place a run meets its flow, for dispatch, hooks and replay alike.
-  // Under "synthesize" a drifted-but-live run resolves to its pinned DAG with
-  // the live handlers attached; only a run nagi cannot honestly rebuild stays
-  // gone-live for the worker's snapshot-gone policy.
-  async function resolveFlow(runId: RunId): Promise<FlowResolution> {
-    const resolution = registry.resolve(await config.store.loadRunState(runId));
-    if (resolution.kind !== "gone-live" || driftPolicy === "freeze") {
-      return resolution;
-    }
-    try {
-      return { kind: "current", flow: await registry.synthesize(resolution) };
-    } catch (err) {
-      if (!(err instanceof NagiRuntimeError)) throw err;
-      emitLog({
-        level: "warn",
-        msg: "resolveFlow: drift synthesis failed — treating run as snapshot-gone",
-        attrs: {
-          runId: resolution.error.runId,
-          flowId: resolution.error.flowId,
-          pinnedHash: resolution.error.pinnedHash,
-          error: err.message,
-        },
-      });
-      return resolution;
-    }
+  const flowOfUnder = makeFlowOf({ registry, store: config.store, emitLog });
+  const flowOf: FlowOf = (runId) => flowOfUnder(runId, driftPolicy);
+
+  // A dispatcher and the lifecycle its subflow steps start children through.
+  // The runtime's own pair runs on the shared queue with hooks on; a replay
+  // gets a pair of its own per call (see ReplayScope).
+  function makeEngine(env: {
+    readonly flowOf: FlowOf;
+    readonly queue: Queue;
+    readonly fireHooks: boolean;
+  }) {
+    const deps: DispatchDeps = {
+      flowOf: env.flowOf,
+      lookupFlow: (flowId) => registry.get(flowId),
+      startChildRun: (args) => lifecycle.startChildRun(args),
+      store: config.store,
+      queue: env.queue,
+      clock,
+      emitLog,
+      fireHooks: env.fireHooks,
+      // The one fork point for heartbeat tuning: collapse the public optionals to
+      // a single required config here so the dispatch internals never re-check it.
+      heartbeat: {
+        intervalMs: config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
+        leaseMs: config.heartbeatLeaseMs ?? DEFAULT_HEARTBEAT_LEASE_MS,
+        holdWarnMs: config.leaseHoldWarnMs ?? DEFAULT_LEASE_HOLD_WARN_MS,
+      },
+      ...compact({
+        hooks: config.hooks,
+        defaultRetry: config.defaultRetry,
+        streamTransport,
+      }),
+    };
+    const dispatcher = makeDispatcher(deps);
+    // Flow-start hooks fire outside the dispatch path, so the lifecycle owns
+    // its own Hooks.
+    const hooks = makeHooks(deps);
+    const lifecycle = makeRunLifecycle({
+      store: config.store,
+      queue: env.queue,
+      clock,
+      registry,
+      flowOf: env.flowOf,
+      codeVersion,
+      queueForTx: (tx) => config.queue.withTx?.(tx) ?? config.queue,
+      hooks,
+      flowHooks: config.hooks,
+      dispatcher,
+    });
+    return { deps, dispatcher, hooks, lifecycle };
   }
 
-  function lookupFlow(flowId: string): Flow | undefined {
-    return registry.get(flowId);
-  }
-
-  const dispatchDeps: DispatchDeps = {
-    resolveFlow,
-    lookupFlow,
-    startChildRun: (args) => lifecycle.startChildRun(args),
-    store: config.store,
-    queue: config.queue,
-    clock,
-    emitLog,
-    // The one fork point for heartbeat tuning: collapse the public optionals to
-    // a single required config here so the dispatch internals never re-check it.
-    heartbeat: {
-      intervalMs: config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
-      leaseMs: config.heartbeatLeaseMs ?? DEFAULT_HEARTBEAT_LEASE_MS,
-      holdWarnMs: config.leaseHoldWarnMs ?? DEFAULT_LEASE_HOLD_WARN_MS,
-    },
-    ...compact({
-      hooks: config.hooks,
-      defaultRetry: config.defaultRetry,
-      streamTransport,
-    }),
-  };
-  const dispatcher = makeDispatcher(dispatchDeps);
-  // Runtime fires flow-level hooks directly (concurrency-cancel on start, and
-  // cancelRunRecursive) — outside the dispatch path, so it owns its own Hooks.
-  const hooks = makeHooks(dispatchDeps);
-  const lifecycle = makeRunLifecycle({
-    store: config.store,
-    queue: config.queue,
-    clock,
-    registry,
-    codeVersion,
-    queueForTx: (tx) => config.queue.withTx?.(tx) ?? config.queue,
-    hooks,
-    flowHooks: config.hooks,
+  const {
+    deps: dispatchDeps,
     dispatcher,
-    emitLog,
-  });
+    hooks,
+    lifecycle,
+  } = makeEngine({ flowOf, queue: config.queue, fireHooks: true });
 
   const signals = makeSignals({
     dispatcher,
     store: config.store,
     clock,
-    registry,
+    // A signal only settles facts; under "freeze" a frozen-version worker may
+    // still own the run and apply it, so its steps are named from the pinned
+    // shape whatever this process may run.
+    flowOf: (runId) => flowOfUnder(runId, "synthesize"),
     hooks,
     emitLog,
     ...compact({ flowHooks: config.hooks }),
   });
-  const replayer = makeReplay({ ...dispatchDeps, registry, driftPolicy });
+  const replayer = makeReplay({
+    store: config.store,
+    queue: config.queue,
+    clock,
+    registry,
+    driftPolicy,
+    flowOfUnder,
+    dispatcherFor: (scope: ReplayScope) =>
+      makeEngine({
+        flowOf: pinRun(scope.run.runId, scope.run.flow, flowOf),
+        ...(scope.kind === "enqueue"
+          ? { queue: config.queue, fireHooks: true }
+          : { queue: scope.queue, fireHooks: false }),
+      }).dispatcher,
+  });
 
   const wf: Wf = {
     async start<F extends Flow>(
@@ -373,7 +360,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     signal: signals.signal,
 
     async cancel(runId: RunId, opts?: CancelOpts): Promise<void> {
-      await lifecycle.cancelRunRecursive(runId, {
+      await dispatcher.cancel(runId, {
         cause: "explicit",
         reason: opts?.reason ?? "explicit wf.cancel()",
       });
@@ -384,8 +371,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         dispatcher,
         store: config.store,
         clock,
-        registry,
-        cancelRunRecursive: lifecycle.cancelRunRecursive,
+        flowOf,
         emitLog,
       });
     },
@@ -396,7 +382,16 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
           "nagi(): no flows registered — cannot create a worker.",
         );
       }
-      return makeWorker({ ...dispatchDeps, clock }, workerConfig);
+      return makeWorker(
+        { ...dispatchDeps, clock },
+        {
+          ...workerConfig,
+          ...compact({
+            reaperIntervalMs:
+              workerConfig?.reaperIntervalMs ?? config.reaperIntervalMs,
+          }),
+        },
+      );
     },
 
     replay: replayer.replay,
@@ -520,51 +515,14 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
     : internal.signal;
   const worker = wf.worker({ ...config.worker, signal });
 
-  const emitLog = makeEmit(config.onLog);
-  const clock = config.clock ?? new InMemoryClock();
   const loop = worker.run();
   loop.catch((err: unknown) => {
     if (signal.aborted) return; // graceful shutdown — not a crash
-    emitLog({
+    makeEmit(config.onLog)({
       level: "error",
       msg: "nagi.run: worker exited unexpectedly",
       attrs: { error: String(err) },
     });
-  });
-
-  // Lease-reaper loop. Driven by clock.sleep so fake clocks (tests) can step
-  // it deterministically; aborts on stop() via the shared signal so process
-  // shutdown drains cleanly without orphaning a pending timer.
-  const reaperIntervalMs =
-    config.reaperIntervalMs ?? DEFAULT_REAPER_INTERVAL_MS;
-  const reaper: Promise<void> =
-    reaperIntervalMs > 0
-      ? (async () => {
-          while (!signal.aborted) {
-            try {
-              await clock.sleep(reaperIntervalMs, signal);
-            } catch {
-              return; // aborted via signal — graceful shutdown
-            }
-            if (signal.aborted) return;
-            try {
-              await config.store.sweepLeases({
-                now: clock.now(),
-                queue: config.queue,
-              });
-            } catch (err) {
-              emitLog({
-                level: "warn",
-                msg: "nagi.run: lease reaper sweep failed",
-                attrs: { error: String(err) },
-              });
-            }
-          }
-        })()
-      : Promise.resolve();
-  reaper.catch(() => {
-    // sweep errors are already logged; this catch only guards against an
-    // uncaught rejection from the loop's own teardown.
   });
 
   let stopping: Promise<void> | undefined;
@@ -575,11 +533,6 @@ async function nagiRun<const TFlows extends ReadonlyArray<Flow>>(
         await loop;
       } catch {
         // graceful abort, or a crash already logged above — stop() never throws.
-      }
-      try {
-        await reaper;
-      } catch {
-        // reaper rejections are already logged above.
       }
     })();
     return stopping;

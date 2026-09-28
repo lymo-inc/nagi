@@ -1,13 +1,38 @@
-import type { CanonicalDag, CanonicalStep } from "./canonicalize";
+import {
+  type CanonicalDag,
+  type CanonicalStep,
+  stableStringify,
+} from "./canonicalize";
 import type { StepId } from "./types";
 
+// Every hashed CanonicalStep field except `needs` (reported as edges) must be
+// listed, so a snapshot-hash change always surfaces in the diff.
+const CHANGED_FIELD = {
+  kind: "kind",
+  whenHash: "when",
+  retry: "retry",
+  timeoutMs: "timeoutMs",
+  signalSchema: "signalSchema",
+  signalNames: "signalNames",
+  matchArms: "matchArms",
+  childFlowId: "childFlowId",
+  subflowInputHash: "subflowInput",
+} as const satisfies Record<
+  Exclude<keyof CanonicalStep, "id" | "needs">,
+  string
+>;
+
 export type SnapshotChangedField =
-  | "kind"
-  | "when"
-  | "retry"
-  | "timeoutMs"
-  | "signalSchema"
-  | "matchArms";
+  (typeof CHANGED_FIELD)[keyof typeof CHANGED_FIELD];
+
+// Every hashed CanonicalDag field except `steps` (diffed per step) must be listed.
+const CHANGED_FLOW_FIELD = {
+  flowId: "flowId",
+  inputSchema: "inputSchema",
+} as const satisfies Record<Exclude<keyof CanonicalDag, "steps">, string>;
+
+export type SnapshotChangedFlowField =
+  (typeof CHANGED_FLOW_FIELD)[keyof typeof CHANGED_FLOW_FIELD];
 
 export interface SnapshotChangedEdge {
   readonly from: StepId;
@@ -22,6 +47,7 @@ export interface SnapshotChangedPredicate {
 }
 
 export interface SnapshotDiff {
+  readonly changedFlowFields: readonly SnapshotChangedFlowField[];
   readonly addedSteps: readonly StepId[];
   readonly removedSteps: readonly StepId[];
   readonly changedEdges: readonly SnapshotChangedEdge[];
@@ -65,7 +91,23 @@ export function diffSnapshots(
     a.stepId !== b.stepId ? cmp(a.stepId, b.stepId) : cmp(a.field, b.field),
   );
 
-  return { addedSteps, removedSteps, changedEdges, changedPredicates };
+  const changedFlowFields: SnapshotChangedFlowField[] = [];
+  for (const key of Object.keys(CHANGED_FLOW_FIELD) as Array<
+    keyof typeof CHANGED_FLOW_FIELD
+  >) {
+    if (stableStringify(before[key]) !== stableStringify(after[key])) {
+      changedFlowFields.push(CHANGED_FLOW_FIELD[key]);
+    }
+  }
+  changedFlowFields.sort(cmp);
+
+  return {
+    changedFlowFields,
+    addedSteps,
+    removedSteps,
+    changedEdges,
+    changedPredicates,
+  };
 }
 
 function diffEdges(
@@ -103,74 +145,14 @@ function diffFields(
   after: CanonicalStep,
   out: SnapshotChangedPredicate[],
 ): void {
-  const id = after.id;
-  if (before.kind !== after.kind) {
-    out.push({ stepId: id, field: "kind" });
-  }
-  if (before.whenHash !== after.whenHash) {
-    out.push({ stepId: id, field: "when" });
-  }
-  if (!retryEq(before.retry, after.retry)) {
-    out.push({ stepId: id, field: "retry" });
-  }
-  if (before.timeoutMs !== after.timeoutMs) {
-    out.push({ stepId: id, field: "timeoutMs" });
-  }
-  if (!schemaEq(before.signalSchema, after.signalSchema)) {
-    out.push({ stepId: id, field: "signalSchema" });
-  }
-  if (!armsEq(before.matchArms, after.matchArms)) {
-    out.push({ stepId: id, field: "matchArms" });
-  }
-}
-
-function retryEq(
-  a: CanonicalStep["retry"],
-  b: CanonicalStep["retry"],
-): boolean {
-  if (a === b) return true;
-  if (a === undefined || b === undefined) return false;
-  return (
-    a.maxAttempts === b.maxAttempts &&
-    a.backoff === b.backoff &&
-    a.initialDelayMs === b.initialDelayMs &&
-    a.maxDelayMs === b.maxDelayMs
-  );
-}
-
-function schemaEq(
-  a: CanonicalStep["signalSchema"],
-  b: CanonicalStep["signalSchema"],
-): boolean {
-  if (a === b) return true;
-  if (a === undefined || b === undefined) return false;
-  return (
-    a.vendor === b.vendor &&
-    a.version === b.version &&
-    a.validateHash === b.validateHash
-  );
-}
-
-function armsEq(
-  a: CanonicalStep["matchArms"],
-  b: CanonicalStep["matchArms"],
-): boolean {
-  if (a === b) return true;
-  if (a === undefined || b === undefined) return false;
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const x = a[i];
-    const y = b[i];
-    if (x === undefined || y === undefined) return false;
-    if (x.id !== y.id) return false;
-    if (x.otherwise !== y.otherwise) return false;
-    if (x.whenHash !== y.whenHash) return false;
-    if (x.stepIds.length !== y.stepIds.length) return false;
-    for (let j = 0; j < x.stepIds.length; j++) {
-      if (x.stepIds[j] !== y.stepIds[j]) return false;
+  for (const key of Object.keys(CHANGED_FIELD) as Array<
+    keyof typeof CHANGED_FIELD
+  >) {
+    // Same serializer as the snapshot hash, so "changed" means exactly "hash-relevant change".
+    if (stableStringify(before[key]) !== stableStringify(after[key])) {
+      out.push({ stepId: after.id, field: CHANGED_FIELD[key] });
     }
   }
-  return true;
 }
 
 function cmp(a: string, b: string): number {

@@ -1,43 +1,43 @@
 import { NagiConcurrencyConflictError } from "./errors";
-import { Facts, foldRun } from "./facts";
+import {
+  factConsequences,
+  foldRun,
+  isRunEnd,
+  type Release,
+  type RowDelta,
+} from "./facts";
 import { decideExpiredLeaseAction, type ReapedLease } from "./lease-reaper";
-import { InMemoryRunEventHub, runEventOf } from "./run-events";
-import type {
-  RunDescription,
-  RunView,
-  StepRunStatus,
-  StepView,
-} from "./run-view";
+import {
+  nextRunRow,
+  nextStepRow,
+  type RunRow,
+  type StepRow,
+} from "./read-model";
+import { InMemoryRunEventHub } from "./run-events";
+import type { RunDescription, StepView } from "./run-view";
 import { decideSignal, decideTimeout } from "./signals";
 import {
-  attemptOf,
-  errorOf,
-  isTerminalRun,
-  outputOf,
-  runStatusOf,
-  stepStateOf,
-  stepStatusOf,
-} from "./state";
-import {
+  admitsRunEnd,
   clampQueryLimit,
   compareRunOrder,
   DEFAULT_SWEEP_LIMIT,
   decodeRunCursor,
   encodeRunCursor,
-  factEffects,
   isPastCursor,
   jsonContains,
+  type PruneCandidate,
+  type Superseded,
   selectExpired,
   selectPruneBatch,
+  supersede,
 } from "./store-policy";
-import { InMemoryStreamHub } from "./stream-hub";
+import { InMemoryStreamHub, isStreamOver } from "./stream-hub";
 import type {
   AttemptNumber,
   ClaimToken,
   Clock,
   ConcurrencyMode,
   Fact,
-  FlowCanceledByConcurrencyFact,
   FlowStartedFact,
   GetOnceResult,
   GlobalFact,
@@ -52,6 +52,7 @@ import type {
   QueueEnqueueOpts,
   QueueInspectEntry,
   QueueMessage,
+  RunEndFact,
   RunEventTransport,
   RunId,
   RunState,
@@ -110,8 +111,9 @@ export class InMemoryStore implements Store {
   private readonly keyByActiveRun = new Map<RunId, string>();
   // Kept past terminal facts so a reopened run can re-take its slot.
   private readonly slotByRun = new Map<RunId, string>();
-  private readonly childrenByParent = new Map<RunId, Set<RunId>>();
-  private readonly summaries = new Map<RunId, RunSummary>();
+  // The read model (Postgres: workflow_run / step_run), fed only by row deltas.
+  private readonly runRows = new Map<RunId, RunRow>();
+  private readonly stepRows = new Map<RunId, Map<StepId, StepRow>>();
   private readonly streamHub = new InMemoryStreamHub();
   // Durable signal-timeout deadlines (the Postgres `timer` table), distinct
   // from InMemoryClock's setTimeout-based scheduler.
@@ -122,7 +124,24 @@ export class InMemoryStore implements Store {
     this.leaseMs = opts.leaseMs ?? DEFAULT_STORE_LEASE_MS;
   }
 
-  async appendFact(runId: RunId, fact: Fact): Promise<void> {
+  async appendFact(
+    runId: RunId,
+    fact: Exclude<Fact, RunEndFact>,
+  ): Promise<void> {
+    this.writeFact(runId, fact);
+  }
+
+  async endRun(runId: RunId, fact: RunEndFact): Promise<boolean> {
+    return this.writeFact(runId, fact);
+  }
+
+  // The one fact-write path. Synchronous on purpose: with no await between the
+  // read that led to a write and the write itself, every caller gets the
+  // atomicity the Postgres store takes a transaction for.
+  private writeFact(runId: RunId, fact: Fact): boolean {
+    if (isRunEnd(fact) && !admitsRunEnd(this.runRows.get(runId)?.status)) {
+      return false;
+    }
     const list = this.facts.get(runId) ?? [];
     if (fact.kind === "step.reset") {
       // Mirror of the Postgres partial unique index: a reopened run re-takes
@@ -146,48 +165,35 @@ export class InMemoryStore implements Store {
     }
     list.push(fact);
     this.facts.set(runId, list);
-    // Lifecycle fan-out rides the same durable write as the stream hub below,
-    // so an observer never sees an event for a fact that was not persisted.
-    const event = runEventOf(fact);
+    const { rows, release, stream, event } = factConsequences(fact);
+    if (rows !== null) this.applyRows(runId, rows);
+    if (release !== null) this.release(runId, release);
+    if (stream !== null) this.streamHub.apply(runId, stream);
     if (event !== null) this.eventHub.publish({ ...event, runId });
-    // Drive the stream hub off the durable fact log. These fire for ALL steps;
-    // the hub's close*/closeRun are safe no-ops for non-streaming steps (no
-    // channel exists, so nothing is created and nothing leaks).
-    switch (fact.kind) {
-      case "step.completed":
-        this.streamHub.closeOk(runId, fact.stepId);
-        break;
-      case "step.failed":
-        // Only written on terminal failure (retries use step.retried), so this
-        // is always retries-exhausted.
-        this.streamHub.closeError(runId, fact.stepId, fact.error);
-        break;
-      case "step.retried":
-        // The retry event carries the NEXT attempt number.
-        this.streamHub.signalRetry(
-          runId,
-          fact.stepId,
-          (fact.attempt + 1) as AttemptNumber,
-        );
-        break;
-      case "flow.completed":
-      case "flow.failed":
-      case "flow.canceled":
-        // Close every still-open channel for the run so a subscriber to a
-        // skipped/typo'd/never-emitting step never hangs.
-        this.streamHub.closeRun(runId);
-        break;
-    }
-    // Every fact write applies the release table, so settle paths only append.
-    const effects = factEffects(fact);
-    switch (effects.tag) {
-      case "none":
-        return;
+    return true;
+  }
+
+  private applyRows(runId: RunId, delta: RowDelta): void {
+    const run = nextRunRow(this.runRows.get(runId), delta);
+    if (run !== undefined) this.runRows.set(runId, run);
+    if (delta.row === "run") return;
+    const steps = this.stepRows.get(runId) ?? new Map<StepId, StepRow>();
+    const step = nextStepRow(steps.get(delta.stepId), delta);
+    if (step === undefined) steps.delete(delta.stepId);
+    else steps.set(delta.stepId, step);
+    this.stepRows.set(runId, steps);
+  }
+
+  private release(runId: RunId, release: Release): void {
+    switch (release.tag) {
       case "release-step":
-        this.releaseLeases(runId, effects.stepId);
-        if (effects.timer) {
-          this.signalTimers.delete(timerKey(runId, effects.stepId));
+        this.releaseLeases(runId, release.stepId);
+        if (release.timer) {
+          this.signalTimers.delete(timerKey(runId, release.stepId));
         }
+        return;
+      case "release-lease":
+        this.leases.delete(leaseKey(runId, release.stepId, release.attempt));
         return;
       case "release-run": {
         const slot = this.keyByActiveRun.get(runId);
@@ -218,53 +224,36 @@ export class InMemoryStore implements Store {
     },
   ): Promise<{
     readonly started: boolean;
-    readonly canceled: ReadonlyArray<{
-      readonly runId: RunId;
-      readonly fact: FlowCanceledByConcurrencyFact;
-    }>;
+    readonly canceled: ReadonlyArray<Superseded>;
   }> {
-    if (this.runExists(runId)) {
+    // A run pruned with keepSummary keeps its row, so its runId stays taken.
+    if (this.runRows.has(runId)) {
       return { started: false, canceled: [] };
     }
 
-    const canceled: Array<{
-      runId: RunId;
-      fact: FlowCanceledByConcurrencyFact;
-    }> = [];
+    const canceled: Superseded[] = [];
     if (concurrency !== undefined) {
       const slot = `${fact.flowId}::${concurrency.key}`;
-      const priorRunId = this.activeByKey.get(slot);
-      if (priorRunId !== undefined) {
-        const cancelFact = Facts.flowCanceledByConcurrency({
-          runId: priorRunId,
-          at: fact.at,
-          canceledByRunId: runId,
-          concurrencyKey: concurrency.key,
-        });
-        await this.appendFact(priorRunId, cancelFact);
-        canceled.push({ runId: priorRunId, fact: cancelFact });
+      const prior = this.activeByKey.get(slot);
+      for (const c of supersede({
+        start: fact,
+        concurrency,
+        priors: prior === undefined ? [] : [prior],
+      })) {
+        if (this.writeFact(c.runId, c.fact)) canceled.push(c);
       }
       this.activeByKey.set(slot, runId);
       this.keyByActiveRun.set(runId, slot);
       this.slotByRun.set(runId, slot);
     }
 
-    this.facts.set(runId, [fact]);
-    // flow.started never passes through appendFact — the run row and its first
-    // fact are written together here — so the event is published here too.
-    this.eventHub.publish({ type: "flow.started", flowId: fact.flowId, runId });
-    const parentRunId = fact.parent?.runId;
-    if (parentRunId !== undefined) {
-      const set = this.childrenByParent.get(parentRunId) ?? new Set<RunId>();
-      set.add(runId);
-      this.childrenByParent.set(parentRunId, set);
-    }
+    this.writeFact(runId, fact);
     return { started: true, canceled };
   }
 
-  // In-memory has no real tx; we share the underlying maps with tryStartRun,
-  // so the implementation is intentionally a straight delegate. The `tx`
-  // parameter is accepted for shape-compat with the Store contract.
+  // No real tx to join: every write here is visible, and announced, the moment
+  // it happens, and nothing the caller does later can roll it back. Events stay
+  // exactly as durable as the facts they report.
   async tryStartRunOnTx(
     _tx: Tx,
     runId: RunId,
@@ -275,36 +264,30 @@ export class InMemoryStore implements Store {
     },
   ): Promise<{
     readonly started: boolean;
-    readonly canceled: ReadonlyArray<{
-      readonly runId: RunId;
-      readonly fact: FlowCanceledByConcurrencyFact;
-    }>;
+    readonly canceled: ReadonlyArray<Superseded>;
   }> {
     return this.tryStartRun(runId, fact, concurrency);
   }
 
   async listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>> {
-    const set = this.childrenByParent.get(parentRunId);
-    if (set === undefined) return [];
-    return Array.from(set);
+    return this.childRows(parentRunId).map(([runId]) => runId);
+  }
+
+  private childRows(parentRunId: RunId): Array<[RunId, RunRow]> {
+    return [...this.runRows].filter(
+      ([, row]) => row.parent?.runId === parentRunId,
+    );
   }
 
   // Does a non-terminal child exist for this (parentRunId, stepId)? Used by the
   // reaper to leave a subflow step parked while its child still runs (instead
-  // of re-dispatching it at attempt+1). childrenByParent is keyed by parent run
-  // only, so filter on the child's parent.stepId.
+  // of re-dispatching it at attempt+1).
   private hasActiveChild(parentRunId: RunId, parentStepId: StepId): boolean {
-    const childIds = this.childrenByParent.get(parentRunId);
-    if (childIds === undefined) return false;
-    for (const childId of childIds) {
-      const factList = this.facts.get(childId);
-      if (factList === undefined) continue;
-      const child = foldRun(childId, factList);
-      if (child.parent?.stepId === parentStepId && !isTerminalRun(child)) {
-        return true;
-      }
-    }
-    return false;
+    return this.childRows(parentRunId).some(
+      ([, row]) =>
+        row.parent?.stepId === parentStepId &&
+        (row.status === "pending" || row.status === "running"),
+    );
   }
 
   async loadRunState(runId: RunId): Promise<RunState> {
@@ -361,11 +344,7 @@ export class InMemoryStore implements Store {
 
     for (const lease of candidates) {
       const { runId, stepId, attempt } = lease;
-      const factList = this.facts.get(runId);
-      const state = factList ? foldRun(runId, factList) : null;
-      const stepStatus: StepRunStatus = state
-        ? stepStatusOf(stepStateOf(state, stepId))
-        : "pending";
+      const flowId = this.runRows.get(runId)?.flowId;
       const decision = decideExpiredLeaseAction({
         lease: {
           runId,
@@ -373,22 +352,28 @@ export class InMemoryStore implements Store {
           attempt,
           expiresAt: new Date(lease.expiresAt),
         },
-        stepStatus,
+        stepStatus: this.stepRows.get(runId)?.get(stepId)?.status ?? "pending",
         childActive: this.hasActiveChild(runId, stepId),
         now,
       });
       if (decision.tag === "skip") continue;
 
-      this.leases.delete(leaseKey(runId, stepId, attempt));
-      await this.appendFact(
-        runId,
-        Facts.leaseReaped({ runId, stepId, attempt, at: now, reapedAt: now }),
-      );
-      await queue.enqueue(runId, stepId, {
-        attempt: decision.nextAttempt,
-        delayMs: decision.backoffMs,
-        ...(state?.flowId !== undefined ? { flowId: state.flowId } : {}),
-      });
+      // No tx to roll back: take the lease before the await so a concurrent
+      // sweep cannot reap it twice, and hand it back if the enqueue fails so
+      // nothing is left half-reaped.
+      const key = leaseKey(runId, stepId, attempt);
+      this.leases.delete(key);
+      try {
+        await queue.enqueue(runId, stepId, {
+          attempt: decision.nextAttempt,
+          delayMs: decision.backoffMs,
+          ...(flowId !== undefined ? { flowId } : {}),
+        });
+      } catch (err) {
+        this.leases.set(key, lease);
+        throw err;
+      }
+      this.writeFact(runId, decision.fact);
       reaped.push({
         runId,
         stepId,
@@ -398,14 +383,6 @@ export class InMemoryStore implements Store {
     }
 
     return reaped;
-  }
-
-  async settleStep(
-    runId: RunId,
-    _stepId: StepId,
-    fact: StepCompletedFact | StepFailedFact,
-  ): Promise<void> {
-    await this.appendFact(runId, fact);
   }
 
   async settleSignal(args: {
@@ -427,11 +404,11 @@ export class InMemoryStore implements Store {
       case "noop":
         return decision.result;
       case "buffer":
-        if (decision.fact !== null) await this.appendFact(runId, decision.fact);
+        if (decision.fact !== null) this.writeFact(runId, decision.fact);
         return decision.result;
       case "deliver":
-        await this.appendFact(runId, decision.received);
-        await this.appendFact(runId, decision.completed);
+        this.writeFact(runId, decision.received);
+        this.writeFact(runId, decision.completed);
         return decision.result;
     }
   }
@@ -467,7 +444,7 @@ export class InMemoryStore implements Store {
       // Fired once: consumed whether or not the step was still awaiting.
       this.signalTimers.delete(timerKey(runId, stepId));
       if (decision.kind === "noop") continue;
-      await this.appendFact(runId, decision.fact);
+      this.writeFact(runId, decision.fact);
       timedOut.push({ runId, stepId, attempt: decision.attempt, fireAt });
     }
 
@@ -503,7 +480,7 @@ export class InMemoryStore implements Store {
     }>,
   ): Promise<T> {
     const result = await body(undefined as unknown as Tx);
-    await this.appendFact(runId, result.fact);
+    this.writeFact(runId, result.fact);
     return result.output;
   }
 
@@ -548,12 +525,8 @@ export class InMemoryStore implements Store {
       (where.input === undefined || jsonContains(summary.input, where.input));
 
     const summaries: RunSummary[] = [];
-    for (const [runId, factList] of this.facts) {
-      const summary = summarize(runId as RunId, factList);
-      if (summary === null) continue;
-      if (matches(summary)) summaries.push(summary);
-    }
-    for (const summary of this.summaries.values()) {
+    for (const [runId, row] of this.runRows) {
+      const summary = summaryOf(runId, row);
       if (matches(summary)) summaries.push(summary);
     }
     summaries.sort(compareRunOrder);
@@ -579,156 +552,53 @@ export class InMemoryStore implements Store {
   }
 
   async describe(runId: RunId): Promise<RunDescription> {
-    const factList = this.facts.get(runId);
-    if (factList === undefined || factList.length === 0) {
-      return this.describeSummary(runId);
-    }
-    const first = factList[0];
-    if (first === undefined || first.kind !== "flow.started") return null;
-
-    const state = foldRun(runId, factList);
-    const status = runStatusOf(state);
-
-    let completedAt: Date | undefined;
-    let output: Json | undefined;
-    let error: Json | undefined;
-    let canceledByRunId: RunId | undefined;
-    let concurrencyKey: string | undefined;
-    // A reopened run carries stale terminal facts; only a terminal phase owns them.
-    for (let i = isTerminalRun(state) ? factList.length - 1 : -1; i >= 0; i--) {
-      const f = factList[i];
-      if (f === undefined) continue;
-      if (f.kind === "flow.completed") {
-        completedAt = f.at;
-        output = f.output;
-        break;
-      }
-      if (f.kind === "flow.failed") {
-        completedAt = f.at;
-        error = f.error as unknown as Json;
-        break;
-      }
-      if (f.kind === "flow.canceled") {
-        completedAt = f.at;
-        // The fact keeps the superseder's id forever; the VIEW must not name a
-        // run retention has deleted. A dangling reference here is nagi#29.
-        if (f.cause === "concurrency" && this.runExists(f.canceledByRunId)) {
-          canceledByRunId = f.canceledByRunId;
-        }
-        break;
-      }
-    }
-    const slot = this.keyByActiveRun.get(runId);
-    if (slot !== undefined) {
-      const sep = slot.indexOf("::");
-      if (sep >= 0) concurrencyKey = slot.slice(sep + 2);
-    }
-    if (concurrencyKey === undefined) {
-      for (const f of factList) {
-        if (f.kind === "flow.canceled" && f.cause === "concurrency") {
-          concurrencyKey = f.concurrencyKey;
-          break;
-        }
-      }
-    }
-
-    const childSet = this.childrenByParent.get(runId);
-    const children: RunId[] = childSet ? Array.from(childSet) : [];
-    const parent = first.parent;
-
-    const run: RunView = {
-      runId,
-      flowId: first.flowId,
-      flowHash: first.flowHash ?? "",
-      status,
-      startedAt: first.at,
-      input: first.input,
-      children,
-      ...(completedAt !== undefined ? { completedAt } : {}),
-      ...(output !== undefined ? { output } : {}),
-      ...(error !== undefined ? { error } : {}),
-      ...(canceledByRunId !== undefined ? { canceledByRunId } : {}),
-      ...(concurrencyKey !== undefined ? { concurrencyKey } : {}),
-      ...(parent !== undefined ? { parent } : {}),
-    };
-
-    const steps: StepView[] = [];
-    const startedAtByStep = new Map<StepId, Date>();
-    const completedAtByStep = new Map<StepId, Date>();
-    for (const f of factList) {
-      if (f.kind === "step.started" && !startedAtByStep.has(f.stepId)) {
-        startedAtByStep.set(f.stepId, f.at);
-      }
-      if (
-        (f.kind === "step.completed" ||
-          f.kind === "step.failed" ||
-          f.kind === "step.canceled" ||
-          f.kind === "step.skipped") &&
-        !completedAtByStep.has(f.stepId)
-      ) {
-        completedAtByStep.set(f.stepId, f.at);
-      }
-    }
-    const now = Date.now();
-    for (const [stepId, stepState] of Object.entries(state.steps)) {
-      const status = stepStatusOf(stepState);
-      const attempt = attemptOf(stepState);
-      const out = outputOf(stepState);
-      const err = errorOf(stepState);
-      const startedAt = startedAtByStep.get(stepId);
-      const completedAt = completedAtByStep.get(stepId);
-      let lease: { readonly expiresAt: Date } | undefined;
-      let bestExpiry = 0;
-      for (const l of this.leases.values()) {
-        if (l.runId !== runId || l.stepId !== stepId) continue;
-        if (l.expiresAt > now && l.expiresAt > bestExpiry) {
-          bestExpiry = l.expiresAt;
-        }
-      }
-      if (bestExpiry > 0) lease = { expiresAt: new Date(bestExpiry) };
-      steps.push({
-        stepId,
-        attempt,
-        status,
-        ...(startedAt !== undefined ? { startedAt } : {}),
-        ...(completedAt !== undefined ? { completedAt } : {}),
-        ...(out !== null ? { output: out } : {}),
-        ...(err !== undefined ? { error: err as unknown as Json } : {}),
-        ...(lease !== undefined ? { lease } : {}),
-      });
-    }
-    steps.sort((a, b) => {
-      const ta = a.startedAt?.getTime() ?? Number.POSITIVE_INFINITY;
-      const tb = b.startedAt?.getTime() ?? Number.POSITIVE_INFINITY;
-      if (ta !== tb) return ta - tb;
-      return a.stepId < b.stepId ? -1 : a.stepId > b.stepId ? 1 : 0;
-    });
-
-    return { run, steps };
-  }
-
-  // A run pruned with keepSummary keeps its row in Postgres; the summary is
-  // the in-memory equivalent, so describe() stays non-null for it.
-  private runExists(runId: RunId): boolean {
-    return this.facts.has(runId) || this.summaries.has(runId);
-  }
-
-  private describeSummary(runId: RunId): RunDescription {
-    const s = this.summaries.get(runId);
-    if (s === undefined) return null;
-    const childSet = this.childrenByParent.get(runId);
+    const row = this.runRows.get(runId);
+    if (row === undefined) return null;
+    const slot = this.slotByRun.get(runId);
+    const children = this.childRows(runId)
+      .sort(([, a], [, b]) => a.startedAt.getTime() - b.startedAt.getTime())
+      .map(([childId]) => childId);
+    const steps = [...(this.stepRows.get(runId) ?? [])]
+      .map(([stepId, step]) => this.stepView(runId, stepId, step))
+      .sort(compareStepOrder);
     return {
       run: {
         runId,
-        flowId: s.flowId,
-        flowHash: "",
-        status: s.status,
-        startedAt: s.startedAt,
-        input: s.input,
-        children: childSet ? Array.from(childSet) : [],
-        ...(s.completedAt !== null ? { completedAt: s.completedAt } : {}),
+        flowId: row.flowId,
+        flowHash: row.flowHash ?? "",
+        status: row.status,
+        startedAt: row.startedAt,
+        input: row.input,
+        children,
+        ...(row.completedAt !== null ? { completedAt: row.completedAt } : {}),
+        ...(row.output !== null ? { output: row.output } : {}),
+        ...(row.error !== null ? { error: row.error as unknown as Json } : {}),
+        // Postgres: ON DELETE SET NULL — the view never names a pruned run.
+        ...(row.canceledByRunId !== null &&
+        this.runRows.has(row.canceledByRunId)
+          ? { canceledByRunId: row.canceledByRunId }
+          : {}),
+        ...(slot !== undefined
+          ? { concurrencyKey: slot.slice(row.flowId.length + 2) }
+          : {}),
+        ...(row.parent !== null ? { parent: row.parent } : {}),
       },
-      steps: [],
+      steps,
+    };
+  }
+
+  private stepView(runId: RunId, stepId: StepId, row: StepRow): StepView {
+    const lease = this.leases.get(leaseKey(runId, stepId, row.attempt));
+    const live = lease !== undefined && lease.expiresAt > Date.now();
+    return {
+      stepId,
+      attempt: row.attempt,
+      status: row.status,
+      ...(row.startedAt !== null ? { startedAt: row.startedAt } : {}),
+      ...(row.completedAt !== null ? { completedAt: row.completedAt } : {}),
+      ...(row.output !== null ? { output: row.output } : {}),
+      ...(row.error !== null ? { error: row.error as unknown as Json } : {}),
+      ...(live ? { lease: { expiresAt: new Date(lease.expiresAt) } } : {}),
     };
   }
 
@@ -738,24 +608,15 @@ export class InMemoryStore implements Store {
     for (;;) {
       const batch = selectPruneBatch(this.pruneCandidates(), opts);
       if (batch.length === 0) break;
-      for (const { factCount, parentRunId, ...summary } of batch) {
-        const runId = summary.runId;
+      for (const { runId, factCount } of batch) {
         this.facts.delete(runId);
+        this.stepRows.delete(runId);
         deleteByRunPrefix(this.onces, runId);
         deleteByRunPrefix(this.leases, runId);
         deleteByRunPrefix(this.signalTimers, runId);
-        this.childrenByParent.delete(runId);
-        if (parentRunId !== undefined) {
-          const siblings = this.childrenByParent.get(parentRunId);
-          if (siblings !== undefined) {
-            siblings.delete(runId);
-            if (siblings.size === 0) this.childrenByParent.delete(parentRunId);
-          }
-        }
-        if (opts.keepSummary) {
-          this.summaries.set(runId, summary);
-        } else {
-          this.summaries.delete(runId);
+        if (!opts.keepSummary) {
+          this.runRows.delete(runId);
+          this.slotByRun.delete(runId);
         }
         runsPruned += 1;
         factsPruned += factCount;
@@ -766,15 +627,15 @@ export class InMemoryStore implements Store {
 
   private pruneCandidates(): PruneVictim[] {
     const out: PruneVictim[] = [];
-    for (const [runId, factList] of this.facts) {
-      const summary = summarize(runId as RunId, factList);
-      if (summary === null) continue;
-      const first = factList[0];
-      const parentRunId =
-        first !== undefined && first.kind === "flow.started"
-          ? first.parent?.runId
-          : undefined;
-      out.push({ ...summary, factCount: factList.length, parentRunId });
+    for (const [runId, row] of this.runRows) {
+      const factList = this.facts.get(runId);
+      if (factList === undefined) continue;
+      out.push({
+        runId,
+        status: row.status,
+        completedAt: row.completedAt,
+        factCount: factList.length,
+      });
     }
     return out;
   }
@@ -792,19 +653,8 @@ export class InMemoryStore implements Store {
       stepId: StepId,
       opts?: { readonly replayBuffered?: boolean },
     ): AsyncIterable<StreamEvent<Json>> => {
-      // Durable facts decide whether the stream is over, not the hub (which may
-      // never have held a channel for this step). Delegating to a terminal step
-      // would open a channel that hangs, so hand back an empty iterable instead.
-      const state = foldRun(runId, this.facts.get(runId) ?? []);
-      const stepStatus = stepStatusOf(stepStateOf(state, stepId));
-      const runIsTerminal = isTerminalRun(state);
-      if (
-        runIsTerminal ||
-        stepStatus === "completed" ||
-        stepStatus === "failed" ||
-        stepStatus === "canceled" ||
-        stepStatus === "skipped"
-      ) {
+      // Delegating to a finished step would open a channel that hangs.
+      if (isStreamOver(foldRun(runId, this.facts.get(runId) ?? []), stepId)) {
         return EMPTY_CLOSED_STREAM;
       }
       return this.streamHub.subscribeStream(runId, stepId, opts);
@@ -816,9 +666,27 @@ export class InMemoryStore implements Store {
   };
 }
 
-interface PruneVictim extends RunSummary {
+interface PruneVictim extends PruneCandidate {
   readonly factCount: number;
-  readonly parentRunId: RunId | undefined;
+}
+
+function summaryOf(runId: RunId, row: RunRow): RunSummary {
+  return {
+    runId,
+    flowId: row.flowId,
+    status: row.status,
+    startedAt: row.startedAt,
+    completedAt: row.completedAt,
+    input: row.input,
+  };
+}
+
+// Postgres: ORDER BY started_at ASC NULLS LAST, step_id ASC.
+function compareStepOrder(a: StepView, b: StepView): number {
+  const ta = a.startedAt?.getTime() ?? Number.POSITIVE_INFINITY;
+  const tb = b.startedAt?.getTime() ?? Number.POSITIVE_INFINITY;
+  if (ta !== tb) return ta - tb;
+  return a.stepId < b.stepId ? -1 : a.stepId > b.stepId ? 1 : 0;
 }
 
 const EMPTY_CLOSED_STREAM: AsyncIterable<StreamEvent<Json>> = {
@@ -832,33 +700,6 @@ function deleteByRunPrefix<V>(map: Map<string, V>, runId: RunId): void {
   for (const key of map.keys()) {
     if (key.startsWith(prefix)) map.delete(key);
   }
-}
-
-function summarize(runId: RunId, facts: readonly Fact[]): RunSummary | null {
-  const first = facts[0];
-  if (first === undefined || first.kind !== "flow.started") return null;
-  const projected = foldRun(runId, facts);
-  let completedAt: Date | null = null;
-  for (let i = isTerminalRun(projected) ? facts.length - 1 : -1; i >= 0; i--) {
-    const f = facts[i];
-    if (f === undefined) continue;
-    if (
-      f.kind === "flow.completed" ||
-      f.kind === "flow.failed" ||
-      f.kind === "flow.canceled"
-    ) {
-      completedAt = f.at;
-      break;
-    }
-  }
-  return {
-    runId,
-    flowId: first.flowId,
-    status: runStatusOf(projected),
-    startedAt: first.at,
-    completedAt,
-    input: first.input,
-  };
 }
 
 export { foldRun as projectRunState } from "./facts";

@@ -1,18 +1,18 @@
 import type { Dispatcher } from "./dispatch";
 import { NagiRuntimeError, validationError } from "./errors";
 import { Facts } from "./facts";
-import type { FlowRegistry } from "./flows";
+import { type FlowOf, requireCurrent } from "./flows";
 import { compact, type EmitLog } from "./internal";
-import { resetSetOf, stepStateOf } from "./scheduler";
+import { resetFactsOf } from "./scheduler";
 import {
   attemptOf,
   isStepTerminal,
   isTerminalRun,
   runStatusOf,
+  stepStateOf,
   stepStatusOf,
 } from "./state";
 import type {
-  CancelArgs,
   Clock,
   Operator,
   OperatorAuditOpts,
@@ -26,11 +26,7 @@ export interface OperatorDeps {
   readonly dispatcher: Dispatcher;
   readonly store: Store;
   readonly clock: Clock;
-  readonly registry: FlowRegistry;
-  readonly cancelRunRecursive: (
-    runId: RunId,
-    args: CancelArgs,
-  ) => Promise<void>;
+  readonly flowOf: FlowOf;
   readonly emitLog: EmitLog;
 }
 
@@ -48,7 +44,7 @@ function requireActor(method: string, actor: string): void {
 }
 
 export function makeOperator(o: OperatorDeps): Operator {
-  const { dispatcher, store, clock, registry, cancelRunRecursive, emitLog } = o;
+  const { dispatcher, store, clock, flowOf, emitLog } = o;
 
   async function skip(
     runId: RunId,
@@ -57,7 +53,7 @@ export function makeOperator(o: OperatorDeps): Operator {
   ): Promise<void> {
     requireActor("operator.skip", opts.actor);
     const state = await store.loadRunState(runId);
-    const flow = registry.require(state.flowId);
+    const flow = requireCurrent(await flowOf(runId));
     if (!(stepId in flow.steps)) {
       throw validationError(
         `operator.skip: step "${stepId}" is not a step in flow "${flow.id}".`,
@@ -126,7 +122,7 @@ export function makeOperator(o: OperatorDeps): Operator {
         `operator.retry: run ${runId} is canceled; cannot retry. Start a new run instead.`,
       );
     }
-    const flow = registry.require(state.flowId);
+    const flow = requireCurrent(await flowOf(runId));
     if (!(stepId in flow.steps)) {
       throw validationError(
         `operator.retry: step "${stepId}" is not a step in flow "${flow.id}".`,
@@ -155,27 +151,20 @@ export function makeOperator(o: OperatorDeps): Operator {
       );
     }
 
-    const resetSet = resetSetOf(flow, stepId, opts.scope);
-    const at = clock.now();
-    for (const id of resetSet) {
-      const fact =
-        id === stepId
-          ? Facts.stepReset({
-              runId,
-              stepId: id,
-              at,
-              actor: opts.actor,
-              ...compact({ scope: opts.scope, note: opts.note }),
-            })
-          : Facts.stepReset({ runId, stepId: id, at, cascadedFrom: stepId });
-      await store.appendFact(runId, fact);
-    }
+    const resets = resetFactsOf(flow, {
+      runId,
+      stepId,
+      at: clock.now(),
+      actor: opts.actor,
+      ...compact({ scope: opts.scope, note: opts.note }),
+    });
+    for (const fact of resets) await store.appendFact(runId, fact);
     await dispatcher.advance(runId);
   }
 
   async function abort(runId: RunId, opts: OperatorAuditOpts): Promise<void> {
     requireActor("operator.abort", opts.actor);
-    await cancelRunRecursive(runId, {
+    await dispatcher.cancel(runId, {
       cause: "operator",
       reason: opts.note ?? `aborted by operator ${opts.actor}`,
       actor: opts.actor,

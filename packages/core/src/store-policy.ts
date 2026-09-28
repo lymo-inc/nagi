@@ -1,17 +1,19 @@
+import { Facts } from "./facts";
 import type {
-  Fact,
+  ConcurrencyMode,
+  FlowCanceledByConcurrencyFact,
+  FlowStartedFact,
   Json,
   PrunableStatus,
   RunId,
   RunStatus,
-  StepId,
 } from "./types";
 
 // Store policy the adapters must not re-decide. An adapter owns only its
 // transaction boundary (locks, rows, maps); every decision below is pure and
 // shared, so two stores can only disagree by not calling it. Companions:
-// decideSignal / decideTimeout (signals.ts), decideExpiredLeaseAction
-// (lease-reaper.ts). `storeContract` (./testing) asserts each one per adapter.
+// factConsequences (facts/), decideSignal / decideTimeout (signals.ts),
+// decideExpiredLeaseAction (lease-reaper.ts). `storeContract` (./testing) asserts each one per adapter.
 
 export const QUERY_RUNS_DEFAULT_LIMIT = 50;
 export const QUERY_RUNS_MAX_LIMIT = 500;
@@ -152,46 +154,40 @@ export function selectPruneBatch<T extends PruneCandidate>(
   return eligible.slice(0, opts.batchSize).map((e) => e.item);
 }
 
-// What a fact releases besides being appended. Both stores apply this at their
-// fact write, so "which settle path also drops the lease" is not a per-adapter
-// question. `timer` is the signal-timeout deadline: released when the step
-// resolves by delivery or is restarted. A deadline that fires consumes its own
-// row (sweepSignalTimeouts), and the other terminal paths leave a stale timer
-// to fire as a no-op rather than contend with the sweeper's lock order.
-export type FactEffects =
-  | { readonly tag: "none" }
-  | {
-      readonly tag: "release-step";
-      readonly stepId: StepId;
-      readonly timer: boolean;
-    }
-  | { readonly tag: "release-run" };
+// A run ends once. The adapter reads the run's row status under the lock that
+// serializes its run ends (Postgres: the workflow_run row, FOR UPDATE) and, when
+// this refuses, writes nothing: no fact, no consequence. No row = never started.
+export function admitsRunEnd(status: RunStatus | undefined): boolean {
+  return status === "pending" || status === "running";
+}
 
-const NONE: FactEffects = { tag: "none" };
-const RELEASE_RUN: FactEffects = { tag: "release-run" };
+export interface Superseded {
+  readonly runId: RunId;
+  readonly fact: FlowCanceledByConcurrencyFact;
+}
 
-export function factEffects(fact: Fact): FactEffects {
-  switch (fact.kind) {
-    case "step.completed":
-    case "step.reset":
-      return { tag: "release-step", stepId: fact.stepId, timer: true };
-    case "step.failed":
-    case "step.canceled":
-      return { tag: "release-step", stepId: fact.stepId, timer: false };
-    case "flow.completed":
-    case "flow.failed":
-    case "flow.canceled":
-      return RELEASE_RUN;
-    case "flow.started":
-    case "step.started":
-    case "step.retried":
-    case "step.skipped":
-    case "step.abort-requested":
-    case "signal.received":
-    case "signal.buffered":
-    case "once.recorded":
-    case "match.arm-selected":
-    case "lease.reaped":
-      return NONE;
+// The runs a new start cancels, and the facts that record it. The adapter's
+// share is finding `priors` (the active runs on the same flowId and key) under
+// its own lock, then writing each fact before the new run takes the slot.
+export function supersede(args: {
+  readonly start: FlowStartedFact;
+  readonly concurrency: {
+    readonly key: string;
+    readonly mode: ConcurrencyMode;
+  };
+  readonly priors: Iterable<RunId>;
+}): Superseded[] {
+  const { start, concurrency } = args;
+  switch (concurrency.mode) {
+    case "cancel-in-progress":
+      return Array.from(args.priors, (runId) => ({
+        runId,
+        fact: Facts.flowCanceledByConcurrency({
+          runId,
+          canceledByRunId: start.runId,
+          concurrencyKey: concurrency.key,
+          at: start.at,
+        }),
+      }));
   }
 }
