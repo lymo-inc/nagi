@@ -1,6 +1,6 @@
 # RFC 0019 — `b.streamingTask`: streaming step outputs for LLM token streaming
 
-- **Status:** Accepted (2026-05-21, Jay — decisions resolved via grill). **Implemented: Phases A–D** (types/builder; in-memory broadcast hub; dispatch `emit` + lifecycle + `wf.subscribe` + capability gate; replay/retry/edge + type-d tests). Whole `@nagi-js/core` suite green (50 files · 743 tests · typecheck clean, 2026-05-22), composing with the committed core refactor + uncommitted RFC 0020. **Not committed / no PR** — held for your sequencing (intermixed with RFC 0020 in shared files). See `0019-streaming-task.handoff.md`.
+- **Status:** Accepted (2026-05-21, Jay — decisions resolved via grill). Phases A–D shipped to `main` in `5cbca32` (2026-05-22); the Postgres `StreamTransport` followed in `c1e0331` (2026-09-21). See `0019-streaming-task.handoff.md`.
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking:** GitHub issue #12 (note: RFC number ≠ issue number; RFC 0012 is `shorthand-concurrency-config`)

@@ -1,6 +1,6 @@
 # RFC 0020 — `onLog` callback: replace the `Logger` interface with a structured-record sink
 
-- **Status:** Decisions log COMPLETE (O1–O4 resolved 2026-05-21) — **awaiting Jay's final approval before implementation**
+- **Status:** Decisions log COMPLETE (O1–O4 resolved 2026-05-21) — shipped to `main`: production code in `e451bfd` (2026-05-21), tests and changeset in `5cbca32` (2026-05-22).
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking:** GitHub issue #19 (RFC doc number ≠ issue number is coincidental here; they happen to match)

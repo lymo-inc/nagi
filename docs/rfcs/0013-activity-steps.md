@@ -1,6 +1,6 @@
 # RFC 0013 — Activity steps (external-effect steps that run outside the durable transaction)
 
-- **Status:** Draft
+- **Status:** Implemented — shipped to `main` in `92f9d9f` (2026-05-25).
 - **Author:** @jay (lymo-inc)
 - **Created:** 2026-05-25 (JST)
 - **Tracking issue:** lymo-inc/nagi#13

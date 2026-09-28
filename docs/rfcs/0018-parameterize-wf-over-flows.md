@@ -1,6 +1,6 @@
 # RFC 0018 — Parameterize `Wf` over registered flows (typed `flowId`)
 
-- **Status:** Decisions resolved (2026-05-21, Jay) — **awaiting approval of this log before implementation.**
+- **Status:** Decisions resolved (2026-05-21, Jay) — shipped to `main` in `3334319` (2026-05-21).
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking:** issue #18

@@ -4,7 +4,7 @@
 - **Source:** the consumer-side rc.12 refactor RFC at `../lymo/docs/rfcs/2026-05-23-nagi-usage-rc12-refactor.md` §12 (N1–N12)
 - **Author:** Claude Opus 4.7 (1M ctx), 3-agent parallel pipeline + 4 implementation subagents, supervised by @jay
 - **Tracking issues:** [#21 N5](https://github.com/lymo-inc/nagi/issues/21), [#22 N1](https://github.com/lymo-inc/nagi/issues/22), [#23 N3+N4](https://github.com/lymo-inc/nagi/issues/23), [#25 N8](https://github.com/lymo-inc/nagi/issues/25), [#26 N9](https://github.com/lymo-inc/nagi/issues/26), [#27 N10](https://github.com/lymo-inc/nagi/issues/27), [#28 N12](https://github.com/lymo-inc/nagi/issues/28), [#29 N11](https://github.com/lymo-inc/nagi/issues/29) (TRACKING ONLY — don't close on merge). N7 verified-OK, no issue filed.
-- **Status:** Implemented + green locally — **NOT committed, NOT PR'd** (Jay sequences; see memory `feedback-commit-sequencing`)
+- **Status:** Shipped to `main` in `3b8e7a9` (2026-05-29). The notes below describe the working tree at handoff time.
 - **Date:** 2026-05-29 (JST)
 
 ## What landed (cumulative)

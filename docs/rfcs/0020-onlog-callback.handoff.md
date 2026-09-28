@@ -3,7 +3,7 @@
 - **RFC:** `docs/rfcs/0020-onlog-callback.md` (decisions log, approved by @jay 2026-05-21)
 - **Tracking issue:** #19
 - **Author:** Claude (paired with @jay)
-- **Status:** Implemented + green locally (714 tests, 0 type errors). **Production code already committed to `main` in `e451bfd` — see Sequencing caveat. New test files + changeset are uncommitted. NOT PR'd.**
+- **Status:** Shipped to `main`: production code in `e451bfd` (2026-05-21), tests and changeset in `5cbca32` (2026-05-22). The notes below describe the working tree at handoff time.
 - **Date:** 2026-05-21 (JST)
 
 ## ⚠ Sequencing caveat — read first

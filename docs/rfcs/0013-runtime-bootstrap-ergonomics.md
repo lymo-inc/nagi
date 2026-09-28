@@ -1,6 +1,6 @@
 # RFC 0013 — Runtime bootstrap ergonomics (`nagi.run` + auto queue init + pgmq typing)
 
-- **Status:** Accepted (2026-05-21, Jay) — decisions resolved via grill; pending implementation approval
+- **Status:** Accepted (2026-05-21, Jay) — shipped to `main` in `3334319` (2026-05-21).
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking issue:** lymo-inc/nagi#17

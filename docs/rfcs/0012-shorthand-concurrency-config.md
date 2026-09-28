@@ -1,6 +1,6 @@
 # RFC 0012 — Shorthand concurrency config (typed key + default mode)
 
-- **Status:** Draft — decisions log COMPLETE (grilled 2026-05-21); awaiting approval before implementation
+- **Status:** Implemented — shipped to `main` in `3334319` (2026-05-21). Decisions log completed 2026-05-21.
 - **Author:** Claude (paired with @jay)
 - **Created:** 2026-05-21 (JST)
 - **Tracking issue:** #20

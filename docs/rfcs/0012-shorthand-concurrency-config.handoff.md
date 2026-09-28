@@ -3,7 +3,7 @@
 - **RFC:** `docs/rfcs/0012-shorthand-concurrency-config.md`
 - **Issue:** lymo-inc/nagi#20
 - **Author of impl:** Claude, dispatched by Jay (2026-05-21 JST)
-- **Status:** Implemented + tested in `@nagi-js/core` (523/523 pass; typecheck + test:types clean). Awaiting Jay's decision on PR strategy (see "Caveats").
+- **Status:** Shipped to `main` in `3334319` (2026-05-21). The notes below describe the working tree at handoff time.
 
 ## What landed
 
