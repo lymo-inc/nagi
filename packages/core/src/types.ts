@@ -692,6 +692,10 @@ export interface Store {
     flowHash: string,
   ): Promise<{ readonly flowId: string; readonly dag: Json } | null>;
 
+  // Write-only audit trail of flow-hash changes: one flow_ref.updated per flow
+  // whose hash changed at registration (so, per deploy that changed it). nagi
+  // never reads it back and pruneFacts does not touch it; a read or retention
+  // arrives with the first consumer that needs one.
   appendGlobalFact(fact: GlobalFact): Promise<void>;
 
   // describe and pruneFacts MUST answer from the rows the facts' `rows`
