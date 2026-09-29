@@ -1,5 +1,12 @@
 # @nagi-js/core
 
+## 0.1.1-rc.23
+
+### Patch Changes
+
+- 30103e5: `FlowStartEvent.parent` is now a `ParentLink` (`{ runId, stepId }`), and the `ParentRef` type is removed. Its extra `attempt` field existed only for the removed `@nagi-js/otel` span keys and was never stored with the child run.
+- 9133e4e: `replay({ from })` now aborts every attempt that starts while it waits, so a lease-reaped step restarted mid-replay no longer outlives the reset. A step's completion, failure or cancel now applies only to an attempt that has started since its last reset, in the fold and both read models.
+
 ## 0.1.1-rc.22
 
 ### Patch Changes

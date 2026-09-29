@@ -1,5 +1,14 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.24
+
+### Patch Changes
+
+- 9133e4e: `replay({ from })` now aborts every attempt that starts while it waits, so a lease-reaped step restarted mid-replay no longer outlives the reset. A step's completion, failure or cancel now applies only to an attempt that has started since its last reset, in the fold and both read models.
+- Updated dependencies [30103e5]
+- Updated dependencies [9133e4e]
+  - @nagi-js/core@0.1.1-rc.23
+
 ## 0.1.1-rc.23
 
 ### Patch Changes
