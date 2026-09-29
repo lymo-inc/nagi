@@ -21,7 +21,7 @@ import type {
   FlowStartEvent,
   FlowStartedFact,
   Json,
-  ParentRef,
+  ParentLink,
   Queue,
   RunId,
   StepId,
@@ -89,7 +89,7 @@ export interface StageArgs {
   readonly flow: Flow;
   readonly validatedInput: Json;
   readonly runId: RunId;
-  readonly parent: ParentRef | undefined;
+  readonly parent: ParentLink | undefined;
   readonly boundary: TxBoundary;
 }
 
@@ -105,7 +105,7 @@ export interface RunLifecycle {
   startChildRun(args: {
     readonly child: Flow;
     readonly childInput: unknown;
-    readonly parent: ParentRef;
+    readonly parent: ParentLink;
     readonly generation: number;
   }): Promise<RunId>;
 }
@@ -179,10 +179,7 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
       codeVersion: deps.codeVersion,
       flowHash: registry.hashOf(flow.id),
       ...compact({
-        parent:
-          parent !== undefined
-            ? { runId: parent.runId, stepId: parent.stepId }
-            : undefined,
+        parent,
       }),
     });
     const concurrency = concurrencyOf(flow, validatedInput);
@@ -285,7 +282,7 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
   async function startChildRun(args: {
     readonly child: Flow;
     readonly childInput: unknown;
-    readonly parent: ParentRef;
+    readonly parent: ParentLink;
     readonly generation: number;
   }): Promise<RunId> {
     const { child, childInput, parent, generation } = args;

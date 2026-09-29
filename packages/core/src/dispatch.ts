@@ -16,7 +16,7 @@ import type {
   FlowCanceledByConcurrencyFact,
   FlowHooks,
   Millis,
-  ParentRef,
+  ParentLink,
   Queue,
   QueueMessage,
   RetryPolicy,
@@ -38,7 +38,7 @@ export interface DispatchDeps {
   readonly startChildRun: (args: {
     readonly child: Flow;
     readonly childInput: unknown;
-    readonly parent: ParentRef;
+    readonly parent: ParentLink;
     readonly generation: number;
   }) => Promise<RunId>;
   readonly store: Store;
