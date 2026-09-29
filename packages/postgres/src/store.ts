@@ -89,6 +89,9 @@ export interface PostgresStoreOpts<DB = unknown> {
 // the same breath MUST await ready() first.
 export interface PostgresStoreHandle extends Store {
   ready(): Promise<void>;
+  // Stops both LISTEN channels. Idempotent. Open wf.subscribe() iterators
+  // and watchers stop receiving; nothing is written.
+  close(): Promise<void>;
 }
 
 export function postgresStore<DB = unknown>(
@@ -109,6 +112,12 @@ class PostgresStore<DB = unknown> implements Store {
   // so chunks and events published before then are gone, not delayed. Total
   // rather than optional: with no listener there is simply nothing to wait for.
   private readonly listening: Promise<void>;
+  // Resolved disposers, kept so close() can release both LISTEN channels.
+  // Total rather than optional, same reasoning as `listening`.
+  private readonly disposers: Promise<
+    ReadonlyArray<() => void | Promise<void>>
+  >;
+  private closing: Promise<void> | undefined;
   // Left UNASSIGNED when no listener is supplied: under
   // exactOptionalPropertyTypes an absent property and one set to undefined are
   // different things, and Store declares `stream?`.
@@ -130,7 +139,8 @@ class PostgresStore<DB = unknown> implements Store {
     // 63-byte limit.
     this.streamChannel = `${this.schema}_stream`;
     this.eventChannel = `${this.schema}_events`;
-    let listening: Promise<void> = Promise.resolve();
+    let disposers: Promise<ReadonlyArray<() => void | Promise<void>>> =
+      Promise.resolve([]);
     if (opts.listener !== undefined) {
       const eventHub = new InMemoryRunEventHub();
       this.eventHub = eventHub;
@@ -153,14 +163,17 @@ class PostgresStore<DB = unknown> implements Store {
           const frame = decodeFrame(payload);
           if (frame !== null) applyFrame(hub, frame);
         },
+        () => void this.resyncStreams(hub),
       );
       this.stream = this.makeStreamTransport(hub);
 
-      listening = Promise.all([eventsListening, streamListening]).then(
-        () => undefined,
-      );
+      disposers = Promise.all([eventsListening, streamListening]);
     }
-    this.listening = listening;
+    this.disposers = disposers;
+    // A LISTEN that never succeeded has nothing to dispose; close() does not
+    // need the rejection, only ready() does.
+    void this.disposers.catch(() => undefined);
+    this.listening = this.disposers.then(() => undefined);
     // ready() reports a failed LISTEN by rejecting, but nothing forces a caller
     // to ask. This keeps an unobserved failure from surfacing as an unhandled
     // rejection while leaving this.listening itself rejected for those who do.
@@ -170,6 +183,28 @@ class PostgresStore<DB = unknown> implements Store {
   // Resolves once this process is actually receiving NOTIFY on both channels.
   ready(): Promise<void> {
     return this.listening;
+  }
+
+  close(): Promise<void> {
+    this.closing ??= (async () => {
+      const disposers = await this.disposers.catch(() => []);
+      await Promise.all(disposers.map(async (d) => d()));
+    })();
+    return this.closing;
+  }
+
+  // A reconnect loses the close frames sent during the gap; durable state
+  // still knows which of the open streams are over.
+  private async resyncStreams(hub: InMemoryStreamHub): Promise<void> {
+    for (const { runId, stepId } of hub.openStreams()) {
+      try {
+        if (isStreamOver(await this.loadRunState(runId), stepId)) {
+          hub.closeOk(runId, stepId);
+        }
+      } catch {
+        /* one unreadable run must not stop the rest */
+      }
+    }
   }
 
   private makeStreamTransport(hub: InMemoryStreamHub): StreamTransport {
