@@ -1287,6 +1287,21 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         .execute(db);
     });
 
+    // Seeds concurrently: a sequential loop that outlives its test's timeout
+    // keeps inserting after the next test's beforeEach has cleared the tables.
+    async function seedTerminals(n: number, flowId: string): Promise<void> {
+      await Promise.all(
+        Array.from({ length: n }, (_, i) =>
+          seedTerminal({
+            flowId,
+            status: "completed",
+            startedAtMs: 1000 + i,
+            completedAtMs: 2000 + i,
+          }),
+        ),
+      );
+    }
+
     async function seedTerminal(args: {
       readonly flowId: string;
       readonly status: "completed" | "failed" | "canceled";
@@ -1501,14 +1516,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     });
 
     it("uses the workflow_run_completed_at_idx for the victim selection", async () => {
-      for (let i = 0; i < 50; i++) {
-        await seedTerminal({
-          flowId: "pf-explain",
-          status: "completed",
-          startedAtMs: 1000 + i,
-          completedAtMs: 2000 + i,
-        });
-      }
+      await seedTerminals(50, "pf-explain");
       const plan = await sql<{ "QUERY PLAN": string }>`
         EXPLAIN SELECT run_id FROM ${sql.raw(`${schema}.workflow_run`)}
          WHERE status = ANY(ARRAY['completed','failed','canceled']::text[])
@@ -1525,14 +1533,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
 
     it("concurrent pruners share work without errors (FOR UPDATE SKIP LOCKED)", async () => {
       const wf = await makeNagi();
-      for (let i = 0; i < 12; i++) {
-        await seedTerminal({
-          flowId: "pf-concurrent",
-          status: "completed",
-          startedAtMs: 1000 + i,
-          completedAtMs: 2000 + i,
-        });
-      }
+      await seedTerminals(12, "pf-concurrent");
       const [a, b] = await Promise.all([
         wf.pruneFacts({ olderThan: new Date(), batchSize: 3 }),
         wf.pruneFacts({ olderThan: new Date(), batchSize: 3 }),
