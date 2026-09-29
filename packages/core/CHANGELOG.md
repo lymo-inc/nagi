@@ -1,5 +1,63 @@
 # @nagi-js/core
 
+## 0.1.1-rc.22
+
+### Patch Changes
+
+- 674bea6: Fix: a long-lived process no longer accumulates stream-hub channels, and a settled step no longer leaves its cancel-watcher timer behind.
+
+  `InMemoryStreamHub` marked a channel closed but never deleted it, and `step.retried` created a channel for every retried step, streaming or not. Since `postgresStore` feeds a hub in every listening process and broadcasts retry and close frames cluster-wide, a long-running Postgres worker grew that map by one entry per retried step and per streaming step, forever. A retry now touches only a channel that already exists, and closing a channel deletes it. The keys of recently closed channels are remembered (at most 1024) so a chunk arriving after its step's close is still dropped rather than reopening a channel nothing would close. Subscribe-after-close and replay behave as before.
+
+  The cancel watcher's `stop()` only set a flag, so every finished step left a pending timer for up to one poll interval (250 ms by default) that kept the event loop alive. `stop()` now clears it and ends the poll loop immediately.
+
+- d424f0a: `wf.queryRuns` and `Store.queryRuns` are removed, along with `RunSummary`, `QueryRunsOpts` / `QueryRunsResult` / `QueryRunsWhere` and the cursor helpers (`encodeRunCursor`, `decodeRunCursor`, `clampQueryLimit`, `compareRunOrder`, `isPastCursor`, `jsonContains`, `QUERY_RUNS_DEFAULT_LIMIT`, `QUERY_RUNS_MAX_LIMIT`, `RunCursor`). Use `describe(runId)` for one run, and list or join runs with SQL against `workflow_run` and `step_run`, whose columns are now a documented read contract (docs/OPERATIONS.md, "Reading runs with SQL").
+- 2fc52df: Fix: `diffSnapshots` now reports every hashed field. Changes to a signal's `names`, a subflow's child flow, or a subflow's input builder flipped the snapshot hash but produced an empty diff; they now surface as `signalNames`, `childFlowId`, and `subflowInput` in `changedPredicates`. Flow-level changes to the input schema or flow id now surface in the new `SnapshotDiff.changedFlowFields` (`"inputSchema"`, `"flowId"`).
+- 2fc52df: What a fact implies (read-model rows, lease/timer release, stream close, run event) is now one core table, `factConsequences`, and each store applies all of it through a single write path; `supersede` decides concurrency cancellation and the lease reaper's decision carries its `lease.reaped` fact. Fixes `watchRuns` on Postgres never seeing `flow.started` for runs started with `startStaged`. `Store.settleStep` (use `appendFact`), the unused `once.recorded` fact kind, and the `factEffects` / `rowDeltaOf` / `runEventOf` exports are removed.
+- ecb5ac6: Fix: `ctx.once()` now memoizes a callback that returns `null`, so its side effect no longer re-runs on every redelivery or replay of the step.
+
+  `Store.getOnce` returned `Json | null` and used `null` to mean "nothing recorded". `Json` includes `null`, so a recorded `null` was indistinguishable from a miss and `once()` called the callback again — exactly the duplicate side effect it exists to prevent.
+
+  `Store.getOnce` now returns `GetOnceResult` (`{ tag: "hit", value }` or `{ tag: "miss" }`), and a recorded `null` reads back as a hit. The Postgres `dedupe` table is unchanged; no migration is needed.
+
+  Custom `Store` implementations must update `getOnce` to return the new shape. The shared conformance suite in `@nagi-js/core/testing` checks it.
+
+- 2fc52df: Every path that needs a run's flow (dispatch, `wf.signal`, the operator, cancel, concurrency supersede and `replay`) now resolves it through one drift-aware resolver, checking step names against the run's pinned flow rather than the live one. User-visible changes:
+
+  - A signal to a step that exists only in the live flow, not the run's pinned one, is rejected.
+  - Operator `skip`/`retry` under the `"freeze"` drift policy throws before writing anything.
+  - Cancelling an unpinned run whose flow is not registered throws.
+  - `replay({ allowDrift })` no longer resolves a parent it wakes to the child's synthesized flow.
+  - `replay({ fireHooks: false })` dispatches only the messages its own replay enqueued, never another run's, and the children it spawns stay quiet too. It runs on a private in-memory queue, so a crash mid-replay needs `replay({ mode: "continue" })` to recover.
+
+- 2fc52df: Task, activity and streaming steps now share one internal def and one execute path, and step-kind branches are exhaustive switches; authoring APIs, `Step.kind` values, persisted `stepKind` and flow hashes are unchanged. `ActivityConfig`, `ActivityCtx` and `StepLifecycleHooks` are now exported, `MatchArmShape` is removed in favour of `MatchArm` (identical shape), and `RunState` gains `resetCounts`, the per-step count of `step.reset` facts.
+- 2fc52df: **`@nagi-js/postgres` ships migration `0009_step_run_per_step`: run migrations before deploying.** It deletes duplicate per-attempt `step_run` rows, keeping one row per step, and changes the table's primary key to `(run_id, step_id)`.
+
+  `describe`, `queryRuns` and `pruneFacts` now answer from one read model in both stores: the in-memory store materializes the same fact row deltas Postgres does. `describe` returns one view per step (its latest attempt, updated in place on retry), and step timestamps come from the facts' `at` rather than the database clock.
+
+- 2fc52df: Every way a run ends now fires the flow error hooks and wakes a parked parent subflow step the same way:
+
+  - Cancel paths now fire `flow.onError` and `onFlowError`, and a handler that throws `NagiCanceledError` wakes its parent right away instead of waiting for the lease reaper.
+  - A run failed by snapshot-gone handling now fires `onFlowError`.
+  - A canceled child's parent sees the same canonical error whichever path canceled it; operator aborts now read `was canceled by <actor>: <reason>`.
+
+- a87b71c: `wf.operator()` is removed. Rerun a step with `wf.replay(runId, { mode: "continue", from, scope })`, which now also works on a live run and aborts an in-flight `from` step before resetting it; stop a run with `wf.cancel`. `skip` is gone, along with the `"manual"` skip reason, the `"operator"` cancel cause and the `actor`/`note` audit fields on step facts.
+- 9b8b6fa: `b.match` is removed, along with its types (`MatchArm`, `MatchArmGuard`, `MatchArmOtherwise`, `MatchArmOutput`, `MatchGuardConfig`, `MatchArmSelectedFact`, `CanonicalMatchArm`), the `"match"` step kind and `RunState.selectedArms`. Branch with a step-level `when:` guard instead; a step whose guard is false is skipped as before. Flow hashes of flows that never used `match` are unchanged, so in-flight runs keep their pinned snapshots.
+- 2fc52df: A run now ends exactly once. Run-end facts (`flow.completed`, `flow.failed`, `flow.canceled`) go through the new `Store.endRun(runId, fact): Promise<boolean>`, which refuses the fact when the run's row is already terminal and writes nothing. The check runs under the store's lock: Postgres locks the `workflow_run` row, and the core policy lives in `admitsRunEnd`. Only the winning writer fires the flow hooks and wakes the parent, so racing cancels, a cancel against completion, or two snapshot-gone messages for one run no longer fire `onFlowError` twice. `appendFact` no longer accepts run-end facts.
+
+  Postgres: `tryStartRunOnTx` now runs each concurrency start attempt under a savepoint. Its retry after a unique violation used to fail with "current transaction is aborted", and it now completes, leaving the caller's transaction usable. `tryStartRun` uses the same retry, so it no longer surfaces a raw unique violation when it races a start on a caller's transaction.
+
+  In-memory store: `sweepLeases` now reads step status and flowId from the read-model rows, matching Postgres, instead of from the fact fold.
+
+- b9a0c46: Fix: a step's projected state (`loadRunState`) and its `describe()` view now apply the same attempt rules, so they can no longer disagree.
+
+  After a lease reap, the re-dispatched attempt's `step.started` was ignored by the projection: the step kept reading as the dead attempt, so `operator.retry` wrote its abort request for that attempt and the live handler never saw it: the retry waited for the handler to finish on its own, or timed out. A start now supersedes the step whenever its attempt is newer than the one in flight, in both the projection and the read model.
+
+  A duplicate `step.started` no longer moves the view's `startedAt`, and a `step.retried` or `step.abort-requested` for an attempt that is not in flight no longer changes the step in either. A test now explores every single-step fact history against both and fails on any disagreement.
+
+- 4cc20fd: A step's heartbeat and cancel watcher now finish any in-flight tick before the step is acked, so no lease extension or run-state read outlives the step. Worker shutdown now waits on its in-flight dispatches instead of polling `clock.sleep`.
+- 58458fa: `diffSnapshots` (with `SnapshotDiff`, `SnapshotChangedEdge`, `SnapshotChangedField`, `SnapshotChangedFlowField`) and the canonicalization exports (`canonicalize`, `fingerprintFlows`, `sha256Canonical`, `CanonicalDag`, `CanonicalMatchArm`, `CanonicalRetryPolicy`, `CanonicalSchema`, `CanonicalStep`) are removed from the public API. Flow hashing is unchanged, so existing flow hashes and in-flight runs are unaffected.
+- 2fc52df: The worker now owns lease reaping alongside the signal-timeout sweep, on its own clock, store and queue, so workers built with `wf.worker()` outside `nagi.run` reap a crashed peer's expired leases too. Configure it with the new `WorkerConfig.reaperIntervalMs` (default 30s, `0` disables); `NagiConfig.reaperIntervalMs` is deprecated and still honored as its fallback.
+
 ## 0.1.1-rc.21
 
 ### Patch Changes

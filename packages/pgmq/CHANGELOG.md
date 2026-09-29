@@ -1,5 +1,33 @@
 # @nagi-js/pgmq
 
+## 0.1.1-rc.23
+
+### Patch Changes
+
+- 6e9a253: Fix: `pgmqQueue()` now validates `queueName` at construction, and `dequeue()` reads `msg_id` as text.
+
+  The queue name must match `/^[A-Za-z0-9_]{1,47}$/` — pgmq's own client rule, with 47 as pgmq's maximum queue-name length. `inspect()` splices the name into an unquoted `pgmq.q_<name>` identifier, so a name outside that set (a hyphen, a quote, a `;`) either broke `inspect()` or reached the SQL unescaped. Such names now throw from `pgmqQueue()` before any SQL runs.
+
+  `msg_id` is a `bigint`; reading it as `::text` keeps receipts exact even when the application installs a pg type parser that turns int8 into a JS `number`, which loses precision past 2^53.
+
+- Updated dependencies [674bea6]
+- Updated dependencies [d424f0a]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [ecb5ac6]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [a87b71c]
+- Updated dependencies [9b8b6fa]
+- Updated dependencies [2fc52df]
+- Updated dependencies [b9a0c46]
+- Updated dependencies [4cc20fd]
+- Updated dependencies [58458fa]
+- Updated dependencies [2fc52df]
+  - @nagi-js/core@0.1.1-rc.22
+
 ## 0.1.1-rc.22
 
 ### Patch Changes
