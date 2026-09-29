@@ -45,11 +45,10 @@ importers:
   packages/core: {}
 
   packages/pgmq:
-    dependencies:
+    devDependencies:
       '@nagi-js/core':
         specifier: workspace:*
         version: link:../core
-    devDependencies:
       '@types/pg':
         specifier: ^8.23.1
         version: 8.23.1
@@ -61,11 +60,10 @@ importers:
         version: 8.23.0
 
   packages/postgres:
-    dependencies:
+    devDependencies:
       '@nagi-js/core':
         specifier: workspace:*
         version: link:../core
-    devDependencies:
       '@types/pg':
         specifier: ^8.23.1
         version: 8.23.1

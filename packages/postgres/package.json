@@ -43,13 +43,12 @@
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "pnpm run build"
   },
-  "dependencies": {
-    "@nagi-js/core": "workspace:*"
-  },
   "peerDependencies": {
+    "@nagi-js/core": "workspace:*",
     "kysely": "^0.29.0"
   },
   "devDependencies": {
+    "@nagi-js/core": "workspace:*",
     "@types/pg": "^8.23.1",
     "kysely": "^0.29.0",
     "pg": "^8.23.0"
