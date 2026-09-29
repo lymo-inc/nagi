@@ -46,7 +46,7 @@ function chainFlow(id: string, runs: Runs) {
   });
 }
 
-describe('operator.retry({ scope: "step" })', () => {
+describe('replay({ from, scope: "step" })', () => {
   it("reruns only the named step and leaves completed descendants alone", async () => {
     const runs = newRuns();
     const f = chainFlow("isolated-rerun", runs);
@@ -55,9 +55,7 @@ describe('operator.retry({ scope: "step" })', () => {
     await h.drain();
     expect(runs).toEqual({ a: 1, b: 1, c: 1 });
 
-    await h.wf
-      .operator()
-      .retry(runId, "b", { actor: "ops@nagi", scope: "step" });
+    await h.wf.replay(runId, { mode: "continue", from: "b", scope: "step" });
     await h.drain();
 
     // b re-ran; c did NOT, so it still holds output derived from b's OLD value.
@@ -75,7 +73,7 @@ describe('operator.retry({ scope: "step" })', () => {
     const runId = await h.wf.start(f, {});
     await h.drain();
 
-    await h.wf.operator().retry(runId, "b", { actor: "ops@nagi" });
+    await h.wf.replay(runId, { mode: "continue", from: "b" });
     await h.drain();
 
     expect(runs).toEqual({ a: 1, b: 2, c: 2 });
@@ -83,16 +81,14 @@ describe('operator.retry({ scope: "step" })', () => {
     expect(r.output("c")).toEqual({ sawB: "b2" });
   });
 
-  it("records the operator intent as scope on the origin reset fact", async () => {
+  it("records the caller's intent as scope on the origin reset fact", async () => {
     const runs = newRuns();
     const f = chainFlow("scope-audit", runs);
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
     await h.drain();
 
-    await h.wf
-      .operator()
-      .retry(runId, "b", { actor: "ops@nagi", scope: "step" });
+    await h.wf.replay(runId, { mode: "continue", from: "b", scope: "step" });
     await h.drain();
 
     const r = await h.result(runId);
@@ -110,7 +106,7 @@ describe('operator.retry({ scope: "step" })', () => {
     const runId = await h.wf.start(f, {});
     await h.drain();
 
-    await h.wf.operator().retry(runId, "b", { actor: "ops@nagi" });
+    await h.wf.replay(runId, { mode: "continue", from: "b" });
     await h.drain();
 
     const r = await h.result(runId);
@@ -130,9 +126,7 @@ describe('operator.retry({ scope: "step" })', () => {
     const runId = await h.wf.start(f, {});
     await h.drain();
 
-    await h.wf
-      .operator()
-      .retry(runId, "c", { actor: "ops@nagi", scope: "step" });
+    await h.wf.replay(runId, { mode: "continue", from: "c", scope: "step" });
     await h.drain();
 
     const r = await h.result(runId);
@@ -150,47 +144,13 @@ describe('operator.retry({ scope: "step" })', () => {
     expect((await h.result(runId)).status).toBe("completed");
 
     // Isolated rerun of the LEAF, so the flow output itself changes.
-    await h.wf
-      .operator()
-      .retry(runId, "c", { actor: "ops@nagi", scope: "step" });
+    await h.wf.replay(runId, { mode: "continue", from: "c", scope: "step" });
     await h.drain();
 
     const r = await h.result(runId);
     expect(r.status).toBe("completed");
     expect(runs.c).toBe(2);
     expect(r.factCount("flow.completed")).toBe(2);
-  });
-});
-
-describe('replay({ from, scope: "step" })', () => {
-  it("resets only the origin step", async () => {
-    const runs = newRuns();
-    const f = chainFlow("replay-isolated", runs);
-    const h = await makeHarness(f);
-    const runId = await h.wf.start(f, {});
-    await h.drain();
-
-    await h.wf.replay(runId, { mode: "continue", from: "b", scope: "step" });
-    await h.drain();
-
-    expect(runs).toEqual({ a: 1, b: 2, c: 1 });
-    const r = await h.result(runId);
-    const resets = r.factsOf("step.reset") as StepResetFact[];
-    expect(resets).toHaveLength(1);
-    expect(resets[0]?.scope).toBe("step");
-  });
-
-  it("still cascades when scope is omitted", async () => {
-    const runs = newRuns();
-    const f = chainFlow("replay-cascade", runs);
-    const h = await makeHarness(f);
-    const runId = await h.wf.start(f, {});
-    await h.drain();
-
-    await h.wf.replay(runId, { mode: "continue", from: "b" });
-    await h.drain();
-
-    expect(runs).toEqual({ a: 1, b: 2, c: 2 });
   });
 });
 
@@ -239,9 +199,7 @@ describe('subflow step under scope: "step"', () => {
     expect(childRuns).toBe(1);
     expect(consumeRuns).toBe(1);
 
-    await h.wf
-      .operator()
-      .retry(runId, "sub", { actor: "ops@nagi", scope: "step" });
+    await h.wf.replay(runId, { mode: "continue", from: "sub", scope: "step" });
     await h.drain();
 
     const after = await h.result(runId);

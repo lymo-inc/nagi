@@ -130,7 +130,6 @@ describe("decideSignal — pre-awaiting state buffering (N7 audit pins)", () => 
         stepId,
         attempt: 1,
         at: new Date(2),
-        actor: "operator",
       }),
     ]);
     expect(runState.steps[stepId]?.tag).toBe("aborting");

@@ -196,7 +196,7 @@ d("@nagi-js/postgres — run events over LISTEN/NOTIFY", () => {
     expect(perRun.map((e) => e.type)).toContain("flow.completed");
 
     // Reopening must not reach the auto-disposed watcher.
-    await wf.operator().retry(runId, "only", { actor: "ops", scope: "step" });
+    await wf.replay(runId, { mode: "continue", from: "only", scope: "step" });
     await new Promise((r) => setTimeout(r, 300));
     expect(perRun).toHaveLength(afterTerminal);
   }, 30_000);

@@ -5,7 +5,6 @@ import { makeHooks } from "./exec/hooks";
 import { type FlowOf, makeFlowOf, pinRun, registerFlows } from "./flows";
 import { compact, makeEmit } from "./internal";
 import { InMemoryClock } from "./memory";
-import { makeOperator } from "./operator";
 import { makeReplay, type ReplayScope } from "./replay";
 import { makeRunLifecycle } from "./run-lifecycle";
 import type { RunDescription } from "./run-view";
@@ -25,7 +24,6 @@ import type {
   Json,
   LogEntry,
   Millis,
-  Operator,
   PrunableStatus,
   PruneOpts,
   PruneResult,
@@ -168,8 +166,6 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
 
   // Lifecycle events for every run this process observes.
   watchRuns(handler: (e: RunEventEnvelope) => void): () => void;
-
-  operator(): Operator;
 
   pruneFacts(opts: PruneOpts): Promise<PruneResult>;
 }
@@ -363,16 +359,6 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       await dispatcher.cancel(runId, {
         cause: "explicit",
         reason: opts?.reason ?? "explicit wf.cancel()",
-      });
-    },
-
-    operator(): Operator {
-      return makeOperator({
-        dispatcher,
-        store: config.store,
-        clock,
-        flowOf,
-        emitLog,
       });
     },
 

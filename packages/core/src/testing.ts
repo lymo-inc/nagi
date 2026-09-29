@@ -1621,7 +1621,6 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
           stepId: "s",
           attempt: A1,
           at: t(5),
-          actor: "op",
         }),
       );
       await both("running", A2, t(3));
@@ -1633,7 +1632,6 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
           stepId: "s",
           attempt: A2,
           at: t(6),
-          actor: "op",
         }),
       );
       eq(
@@ -1652,7 +1650,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       const skip = (stepId: StepId, at: Date) =>
         s.appendFact(
           runId,
-          Facts.stepSkipped({ runId, stepId, reason: "manual", at }),
+          Facts.stepSkipped({ runId, stepId, reason: "when-false", at }),
         );
       await startRun(s, runId, { at: t(0) });
       await skip("never", t(1));

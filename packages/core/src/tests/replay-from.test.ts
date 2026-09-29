@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { NagiRuntimeError, NagiValidationError } from "../errors";
-import type { StepResetFact } from "../types";
+import { Facts } from "../facts";
+import type { AttemptNumber, StepResetFact } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
 describe("wf.replay({ from }) — step-scoped replay", () => {
@@ -72,7 +73,7 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     ).rejects.toBeInstanceOf(NagiValidationError);
   });
 
-  it("throws NagiRuntimeError when the run is still running", async () => {
+  it("resets a parked step on a live run", async () => {
     const f = flow({
       id: "from-running",
       input: passthroughSchema<Record<string, never>>(),
@@ -86,11 +87,128 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
     await h.drain();
-    const state = await h.store.loadRunState(runId);
-    expect(state.phase.tag).toBe("running");
+    expect((await h.store.loadRunState(runId)).phase.tag).toBe("running");
 
+    await h.wf.replay(runId, { mode: "continue", from: "wait" });
+    await h.drain();
+
+    const r = await h.result(runId);
+    expect(r.factCount("step.reset")).toBe(1);
+    expect(r.factCount("step.abort-requested")).toBe(0);
+    expect((await h.store.loadRunState(runId)).steps["wait"]?.tag).toBe(
+      "awaitingSignal",
+    );
+  });
+
+  it("aborts an in-flight `from` step before resetting it", async () => {
+    let abortObserved = false;
+    let aAttempts = 0;
+    const f = flow({
+      id: "from-in-flight",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ ctx }) => {
+            aAttempts += 1;
+            if (aAttempts === 1) {
+              for (let i = 0; i < 200; i++) {
+                if (ctx.signal.aborted) {
+                  abortObserved = true;
+                  throw new Error("aborted");
+                }
+                await new Promise((r) => setTimeout(r, 5));
+              }
+              return { ran: 1 };
+            }
+            return { ran: 2 };
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    const worker = h.startWorker({ pollIntervalMs: 5 });
+    try {
+      await h.waitForStep(runId, "a", "running", 2_000);
+      await h.wf.replay(runId, { mode: "continue", from: "a" });
+      await h.waitForStep(runId, "a", "completed", 3_000);
+    } finally {
+      await worker.stop();
+    }
+    expect(abortObserved).toBe(true);
+    expect(aAttempts).toBe(2);
+    const r = await h.result(runId);
+    expect(r.factCount("step.abort-requested")).toBe(1);
+    expect(r.factCount("step.canceled")).toBe(1);
+    expect(r.status).toBe("completed");
+  });
+
+  it("recovers a canceled step that holds a live run open", async () => {
+    let attempts = 0;
+    const f = flow({
+      id: "from-canceled-step",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          run: async ({ ctx }) => {
+            attempts += 1;
+            if (attempts === 1) {
+              await new Promise<void>((_, reject) =>
+                ctx.signal.addEventListener("abort", () =>
+                  reject(ctx.signal.reason),
+                ),
+              );
+            }
+            return { ok: true };
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    const worker = h.startWorker({ pollIntervalMs: 5 });
+    try {
+      await h.waitForStep(runId, "a", "running", 2_000);
+      // The state a replay that crashed between its abort and its reset leaves.
+      await h.store.appendFact(
+        runId,
+        Facts.stepAbortRequested({
+          runId,
+          stepId: "a",
+          attempt: 1 as AttemptNumber,
+          at: new Date(),
+        }),
+      );
+      await h.waitForStep(runId, "a", "canceled", 3_000);
+      expect((await h.store.loadRunState(runId)).phase.tag).toBe("running");
+
+      await h.wf.replay(runId, { mode: "continue", from: "a" });
+      await h.waitForStep(runId, "a", "completed", 3_000);
+    } finally {
+      await worker.stop();
+    }
+    expect(attempts).toBe(2);
+    expect((await h.result(runId)).status).toBe("completed");
+  });
+
+  it("throws NagiRuntimeError on a canceled run", async () => {
+    const f = flow({
+      id: "from-canceled-run",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<Record<string, never>>(),
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    await h.drain();
+    await h.wf.cancel(runId);
     await expect(
-      h.wf.replay(runId, { mode: "continue", from: "wait" }),
+      h.wf.replay(runId, { mode: "continue", from: "a" }),
     ).rejects.toBeInstanceOf(NagiRuntimeError);
   });
 

@@ -39,7 +39,7 @@ pnpm verify               # everything CI runs: lint, build, typecheck, test, pu
 - **Single door:** everything public is exported from `packages/core/src/index.ts`
   (plus `./testing`).
 - **Comments:** only load-bearing WHY, and the MUST contracts on the
-  `Store`/`Queue`/`Operator` ports. No JSDoc narrative or banners.
+  `Store`/`Queue` ports. No JSDoc narrative or banners.
 
 ## Changes, changesets, releases
 

@@ -18,7 +18,6 @@ import type {
   AttemptNumber,
   Flow,
   Json,
-  ResetScope,
   RunState,
   SerializedError,
   StepId,
@@ -287,25 +286,15 @@ export function computeFlowOutput(flow: Flow, runState: RunState): Json {
   return flow.output(stepOutputs as never) as Json;
 }
 
-// The steps a reset touches, given its scope. "step" is the regenerate-one
-// shape: only the origin. Both operator.retry and replay({from}) resolve their
-// reset set through here so the two paths can never drift apart.
-export function resetSetOf(
-  flow: Flow,
-  stepId: StepId,
-  scope: ResetScope | undefined,
-): readonly StepId[] {
-  return scope === "step" ? [stepId] : descendantsOf(flow, stepId);
-}
-
-// The facts one reset writes: the origin carries the caller's audit fields,
-// every other step in the reset set records where the cascade came from.
+// The facts one reset writes. "step" is the regenerate-one shape: only the
+// origin. Otherwise every descendant records where the cascade came from.
 export function resetFactsOf(
   flow: Flow,
   origin: Omit<Parameters<typeof Facts.stepReset>[0], "cascadedFrom">,
 ): readonly StepResetFact[] {
   const { runId, stepId, at } = origin;
-  return resetSetOf(flow, stepId, origin.scope).map((id) =>
+  const set = origin.scope === "step" ? [stepId] : descendantsOf(flow, stepId);
+  return set.map((id) =>
     id === stepId
       ? Facts.stepReset(origin)
       : Facts.stepReset({ runId, stepId: id, at, cascadedFrom: stepId }),

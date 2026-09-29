@@ -96,7 +96,7 @@ export class NagiSignalTimeoutError extends Error {
 
 // A handler step (task / activity / streaming) blew its declared timeoutMs.
 // Distinct from NagiAbortError on purpose: an abort means someone canceled the
-// run or an operator reset the step, and classifyFailure settles those as
+// run or a replay reset the step, and classifyFailure settles those as
 // `canceled`. A deadline is the step's own failure, so it must reach
 // classifyFailure as an ordinary error and retry under the step's policy. The
 // name is NOT "AbortError" for the same reason — that name is how an abort is

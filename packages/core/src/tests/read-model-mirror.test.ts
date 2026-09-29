@@ -39,11 +39,9 @@ function alphabet(): Fact[] {
     out.push(Facts.stepCanceled(runId, stepId, a, at));
     out.push(Facts.stepCanceled(runId, stepId, a, at, boom));
     out.push(Facts.stepRetried(runId, stepId, a, at, boom, at));
-    out.push(
-      Facts.stepAbortRequested({ runId, stepId, attempt: a, at, actor: "op" }),
-    );
+    out.push(Facts.stepAbortRequested({ runId, stepId, attempt: a, at }));
   }
-  out.push(Facts.stepSkipped({ runId, stepId, at, reason: "manual" }));
+  out.push(Facts.stepSkipped({ runId, stepId, at, reason: "when-false" }));
   out.push(Facts.stepReset({ runId, stepId, at }));
   out.push(Facts.flowCompleted(runId, { done: true }, at));
   out.push(Facts.flowFailed(runId, boom, at));

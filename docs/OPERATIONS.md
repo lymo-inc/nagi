@@ -108,7 +108,7 @@ const q = await wf.inspectQueue(runId); // in-queue messages for the run
 | running, 0 started steps          | entry with `readCount: 0`      | Never scheduled — workers starved or not consuming               |
 | running, step has live `lease`    | entry with future `visibleAt`  | Actively executing (slow handler — watch for watchdog warns)     |
 | running, signal step `running`    | no entries                     | Parked on a signal/child — check the signal source, not the pool |
-| running, no lease, no entries     | —                              | Advance was lost — self-heals on next redelivery; `operator().retry(runId, stepId, { actor })` re-drives immediately |
+| running, no lease, no entries     | —                              | Advance was lost — self-heals on next redelivery; `replay(runId, { mode: "continue", from: stepId })` re-drives immediately |
 | any status                        | entry with high `readCount`    | Redelivery loop — see poison messages below                      |
 
 ## Nothing is being consumed (fleet-wide stall)
@@ -313,28 +313,29 @@ and `ADD CONSTRAINT ... NOT VALID` yourself, `VALIDATE CONSTRAINT` separately
 `0008_canceled_by_run_id_fk` into `<schema>.schema_migrations` so `migrate()`
 skips it.
 
-## Operator actions
+## Recovery actions
 
-`wf.operator()` (all take `{ actor, note? }` for the audit trail):
+- `wf.replay(runId, { mode: "continue", from: stepId })` — reset the step
+  **and its descendants** and re-dispatch. A `running` step is aborted first
+  (its handler sees `ctx.signal` abort, and replay waits up to 30s for it to
+  settle). Works on a live run — including a `canceled` step holding it open —
+  and on a completed/failed run, which the reset reopens.
+- `wf.replay(runId, { mode: "continue", from: stepId, scope: "step" })` — rerun
+  **only** that step. Completed descendants are left alone, so they keep
+  outputs derived from the step's PREVIOUS output; the run is deliberately
+  inconsistent until you rerun them too. Use it to regenerate one artifact when
+  downstream consumers read from their own storage. On a settled run the reset
+  reopens the run, and the flow output recomputes when it re-completes.
+- `wf.replay(runId, { mode: "continue" })` — re-drive the run on the current
+  flow version without resetting anything.
+- `wf.cancel(runId, { reason })` — cancel the run and its children,
+  recursively.
 
-- `skip(runId, stepId)` — settle a step as skipped and advance past it.
-- `retry(runId, stepId)` — abort if running, reset the step **and its
-  descendants**, re-dispatch.
-- `retry(runId, stepId, { actor, scope: "step" })` — rerun **only** that step.
-  Completed descendants are left alone, so they keep outputs derived from the
-  step's PREVIOUS output; the run is deliberately inconsistent until you rerun
-  them too. Use it to regenerate one artifact when downstream consumers read
-  from their own storage. On a settled run the reset reopens the run, and the
-  flow output recomputes when it re-completes.
-- `abort(runId)` — cancel the run and its children, recursively.
-
-Plus `wf.replay(runId, { mode, from, scope? })` for whole-run replay on the
-current flow version — `scope` behaves exactly as on `retry` — and
-`wf.cancel(runId)` for a plain stop.
+A canceled run cannot be replayed; start a new run instead.
 
 The origin `step.reset` fact records `scope: "step"` for an isolated rerun.
 Intent is recorded rather than inferred: a leaf step has no descendants, so a
-cascading retry on a leaf writes the same single fact an isolated one does.
+cascading reset on a leaf writes the same single fact an isolated one does.
 
 A subflow step reset under either scope bumps its generation, so it spawns a
 FRESH child run rather than re-attaching to the finished one.

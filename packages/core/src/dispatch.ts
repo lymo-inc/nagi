@@ -58,7 +58,7 @@ export type EndingRun =
   | { readonly kind: "resolved"; readonly runId: RunId; readonly flow: Flow }
   | { readonly kind: "gone"; readonly runId: RunId; readonly flowId: string };
 
-// Explicit/operator cancels are excluded: they cascade to children, so they
+// Explicit cancels are excluded: they cascade to children, so they
 // only end a run through Dispatcher.cancel.
 export type RunEnd =
   | Exclude<TerminalPhase, { readonly tag: "canceled" }>
@@ -132,7 +132,7 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
         // must not be stranded behind one gone snapshot or store blip.
         deps.emitLog({
           level: "error",
-          msg: "nagi: signal timeout fired but the run could not be advanced — re-drive with operator.retry",
+          msg: "nagi: signal timeout fired but the run could not be advanced — re-drive with replay({ from })",
           attrs: { runId, stepId, attempt, error: String(err) },
         });
       }

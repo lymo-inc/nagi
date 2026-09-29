@@ -54,7 +54,7 @@ export class NagiAbortError extends Error {
     super(
       kind === "run"
         ? `Run ${runId} was canceled — ctx.signal aborted.`
-        : `Step in run ${runId} was aborted by operator.retry() — ctx.signal aborted.`,
+        : `Step in run ${runId} was aborted by replay({ from }) — ctx.signal aborted.`,
     );
     this.name = "AbortError";
     this.runId = runId;
@@ -63,7 +63,7 @@ export class NagiAbortError extends Error {
 }
 
 // Computed inside the runStep tx so the fact commits atomically with the step's
-// writes. An operator abort reports abortedHere so the caller skips advancing —
+// writes. A replay abort reports abortedHere so the caller skips advancing —
 // the abort re-enqueues the step elsewhere.
 export function resolveExecutionFact(args: {
   readonly postState: RunState;
@@ -282,7 +282,7 @@ export function startHeartbeat(args: {
   });
 }
 
-// Cancellation/abort wins over retry. An operator-aborted step is re-enqueued
+// Cancellation/abort wins over retry. A replay-aborted step is re-enqueued
 // elsewhere so it must not advance, whereas a run-cancellation must advance so
 // the run can finalize; only an abort/cancel error is recorded on the fact.
 // A handler that throws NagiCanceledError reclassifies the whole run to

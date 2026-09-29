@@ -38,7 +38,7 @@ describe("step.reset reopens a settled run", () => {
     expect(state.phase.tag).toBe("canceled");
   });
 
-  it("cancel watcher does not abort a handler re-run via operator.retry", async () => {
+  it("cancel watcher does not abort a handler re-run via replay({ from })", async () => {
     let attempts = 0;
     const f = flow({
       id: "reopen-watcher",
@@ -75,7 +75,7 @@ describe("step.reset reopens a settled run", () => {
     await h.drain();
     expect((await h.result(runId)).status).toBe("failed");
 
-    await h.wf.operator().retry(runId, "b", { actor: "ops" });
+    await h.wf.replay(runId, { mode: "continue", from: "b" });
     await h.drain();
 
     expect(attempts).toBe(2);
@@ -119,7 +119,7 @@ describe("step.reset reopens a settled run", () => {
     expect((await h.result(run2)).status).toBe("running");
 
     await expect(
-      h.wf.operator().retry(run1, "s", { actor: "ops" }),
+      h.wf.replay(run1, { mode: "continue", from: "s" }),
     ).rejects.toBeInstanceOf(NagiConcurrencyConflictError);
 
     const result = await h.result(run1);
