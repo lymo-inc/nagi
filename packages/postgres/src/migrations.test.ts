@@ -1,5 +1,6 @@
+import type { Kysely } from "kysely";
 import { describe, expect, it } from "vitest";
-import { migrations } from "./migrations";
+import { migrate, migrations } from "./migrations";
 
 describe("migrations", () => {
   it("ships at least one migration", () => {
@@ -99,6 +100,28 @@ describe("migrations", () => {
     it("is safe to re-apply", () => {
       expect(sql).toContain("DROP CONSTRAINT IF EXISTS");
       expect(sql).toContain("CREATE INDEX IF NOT EXISTS");
+    });
+  });
+
+  describe("0010_canceled_by_fk_deferrable", () => {
+    it("makes the superseder FK deferrable, checked at commit", () => {
+      const m = migrations.find(
+        (x) => x.id === "0010_canceled_by_fk_deferrable",
+      );
+      expect(m).toBeDefined();
+      const sql = (m as { sql: (schema: string) => string }).sql(
+        "custom_schema",
+      );
+      expect(sql).toContain("DEFERRABLE INITIALLY DEFERRED");
+      expect(sql).toContain("custom_schema.workflow_run");
+    });
+  });
+
+  describe("migrate — schema validation", () => {
+    it("rejects a schema name over the 56-character cap before touching db", async () => {
+      await expect(
+        migrate({} as Kysely<unknown>, { schema: "a".repeat(57) }),
+      ).rejects.toThrow(/invalid schema name/i);
     });
   });
 });

@@ -68,6 +68,7 @@ import { uuidv7 } from "./uuidv7";
 
 const DEFAULT_LEASE_MS: Millis = 60_000;
 const SCHEMA_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_SCHEMA_LEN = 56; // 63-byte identifier limit minus "_stream"/"_events"
 
 type StartResult = Awaited<ReturnType<Store["tryStartRun"]>>;
 const NOT_STARTED: StartResult = { started: false, canceled: [] };
@@ -115,16 +116,18 @@ class PostgresStore<DB = unknown> implements Store {
   readonly events?: RunEventTransport;
 
   constructor(opts: PostgresStoreOpts<DB>) {
-    if (!SCHEMA_RE.test(opts.schema ?? "nagi")) {
+    const schema = opts.schema ?? "nagi";
+    if (!SCHEMA_RE.test(schema) || schema.length > MAX_SCHEMA_LEN) {
       throw new Error(
-        `@nagi-js/postgres: invalid schema name "${opts.schema}". Must match /^[A-Za-z_][A-Za-z0-9_]*$/.`,
+        `@nagi-js/postgres: invalid schema name "${opts.schema}". Must match /^[A-Za-z_][A-Za-z0-9_]*$/ and be at most ${MAX_SCHEMA_LEN} characters.`,
       );
     }
     this.db = opts.db;
-    this.schema = opts.schema ?? "nagi";
+    this.schema = schema;
     this.leaseMs = opts.leaseMs ?? DEFAULT_LEASE_MS;
-    // SCHEMA_RE already bounded this to an identifier, so the channel name is
-    // safe and stays inside PostgreSQL's 63-byte limit.
+    // SCHEMA_RE and MAX_SCHEMA_LEN already bounded this to an identifier of
+    // at most 56 characters, so the channel name stays inside PostgreSQL's
+    // 63-byte limit.
     this.streamChannel = `${this.schema}_stream`;
     this.eventChannel = `${this.schema}_events`;
     let listening: Promise<void> = Promise.resolve();
@@ -1074,23 +1077,27 @@ class PostgresStore<DB = unknown> implements Store {
   }
 
   async describe(runId: RunId): Promise<RunDescription> {
-    // Single tx for read consistency across the three SELECTs.
-    return this.db.transaction().execute(async (trx) => {
-      const runRows = await sql<{
-        run_id: string;
-        flow_id: string;
-        flow_hash: string | null;
-        status: RunStatus;
-        input: Json;
-        output: Json | null;
-        error: Json | null;
-        started_at: Date;
-        completed_at: Date | null;
-        concurrency_key: string | null;
-        canceled_by_run_id: string | null;
-        parent_run_id: string | null;
-        parent_step_id: string | null;
-      }>`
+    // One snapshot across the SELECTs; READ COMMITTED would re-snapshot each.
+    return this.db
+      .transaction()
+      .setIsolationLevel("repeatable read")
+      .setAccessMode("read only")
+      .execute(async (trx) => {
+        const runRows = await sql<{
+          run_id: string;
+          flow_id: string;
+          flow_hash: string | null;
+          status: RunStatus;
+          input: Json;
+          output: Json | null;
+          error: Json | null;
+          started_at: Date;
+          completed_at: Date | null;
+          concurrency_key: string | null;
+          canceled_by_run_id: string | null;
+          parent_run_id: string | null;
+          parent_step_id: string | null;
+        }>`
         SELECT run_id, flow_id, flow_hash, status, input, output, error,
                started_at, completed_at, concurrency_key, canceled_by_run_id,
                parent_run_id, parent_step_id
@@ -1099,19 +1106,19 @@ class PostgresStore<DB = unknown> implements Store {
          LIMIT 1
       `.execute(trx);
 
-      const r = runRows.rows[0];
-      if (r === undefined) return null;
+        const r = runRows.rows[0];
+        if (r === undefined) return null;
 
-      const stepRows = await sql<{
-        step_id: string;
-        attempt: number;
-        status: StepRunStatus;
-        output: Json | null;
-        error: Json | null;
-        started_at: Date | null;
-        completed_at: Date | null;
-        lease_expires_at: Date | null;
-      }>`
+        const stepRows = await sql<{
+          step_id: string;
+          attempt: number;
+          status: StepRunStatus;
+          output: Json | null;
+          error: Json | null;
+          started_at: Date | null;
+          completed_at: Date | null;
+          lease_expires_at: Date | null;
+        }>`
         SELECT s.step_id, s.attempt, s.status, s.output, s.error,
                s.started_at, s.completed_at, l.expires_at AS lease_expires_at
           FROM ${sql.raw(this.t("step_run"))} s
@@ -1124,81 +1131,85 @@ class PostgresStore<DB = unknown> implements Store {
          ORDER BY s.started_at ASC NULLS LAST, s.step_id ASC
       `.execute(trx);
 
-      const childRows = await sql<{ run_id: string }>`
+        const childRows = await sql<{ run_id: string }>`
         SELECT run_id
           FROM ${sql.raw(this.t("workflow_run"))}
          WHERE parent_run_id = ${runId}
          ORDER BY started_at ASC
       `.execute(trx);
 
-      const startedAt =
-        r.started_at instanceof Date ? r.started_at : new Date(r.started_at);
-      const completedAt =
-        r.completed_at === null
-          ? undefined
-          : r.completed_at instanceof Date
-            ? r.completed_at
-            : new Date(r.completed_at);
-      const parent =
-        r.parent_run_id !== null && r.parent_step_id !== null
-          ? {
-              runId: r.parent_run_id as RunId,
-              stepId: r.parent_step_id,
-            }
-          : undefined;
-      const run: RunView = {
-        runId: r.run_id as RunId,
-        flowId: r.flow_id,
-        flowHash: r.flow_hash ?? "",
-        status: r.status,
-        startedAt,
-        input: r.input,
-        children: childRows.rows.map((c) => c.run_id as RunId),
-        ...(completedAt !== undefined ? { completedAt } : {}),
-        ...(r.output !== null ? { output: r.output } : {}),
-        ...(r.error !== null ? { error: r.error } : {}),
-        ...(r.canceled_by_run_id !== null
-          ? { canceledByRunId: r.canceled_by_run_id as RunId }
-          : {}),
-        ...(r.concurrency_key !== null
-          ? { concurrencyKey: r.concurrency_key }
-          : {}),
-        ...(parent !== undefined ? { parent } : {}),
-      };
-
-      const steps: StepView[] = stepRows.rows.map((sr) => {
-        const sStartedAt =
-          sr.started_at === null
+        const startedAt =
+          r.started_at instanceof Date ? r.started_at : new Date(r.started_at);
+        const completedAt =
+          r.completed_at === null
             ? undefined
-            : sr.started_at instanceof Date
-              ? sr.started_at
-              : new Date(sr.started_at);
-        const sCompletedAt =
-          sr.completed_at === null
-            ? undefined
-            : sr.completed_at instanceof Date
-              ? sr.completed_at
-              : new Date(sr.completed_at);
-        const sLeaseAt =
-          sr.lease_expires_at === null
-            ? undefined
-            : sr.lease_expires_at instanceof Date
-              ? sr.lease_expires_at
-              : new Date(sr.lease_expires_at);
-        return {
-          stepId: sr.step_id,
-          attempt: sr.attempt as AttemptNumber,
-          status: sr.status,
-          ...(sStartedAt !== undefined ? { startedAt: sStartedAt } : {}),
-          ...(sCompletedAt !== undefined ? { completedAt: sCompletedAt } : {}),
-          ...(sr.output !== null ? { output: sr.output } : {}),
-          ...(sr.error !== null ? { error: sr.error } : {}),
-          ...(sLeaseAt !== undefined ? { lease: { expiresAt: sLeaseAt } } : {}),
+            : r.completed_at instanceof Date
+              ? r.completed_at
+              : new Date(r.completed_at);
+        const parent =
+          r.parent_run_id !== null && r.parent_step_id !== null
+            ? {
+                runId: r.parent_run_id as RunId,
+                stepId: r.parent_step_id,
+              }
+            : undefined;
+        const run: RunView = {
+          runId: r.run_id as RunId,
+          flowId: r.flow_id,
+          flowHash: r.flow_hash ?? "",
+          status: r.status,
+          startedAt,
+          input: r.input,
+          children: childRows.rows.map((c) => c.run_id as RunId),
+          ...(completedAt !== undefined ? { completedAt } : {}),
+          ...(r.output !== null ? { output: r.output } : {}),
+          ...(r.error !== null ? { error: r.error } : {}),
+          ...(r.canceled_by_run_id !== null
+            ? { canceledByRunId: r.canceled_by_run_id as RunId }
+            : {}),
+          ...(r.concurrency_key !== null
+            ? { concurrencyKey: r.concurrency_key }
+            : {}),
+          ...(parent !== undefined ? { parent } : {}),
         };
-      });
 
-      return { run, steps };
-    });
+        const steps: StepView[] = stepRows.rows.map((sr) => {
+          const sStartedAt =
+            sr.started_at === null
+              ? undefined
+              : sr.started_at instanceof Date
+                ? sr.started_at
+                : new Date(sr.started_at);
+          const sCompletedAt =
+            sr.completed_at === null
+              ? undefined
+              : sr.completed_at instanceof Date
+                ? sr.completed_at
+                : new Date(sr.completed_at);
+          const sLeaseAt =
+            sr.lease_expires_at === null
+              ? undefined
+              : sr.lease_expires_at instanceof Date
+                ? sr.lease_expires_at
+                : new Date(sr.lease_expires_at);
+          return {
+            stepId: sr.step_id,
+            attempt: sr.attempt as AttemptNumber,
+            status: sr.status,
+            ...(sStartedAt !== undefined ? { startedAt: sStartedAt } : {}),
+            ...(sCompletedAt !== undefined
+              ? { completedAt: sCompletedAt }
+              : {}),
+            ...(sr.output !== null ? { output: sr.output } : {}),
+            ...(sr.error !== null ? { error: sr.error } : {}),
+            ...(sLeaseAt !== undefined
+              ? { lease: { expiresAt: sLeaseAt } }
+              : {}),
+          };
+        });
+
+        return { run, steps };
+      });
   }
 
   async listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>> {

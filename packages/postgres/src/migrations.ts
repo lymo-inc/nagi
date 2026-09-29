@@ -224,6 +224,17 @@ export const migrations: readonly Migration[] = [
       DROP INDEX IF EXISTS ${schema}.step_run_lookup_idx;
     `,
   },
+  {
+    // Checked at commit: code older than c50101f writes the victim's
+    // canceled_by_run_id before inserting the superseder in the same tx.
+    // ON DELETE SET NULL stays immediate (referential actions never defer).
+    id: "0010_canceled_by_fk_deferrable",
+    sql: (schema) => `
+      ALTER TABLE ${schema}.workflow_run
+        ALTER CONSTRAINT workflow_run_canceled_by_fk
+        DEFERRABLE INITIALLY DEFERRED;
+    `,
+  },
 ];
 
 export interface MigrateOpts {
@@ -280,10 +291,15 @@ export async function migrate<DB>(
   });
 }
 
+const MAX_SCHEMA_LEN = 56; // 63-byte identifier limit minus "_stream"/"_events"
+
 function assertValidSchema(schema: string): void {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema)) {
+  if (
+    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema) ||
+    schema.length > MAX_SCHEMA_LEN
+  ) {
     throw new Error(
-      `@nagi-js/postgres: invalid schema name "${schema}". Must match /^[A-Za-z_][A-Za-z0-9_]*$/.`,
+      `@nagi-js/postgres: invalid schema name "${schema}". Must match /^[A-Za-z_][A-Za-z0-9_]*$/ and be at most ${MAX_SCHEMA_LEN} characters.`,
     );
   }
 }
