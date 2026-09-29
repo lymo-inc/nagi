@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
-import type { LogEntry, QueueDequeueOpts, QueueMessage } from "../types";
+import type { Clock, LogEntry, QueueDequeueOpts, QueueMessage } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
 const echo = flow({
@@ -243,5 +243,62 @@ describe("nagi.run — back-compat", () => {
     });
     ac.abort();
     await loop;
+  });
+});
+
+describe("worker.run — shutdown", () => {
+  it("resolves once the in-flight dispatch settles, even on a Clock whose unsignalled sleep never fires", async () => {
+    const stalledClock: Clock = {
+      now: () => new Date(),
+      sleep: (_ms, signal) =>
+        new Promise((_, reject) => {
+          if (signal?.aborted) reject(signal.reason);
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        }),
+    };
+    let started = false;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const gated = flow({
+      id: "gated-drain",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        step: b.task({
+          run: async () => {
+            started = true;
+            await gate;
+            return {};
+          },
+        }),
+      }),
+    });
+    const store = new InMemoryStore();
+    const wf = await nagi({
+      flows: [gated],
+      store,
+      queue: new InMemoryQueue(),
+      clock: stalledClock,
+    });
+    // Started before the worker: with this clock an empty poll sleeps until abort.
+    const runId = await wf.start(gated, {});
+    const ac = new AbortController();
+    const done = wf.worker({ pollIntervalMs: 5, signal: ac.signal }).run();
+    let exited = false;
+    void done.then(() => {
+      exited = true;
+    });
+    await vi.waitFor(() => expect(started).toBe(true));
+
+    ac.abort();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(exited).toBe(false);
+
+    release();
+    await vi.waitFor(() => expect(exited).toBe(true), { timeout: 1_000 });
+    expect((await store.loadRunState(runId)).phase.tag).toBe("completed");
   });
 });

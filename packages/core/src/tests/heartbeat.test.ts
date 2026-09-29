@@ -33,9 +33,57 @@ describe("startHeartbeat", () => {
       expect(extendLease).toHaveBeenCalledTimes(3);
       expect(extendLease).toHaveBeenCalledWith("r", "s", 1, 500);
 
-      hb.stop();
+      await hb.stop();
       await vi.advanceTimersByTimeAsync(500);
       expect(extend).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop() waits for an in-flight extension; no tick starts after it resolves", async () => {
+    vi.useFakeTimers();
+    try {
+      const { queue, store, extend, extendLease } = leasePorts();
+      let release: () => void = () => {};
+      extend.mockImplementationOnce(
+        () =>
+          new Promise<void>((r) => {
+            release = r;
+          }),
+      );
+
+      const hb = startHeartbeat({
+        queue,
+        store,
+        runId: "r" as RunId,
+        stepId: "s",
+        attempt: 1,
+        receipt: "42",
+        intervalMs: 100,
+        leaseMs: 500,
+        holdWarnMs: 0,
+        emitLog: vi.fn(),
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(extend).toHaveBeenCalledTimes(1);
+
+      let stopped = false;
+      const stopping = (async () => {
+        await hb.stop();
+        stopped = true;
+      })();
+      const again = hb.stop();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(stopped).toBe(false);
+
+      release();
+      await stopping;
+      await again;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(extend).toHaveBeenCalledTimes(1);
+      expect(extendLease).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
@@ -82,7 +130,7 @@ describe("startHeartbeat", () => {
       await vi.advanceTimersByTimeAsync(200);
       expect(holdWarns()).toHaveLength(2);
 
-      hb.stop();
+      await hb.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -114,7 +162,7 @@ describe("startHeartbeat", () => {
         expect.objectContaining({ level: "warn" }),
       );
 
-      hb.stop();
+      await hb.stop();
     } finally {
       vi.useRealTimers();
     }
@@ -149,7 +197,7 @@ describe("startHeartbeat", () => {
         }),
       );
 
-      hb.stop();
+      await hb.stop();
     } finally {
       vi.useRealTimers();
     }

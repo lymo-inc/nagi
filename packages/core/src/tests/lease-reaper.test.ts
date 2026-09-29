@@ -266,7 +266,7 @@ describe("Heartbeat extends both queue VT and store lease", () => {
       await vi.advanceTimersByTimeAsync(80);
       expect(extend.mock.calls.length).toBeGreaterThanOrEqual(3);
       expect(extendLease.mock.calls.length).toBeGreaterThanOrEqual(3);
-      hb.stop();
+      await hb.stop();
     } finally {
       vi.useRealTimers();
     }

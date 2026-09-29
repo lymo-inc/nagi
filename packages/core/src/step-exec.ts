@@ -95,6 +95,38 @@ export function resolveExecutionFact(args: {
   };
 }
 
+// Ticks never overlap: the next is armed only once the previous settles, and a
+// throwing tick is skipped, not fatal. stop() clears the pending timer — else
+// every settled step strands one on the event loop — and waits out an in-flight
+// tick, so no lease extension or state read outlives the step that owns it.
+export function every(
+  intervalMs: Millis,
+  tick: () => Promise<"stop" | undefined>,
+): { readonly stop: () => Promise<void> } {
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let running: Promise<void> = Promise.resolve();
+  const schedule = (): void => {
+    timer = setTimeout(() => {
+      running = (async () => {
+        let next: "stop" | undefined;
+        try {
+          next = await tick();
+        } catch {}
+        if (!stopped && next !== "stop") schedule();
+      })();
+    }, intervalMs);
+  };
+  schedule();
+  return {
+    stop: async () => {
+      stopped = true;
+      clearTimeout(timer);
+      await running;
+    },
+  };
+}
+
 export function startCancelWatcher(args: {
   readonly store: Store;
   readonly runId: RunId;
@@ -102,44 +134,26 @@ export function startCancelWatcher(args: {
   readonly attempt: number;
   readonly ac: AbortController;
   readonly intervalMs: Millis;
-}): { readonly stop: () => void } {
+}): { readonly stop: () => Promise<void> } {
   const { store, runId, stepId, attempt, ac, intervalMs } = args;
-  let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let wake: (() => void) | undefined;
-  void (async () => {
-    while (!stopped) {
-      await new Promise<void>((r) => {
-        wake = r;
-        timer = setTimeout(r, intervalMs);
-      });
-      if (stopped) return;
-      try {
-        const s = await store.loadRunState(runId);
-        if (isTerminalRun(s)) {
-          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
-          return;
-        }
-        if (isAbortRequested(stepStateOf(s, stepId), attempt)) {
-          if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "step"));
-          return;
-        }
-      } catch {
-        // Transient store read error: skip this tick and re-check on the next
-        // interval rather than tearing down the watcher (which would strand the
-        // abort and let a canceled handler run to completion).
+  return every(intervalMs, async () => {
+    try {
+      const s = await store.loadRunState(runId);
+      if (isTerminalRun(s)) {
+        if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
+        return "stop";
       }
+      if (isAbortRequested(stepStateOf(s, stepId), attempt)) {
+        if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "step"));
+        return "stop";
+      }
+    } catch {
+      // Transient store read error: skip this tick and re-check on the next
+      // interval rather than tearing down the watcher (which would strand the
+      // abort and let a canceled handler run to completion).
     }
-  })();
-  return {
-    // Clear the pending tick, or every settled step strands a timer on the
-    // event loop for up to intervalMs.
-    stop: () => {
-      stopped = true;
-      if (timer !== undefined) clearTimeout(timer);
-      wake?.();
-    },
-  };
+    return undefined;
+  });
 }
 
 // Arms a handler step's deadline. Aborts the SAME AbortController the cancel
@@ -212,7 +226,7 @@ export function startHeartbeat(args: {
   // this. 0 disables (tests). See DEFAULT_LEASE_HOLD_WARN_MS.
   readonly holdWarnMs: Millis;
   readonly emitLog: EmitLog;
-}): { readonly stop: () => void } {
+}): { readonly stop: () => Promise<void> } {
   const {
     queue,
     store,
@@ -225,64 +239,47 @@ export function startHeartbeat(args: {
     holdWarnMs,
     emitLog,
   } = args;
-  let stopped = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
   const startedAtMs = Date.now();
   let warnedCrossings = 0;
 
-  const schedule = (): void => {
-    timer = setTimeout(() => {
-      void (async () => {
-        if (holdWarnMs > 0) {
-          const heldMs = Date.now() - startedAtMs;
-          const crossings = Math.floor(heldMs / holdWarnMs);
-          if (crossings > warnedCrossings) {
-            warnedCrossings = crossings;
-            emitLog({
-              level: "warn",
-              msg: "heartbeat: step is holding a worker slot unusually long — slow handler, or an in-step wait that should be a b.signal step?",
-              attrs: { runId, stepId, attempt, heldMs },
-            });
-          }
-        }
-        await Promise.all([
-          queue.extend(receipt, leaseMs).catch((err: unknown) => {
-            // A missed extension only risks an early redelivery, which admit()'s
-            // claimStep dedupes — never tear the loop down, the next tick may win.
-            emitLog({
-              level: "warn",
-              msg: "heartbeat: failed to extend message visibility",
-              attrs: { receipt, error: String(err) },
-            });
-          }),
-          store
-            .extendLease(runId, stepId, attempt as AttemptNumber, leaseMs)
-            .catch((err: unknown) => {
-              // Same logic as queue extend: a missed store-lease extension only
-              // risks an early sweep, and the sweeper itself re-checks step
-              // status before reaping.
-              emitLog({
-                level: "warn",
-                msg: "heartbeat: failed to extend store lease",
-                attrs: { runId, stepId, attempt, error: String(err) },
-              });
-            }),
-        ]);
-        if (!stopped) schedule();
-      })();
-    }, intervalMs);
-  };
-  schedule();
-
-  return {
-    // Clear the pending timer so a settled step strands nothing on the event
-    // loop — without this every fast step would leak a timer for up to
-    // intervalMs, keeping the process alive and delaying clean shutdown.
-    stop: () => {
-      stopped = true;
-      if (timer !== undefined) clearTimeout(timer);
-    },
-  };
+  return every(intervalMs, async () => {
+    if (holdWarnMs > 0) {
+      const heldMs = Date.now() - startedAtMs;
+      const crossings = Math.floor(heldMs / holdWarnMs);
+      if (crossings > warnedCrossings) {
+        warnedCrossings = crossings;
+        emitLog({
+          level: "warn",
+          msg: "heartbeat: step is holding a worker slot unusually long — slow handler, or an in-step wait that should be a b.signal step?",
+          attrs: { runId, stepId, attempt, heldMs },
+        });
+      }
+    }
+    await Promise.all([
+      queue.extend(receipt, leaseMs).catch((err: unknown) => {
+        // A missed extension only risks an early redelivery, which admit()'s
+        // claimStep dedupes — never tear the loop down, the next tick may win.
+        emitLog({
+          level: "warn",
+          msg: "heartbeat: failed to extend message visibility",
+          attrs: { receipt, error: String(err) },
+        });
+      }),
+      store
+        .extendLease(runId, stepId, attempt as AttemptNumber, leaseMs)
+        .catch((err: unknown) => {
+          // Same logic as queue extend: a missed store-lease extension only
+          // risks an early sweep, and the sweeper itself re-checks step
+          // status before reaping.
+          emitLog({
+            level: "warn",
+            msg: "heartbeat: failed to extend store lease",
+            attrs: { runId, stepId, attempt, error: String(err) },
+          });
+        }),
+    ]);
+    return undefined;
+  });
 }
 
 // Cancellation/abort wins over retry. An operator-aborted step is re-enqueued

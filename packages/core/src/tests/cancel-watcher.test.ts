@@ -25,8 +25,52 @@ describe("startCancelWatcher", () => {
       expect(load).toHaveBeenCalledTimes(1);
       expect(vi.getTimerCount()).toBe(1);
 
-      watcher.stop();
+      await watcher.stop();
       expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stop() waits for an in-flight state read; no tick starts after it resolves", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new InMemoryStore();
+      const runId = "r" as RunId;
+      const live = await store.loadRunState(runId);
+      let release: () => void = () => {};
+      const load = vi.spyOn(store, "loadRunState").mockImplementationOnce(
+        () =>
+          new Promise((r) => {
+            release = () => r(live);
+          }),
+      );
+      const watcher = startCancelWatcher({
+        store,
+        runId,
+        stepId: "s",
+        attempt: 1,
+        ac: new AbortController(),
+        intervalMs: 100 as Millis,
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(load).toHaveBeenCalledTimes(1);
+
+      let stopped = false;
+      const stopping = (async () => {
+        await watcher.stop();
+        stopped = true;
+      })();
+      const again = watcher.stop();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(stopped).toBe(false);
+
+      release();
+      await stopping;
+      await again;
       await vi.advanceTimersByTimeAsync(1_000);
       expect(load).toHaveBeenCalledTimes(1);
       expect(vi.getTimerCount()).toBe(0);
