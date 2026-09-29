@@ -182,10 +182,14 @@ class WorkerImpl implements Worker {
   async runUntilEmpty(
     opts?: WorkerRunUntilEmptyOpts,
   ): Promise<WorkerRunResult> {
-    const deadline = opts?.deadline;
+    const timeoutMs = opts?.timeoutMs;
+    const endAt =
+      timeoutMs === undefined
+        ? undefined
+        : this.deps.clock.now().getTime() + timeoutMs;
     return this.pump({
       shouldContinue: () =>
-        deadline === undefined || this.deps.clock.now().getTime() < deadline,
+        endAt === undefined || this.deps.clock.now().getTime() < endAt,
       batchSize: () => this.concurrency,
     });
   }

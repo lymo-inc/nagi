@@ -474,7 +474,9 @@ export interface WorkerRunOnceOpts {
 }
 
 export interface WorkerRunUntilEmptyOpts {
-  readonly deadline?: number;
+  // Measured on the injected clock from the call. Checked before each
+  // dequeue, so the batch in flight still finishes.
+  readonly timeoutMs?: Millis;
 }
 
 export interface WorkerRunResult {
