@@ -1205,6 +1205,331 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       `.execute(db);
       expect(resets.rows[0]?.n).toBe(0);
     }, 20_000);
+
+    it("replay({ from }) scope:'step' resets only the origin row and reruns only it", async () => {
+      let aRuns = 0;
+      let bRuns = 0;
+      let cRuns = 0;
+      const f = flow({
+        id: "pg-scope-step",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => {
+          const a = b.task({
+            run: async () => {
+              aRuns += 1;
+              return { v: "a" };
+            },
+          });
+          const bStep = b.task({
+            needs: { a },
+            run: async () => {
+              bRuns += 1;
+              return { n: bRuns };
+            },
+          });
+          const c = b.task({
+            needs: { b: bStep },
+            run: async ({ needs }) => {
+              cRuns += 1;
+              return { sawB: needs.b };
+            },
+          });
+          return { a, b: bStep, c };
+        },
+        output(s) {
+          return s.c;
+        },
+      });
+
+      const wf = await makeNagi(f);
+      const runId = await wf.start(f, {});
+      await runToEnd(wf, runId);
+      expect(await loadStatus(db, schema, runId)).toBe("completed");
+      expect({ aRuns, bRuns, cRuns }).toEqual({ aRuns: 1, bRuns: 1, cRuns: 1 });
+
+      await wf.replay(runId, { mode: "continue", from: "b", scope: "step" });
+
+      // Immediately, before draining: the reset projection deleted b's row.
+      // c is a completed descendant, so scope "step" leaves its row alone.
+      const bRows = await sql<{ step_id: string }>`
+        SELECT step_id FROM ${sql.raw(`${schema}.step_run`)}
+         WHERE run_id = ${runId} AND step_id = 'b'
+      `.execute(db);
+      expect(bRows.rows).toHaveLength(0);
+      const others = await sql<{ step_id: string; status: string }>`
+        SELECT step_id, status FROM ${sql.raw(`${schema}.step_run`)}
+         WHERE run_id = ${runId} AND step_id IN ('a', 'c')
+         ORDER BY step_id
+      `.execute(db);
+      expect(others.rows).toEqual([
+        { step_id: "a", status: "completed" },
+        { step_id: "c", status: "completed" },
+      ]);
+      expect(await loadStatus(db, schema, runId)).toBe("running");
+
+      await runToEnd(wf, runId);
+      expect(await loadStatus(db, schema, runId)).toBe("completed");
+      // b re-ran; a and c did not.
+      expect({ aRuns, bRuns, cRuns }).toEqual({ aRuns: 1, bRuns: 2, cRuns: 1 });
+      const reopened = await wf.describe(runId);
+      const bStepView = reopened?.steps.find((s) => s.stepId === "b");
+      expect(bStepView?.output).toEqual({ n: 2 });
+    }, 20_000);
+  });
+
+  describe("task timeoutMs — rolls back the step tx via PG", () => {
+    beforeAll(async () => {
+      await sql
+        .raw(`CREATE TABLE IF NOT EXISTS ${schema}.probe (id text PRIMARY KEY)`)
+        .execute(db);
+    });
+
+    async function probeCount(runId: RunId): Promise<number> {
+      const r = await sql<{ n: number }>`
+        SELECT count(*)::int AS n FROM ${sql.raw(`${schema}.probe`)} WHERE id = ${runId}
+      `.execute(db);
+      return r.rows[0]?.n ?? 0;
+    }
+
+    it("a timed-out task's ctx.tx writes roll back", async () => {
+      const f = flow({
+        id: "pg-timeout-rollback",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          slow: b.task({
+            timeoutMs: 200,
+            retry: { maxAttempts: 1, backoff: "fixed" },
+            run: async ({ ctx }) => {
+              await sql`
+                INSERT INTO ${sql.raw(`${schema}.probe`)} (id) VALUES (${ctx.runId})
+              `.execute(ctx.tx as unknown as Kysely<unknown>);
+              await new Promise((_, reject) =>
+                ctx.signal.addEventListener(
+                  "abort",
+                  () => reject(ctx.signal.reason),
+                  { once: true },
+                ),
+              );
+              return { unreachable: true };
+            },
+          }),
+        }),
+        output(s) {
+          return s.slow;
+        },
+      });
+
+      const wf = await makeNagi(f);
+      const runId = await wf.start(f, {});
+      await runToEnd(wf, runId);
+
+      expect(await loadStatus(db, schema, runId)).toBe("failed");
+      const described = await wf.describe(runId);
+      const step = described?.steps.find((s) => s.stepId === "slow");
+      expect(step?.status).toBe("failed");
+      expect((step?.error as { name?: string } | undefined)?.name).toBe(
+        "NagiStepTimeoutError",
+      );
+      expect(await probeCount(runId)).toBe(0);
+    }, 15_000);
+
+    it("a task's ctx.tx writes commit with its completion", async () => {
+      const f = flow({
+        id: "pg-timeout-control-commit",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          fast: b.task({
+            retry: { maxAttempts: 1, backoff: "fixed" },
+            run: async ({ ctx }) => {
+              await sql`
+                INSERT INTO ${sql.raw(`${schema}.probe`)} (id) VALUES (${ctx.runId})
+              `.execute(ctx.tx as unknown as Kysely<unknown>);
+              return { ok: true };
+            },
+          }),
+        }),
+        output(s) {
+          return s.fast;
+        },
+      });
+
+      const wf = await makeNagi(f);
+      const runId = await wf.start(f, {});
+      await runToEnd(wf, runId);
+
+      expect(await loadStatus(db, schema, runId)).toBe("completed");
+      expect(await loadOutput(db, schema, runId)).toEqual({ ok: true });
+      expect(await probeCount(runId)).toBe(1);
+    }, 15_000);
+
+    it("a body that ignores the signal and returns late still fails and rolls back", async () => {
+      const f = flow({
+        id: "pg-timeout-ignores-signal",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          slow: b.task({
+            timeoutMs: 200,
+            retry: { maxAttempts: 1, backoff: "fixed" },
+            run: async ({ ctx }) => {
+              await sql`
+                INSERT INTO ${sql.raw(`${schema}.probe`)} (id) VALUES (${ctx.runId})
+              `.execute(ctx.tx as unknown as Kysely<unknown>);
+              await new Promise((res) => setTimeout(res, 400));
+              return { reachedAfterAbort: true };
+            },
+          }),
+        }),
+        output(s) {
+          return s.slow;
+        },
+      });
+
+      const wf = await makeNagi(f);
+      const runId = await wf.start(f, {});
+      await runToEnd(wf, runId);
+
+      expect(await loadStatus(db, schema, runId)).toBe("failed");
+      const described = await wf.describe(runId);
+      const step = described?.steps.find((s) => s.stepId === "slow");
+      expect(step?.status).toBe("failed");
+      expect((step?.error as { name?: string } | undefined)?.name).toBe(
+        "NagiStepTimeoutError",
+      );
+      expect(await probeCount(runId)).toBe(0);
+    }, 15_000);
+  });
+
+  describe("driftPolicy: synthesize — via PG", () => {
+    it("resumes a run pinned to the old hash with the live handler, staying pinned to that hash", async () => {
+      const flowA = flow({
+        id: "pg-drift",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          s: b.task({ run: async () => ({ ok: true }) }),
+        }),
+      });
+      const flowB = flow({
+        id: "pg-drift",
+        input: passthroughSchema<Record<string, never>>(),
+        build: (b) => ({
+          s: b.task({ run: async () => ({ different: true }) }),
+          added: b.task({ run: async () => ({ added: true }) }),
+        }),
+      });
+
+      const queue = new InMemoryQueue();
+      const wfA = await nagi({
+        store: postgresStore({ db, schema }),
+        queue,
+        clock: new InMemoryClock(),
+        flows: [flowA],
+      });
+      const runId = await wfA.start(flowA, {});
+
+      const pinnedRow = await sql<{ flow_hash: string }>`
+        SELECT flow_hash FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${runId}
+      `.execute(db);
+      const pinnedHash = pinnedRow.rows[0]?.flow_hash;
+      expect(pinnedHash).toBeDefined();
+
+      const wfB = await nagi({
+        store: postgresStore({ db, schema }),
+        queue,
+        clock: new InMemoryClock(),
+        flows: [flowB],
+        driftPolicy: "synthesize",
+      });
+      // deadline is an absolute epoch ms (compared against clock.now()), not
+      // a duration — InMemoryClock.now() returns the real wall clock.
+      await wfB
+        .worker({ timerSweepIntervalMs: 0 })
+        .runUntilEmpty({ deadline: Date.now() + 10_000 });
+
+      expect(await loadStatus(db, schema, runId)).toBe("completed");
+      const described = await wfB.describe(runId);
+      const sStep = described?.steps.find((s) => s.stepId === "s");
+      expect(sStep?.output).toEqual({ different: true });
+      expect(described?.steps.some((s) => s.stepId === "added")).toBe(false);
+
+      const addedRow = await sql<{ n: number }>`
+        SELECT count(*)::int AS n FROM ${sql.raw(`${schema}.step_run`)}
+         WHERE run_id = ${runId} AND step_id = 'added'
+      `.execute(db);
+      expect(addedRow.rows[0]?.n).toBe(0);
+
+      const afterRow = await sql<{ flow_hash: string }>`
+        SELECT flow_hash FROM ${sql.raw(`${schema}.workflow_run`)} WHERE run_id = ${runId}
+      `.execute(db);
+      expect(afterRow.rows[0]?.flow_hash).toBe(pinnedHash);
+    }, 20_000);
+
+    it("a drifted two-step chain resolves needs.<alias> under the live handler and completes", async () => {
+      function chainA() {
+        return flow({
+          id: "pg-drift-chain",
+          input: passthroughSchema<Record<string, never>>(),
+          build: (b) => {
+            const a = b.task({ run: async () => ({ v: "fromA" }) });
+            const bStep = b.task({
+              needs: { up: a },
+              run: async ({ needs }) => ({ got: needs.up }),
+            });
+            return { a, b: bStep };
+          },
+          output(s) {
+            return s.b;
+          },
+        });
+      }
+      function chainB() {
+        return flow({
+          id: "pg-drift-chain",
+          input: passthroughSchema<Record<string, never>>(),
+          build: (b) => {
+            const a = b.task({ run: async () => ({ v: "fromB" }) });
+            const bStep = b.task({
+              needs: { up: a },
+              run: async ({ needs }) => ({ got: needs.up }),
+            });
+            const extra = b.task({ run: async () => ({}) });
+            return { a, b: bStep, extra };
+          },
+          output(s) {
+            return s.b;
+          },
+        });
+      }
+
+      const A = chainA();
+      const queue = new InMemoryQueue();
+      const wfA = await nagi({
+        store: postgresStore({ db, schema }),
+        queue,
+        clock: new InMemoryClock(),
+        flows: [A],
+      });
+      const runId = await wfA.start(A, {});
+
+      const wfB = await nagi({
+        store: postgresStore({ db, schema }),
+        queue,
+        clock: new InMemoryClock(),
+        flows: [chainB()],
+        driftPolicy: "synthesize",
+      });
+      // Bounded, not an unbounded drain: pre-008, the wrong needs shape makes
+      // checkUpstream throw on every redelivery — an infinite nack/redeliver
+      // loop that would hang instead of failing the test.
+      const { processed } = await wfB
+        .worker({ timerSweepIntervalMs: 0 })
+        .runOnce({ maxSteps: 10 });
+      expect(processed).toBeGreaterThan(0);
+
+      expect(await loadStatus(db, schema, runId)).toBe("completed");
+      expect(await loadOutput(db, schema, runId)).toEqual({
+        got: { v: "fromB" },
+      });
+    }, 20_000);
   });
 
   describe("pruneFacts — retention", () => {
