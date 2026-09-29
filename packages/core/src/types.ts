@@ -354,10 +354,6 @@ export interface ParentLink {
   readonly stepId: StepId;
 }
 
-export interface ParentRef extends ParentLink {
-  readonly attempt: AttemptNumber;
-}
-
 export interface FlowEvent {
   readonly runId: RunId;
   readonly flowId: string;
@@ -366,7 +362,7 @@ export interface FlowEvent {
 
 export interface FlowStartEvent extends FlowEvent {
   readonly input: Json;
-  readonly parent?: ParentRef;
+  readonly parent?: ParentLink;
 }
 
 export interface FlowCompleteEvent extends FlowEvent {

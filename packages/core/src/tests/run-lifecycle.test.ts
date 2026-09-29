@@ -12,7 +12,7 @@ import {
 } from "../run-lifecycle";
 import type {
   Flow,
-  ParentRef,
+  ParentLink,
   Queue,
   QueueEnqueueOpts,
   RunId,
@@ -127,10 +127,9 @@ async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
   };
 }
 
-const PARENT: ParentRef = {
+const PARENT: ParentLink = {
   runId: "parent-run" as RunId,
   stepId: "child" as StepId,
-  attempt: 1 as never,
 };
 
 function started(staged: StagedStart) {
@@ -142,7 +141,7 @@ interface Scenario {
   readonly name: string;
   readonly flow: Flow;
   readonly boundary: TxBoundary;
-  readonly parent?: ParentRef;
+  readonly parent?: ParentLink;
   // A prior run to supersede, started on its own tx and applied.
   readonly prior?: boolean;
   readonly expectDispatch: (runId: RunId) => unknown;

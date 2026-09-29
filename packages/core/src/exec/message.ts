@@ -273,7 +273,7 @@ export function makeMessage(
         return { tag: "parked" };
       }
       case "subflow":
-        return await executeSubflow({ def, runId, stepId, attempt, state });
+        return await executeSubflow({ def, runId, stepId, state });
     }
   }
 
@@ -437,10 +437,9 @@ export function makeMessage(
     def: SubflowDef;
     runId: RunId;
     stepId: string;
-    attempt: number;
     state: RunState;
   }): Promise<Dispatched> {
-    const { def, runId, stepId, attempt, state } = args;
+    const { def, runId, stepId, state } = args;
     const child = deps.lookupFlow(def.childFlowId);
     if (child === undefined) {
       throw new Error(
@@ -472,7 +471,7 @@ export function makeMessage(
     await deps.startChildRun({
       child,
       childInput,
-      parent: { runId, stepId, attempt },
+      parent: { runId, stepId },
       generation,
     });
     return { tag: "parked" };

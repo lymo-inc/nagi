@@ -142,7 +142,6 @@ export type {
   NeedsOutputs,
   Optional,
   ParentLink,
-  ParentRef,
   PrunableStatus,
   PruneOpts,
   PruneResult,
