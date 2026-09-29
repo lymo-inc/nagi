@@ -247,13 +247,22 @@ class WorkerImpl implements Worker {
     try {
       result = await this.dispatcher.dispatchMessage(msg);
     } catch (err) {
+      // Same curve as a failing dequeue: whatever threw (a database outage,
+      // or a bug that throws on every delivery) must not redeliver at once.
+      const delayMs = this.dequeueBackoffMs(msg.readCount);
       this.deps.emitLog({
         level: "error",
         msg: "worker.dispatch threw uncaught",
-        attrs: { error: String(err) },
+        attrs: {
+          runId: msg.runId,
+          stepId: msg.stepId,
+          readCount: msg.readCount,
+          delayMs,
+          error: String(err),
+        },
       });
       try {
-        await this.deps.queue.nack(msg.receipt);
+        await this.deps.queue.nack(msg.receipt, { delayMs });
       } catch {}
       return;
     }

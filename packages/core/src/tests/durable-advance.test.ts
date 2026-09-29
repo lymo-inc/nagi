@@ -89,13 +89,23 @@ describe("durable advance after settle", () => {
     };
 
     // One step through the real worker: the dispatch throws, the worker nacks.
-    expect(await h.drainOnce(1)).toBe(1);
+    const worker = h.wf.worker({ concurrency: 1, pollIntervalMs: 5 });
+    expect((await worker.runOnce({ maxSteps: 1 })).processed).toBe(1);
     expect(fired).toBe(true);
 
     // Not acked: the message is back in the queue, redeliverable.
     expect((await h.queue.inspect(runId)).length).toBe(1);
 
-    // Redelivery takes the recover path and re-drives the run to completion.
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      const m = (await h.queue.inspect(runId))[0];
+      if (m && m.visibleAt.getTime() <= Date.now()) break;
+      if (Date.now() > deadline) throw new Error("never became visible");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    // The redelivery comes after the backoff, takes the recover path and
+    // re-drives the run to completion.
     await h.drain();
 
     expect((await h.result(runId)).status).toBe("completed");
