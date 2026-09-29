@@ -11,7 +11,7 @@ import {
   compact,
   type EmitLog,
   getDef,
-  type StepDef,
+  type NeedRefDef,
   setDef,
 } from "./internal";
 import { isTerminalRun } from "./state";
@@ -288,19 +288,41 @@ function synthesizeReplayFlow(dag: CanonicalDag, liveFlow: Flow): Flow {
     const shell = synthesized[canonStep.id];
     if (shell === undefined) continue;
 
-    const synthesizedNeeds: Record<string, unknown> = {};
-    for (const upstreamId of canonStep.needs) {
-      const upstreamShell = synthesized[upstreamId];
+    const liveDef = getDef(liveSteps[canonStep.id]!);
+    if (liveDef.kind !== canonStep.kind) {
+      throw new NagiRuntimeError(
+        `Drift-allowed replay: step "${canonStep.id}" is a ${canonStep.kind} ` +
+          `in the snapshot but a ${liveDef.kind} live.`,
+      );
+    }
+
+    const needs: Record<string, NeedRefDef> = {};
+    for (const [alias, ref] of Object.entries(liveDef.needs)) {
+      const upstreamShell = synthesized[ref.step.id];
       if (upstreamShell === undefined) {
         throw new NagiRuntimeError(
           `Drift-allowed replay: step "${canonStep.id}" needs upstream ` +
-            `"${upstreamId}" which the snapshot does not declare.`,
+            `"${ref.step.id}" which the snapshot does not declare.`,
         );
       }
-      synthesizedNeeds[upstreamId] = upstreamShell;
+      needs[alias] = { step: upstreamShell, optional: ref.optional };
     }
 
-    setDef(shell, { ...getDef(shell), needs: synthesizedNeeds } as StepDef);
+    const liveNeedIds = new Set(
+      Object.values(liveDef.needs).map((ref) => ref.step.id),
+    );
+    const canonNeedIds = new Set(canonStep.needs);
+    const sameNeeds =
+      liveNeedIds.size === canonNeedIds.size &&
+      [...liveNeedIds].every((id) => canonNeedIds.has(id));
+    if (!sameNeeds) {
+      throw new NagiRuntimeError(
+        `Drift-allowed replay: step "${canonStep.id}" needs [${[...canonNeedIds].sort().join(", ")}] ` +
+          `in the snapshot but [${[...liveNeedIds].sort().join(", ")}] live.`,
+      );
+    }
+
+    setDef(shell, { ...getDef(shell), needs });
   }
 
   return {
