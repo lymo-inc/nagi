@@ -361,6 +361,72 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "tryStartRun: a seed is enqueued with the start, once",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const flowId = fid();
+      const queue = new InMemoryQueue();
+      const fact = Facts.flowStarted({
+        runId,
+        flowId,
+        input: {},
+        at: new Date(),
+      });
+      const steps = ["a" as StepId, "b" as StepId];
+
+      const res = await s.tryStartRun(runId, fact, undefined, {
+        queue,
+        flowId,
+        steps,
+      });
+      ok(res.started, "start reports started");
+      const queued = await queue.dequeue({ count: 10 });
+      eq(
+        queued
+          .map((m) => ({ runId: m.runId, stepId: m.stepId, flowId: m.flowId }))
+          .sort((x, y) => (x.stepId < y.stepId ? -1 : 1)),
+        [
+          { runId, stepId: "a", flowId },
+          { runId, stepId: "b", flowId },
+        ],
+        "both seed steps are queued once, for this run and flowId",
+      );
+
+      const again = await s.tryStartRun(runId, fact, undefined, {
+        queue,
+        flowId,
+        steps,
+      });
+      eq(again.started, false, "second identical call is refused");
+      eq(await queue.dequeue({ count: 10 }), [], "nothing more is queued");
+    },
+  },
+  {
+    name: "tryStartRun: a refused start enqueues nothing",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const flowId = fid();
+      await startRun(s, runId, { flowId });
+
+      const queue = new InMemoryQueue();
+      const fact = Facts.flowStarted({
+        runId,
+        flowId,
+        input: {},
+        at: new Date(),
+      });
+      const res = await s.tryStartRun(runId, fact, undefined, {
+        queue,
+        flowId,
+        steps: ["a" as StepId],
+      });
+      eq(res.started, false, "refused: runId already exists");
+      eq(await queue.dequeue({ count: 10 }), [], "the queue is empty");
+    },
+  },
+  {
     // The third face of nagi#29, and the one the issue's hypothesis list
     // misses: tryStartRun is atomic, but nothing keeps the superseder ALIVE.
     // Retention that prunes "completed" while keeping "canceled" for audit
@@ -664,6 +730,34 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         0,
         "no extra fact",
       );
+    },
+  },
+  {
+    name: "runStep: the body reads run state on its tx and sees committed facts",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s");
+      await s.appendFact(
+        runId,
+        Facts.stepAbortRequested({
+          runId,
+          stepId: "s",
+          attempt: A1,
+          at: new Date(),
+        }),
+      );
+      let seenTag: string | undefined;
+      await s.runStep(runId, "s", A1, async (tx) => {
+        const seen = await s.loadRunState(runId, tx);
+        seenTag = stepStateOf(seen, "s").tag;
+        return {
+          output: null,
+          fact: Facts.stepCanceled(runId, "s", A1, new Date()),
+        };
+      });
+      eq(seenTag, "aborting", "tx read sees the abort-requested fold");
     },
   },
   {
@@ -1893,6 +1987,55 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "events: step.canceled and step.reset are events",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.events === undefined) return;
+      const runId = rid();
+      const seen: RunEventEnvelope[] = [];
+      const off = s.events.watchRuns((e) => {
+        if (e.runId === runId) seen.push(e);
+      });
+      try {
+        await startRun(s, runId);
+        await startStep(s, runId, "s");
+        await s.appendFact(
+          runId,
+          Facts.stepCanceled(runId, "s", A1, new Date()),
+        );
+        await s.appendFact(
+          runId,
+          Facts.stepReset({ runId, stepId: "s", at: new Date() }),
+        );
+        const want = [
+          "flow.started",
+          "step.started",
+          "step.canceled",
+          "step.reset",
+        ];
+        await eventually(() => seen.length >= want.length, "all four events");
+        eq(
+          seen.map((e) => e.type),
+          want,
+          "cancel and reset are observable",
+        );
+        eq(
+          seen.slice(2).map((e) => ({
+            type: e.type,
+            stepId: (e as { stepId?: string }).stepId,
+          })),
+          [
+            { type: "step.canceled", stepId: "s" },
+            { type: "step.reset", stepId: "s" },
+          ],
+          "carry the stepId",
+        );
+      } finally {
+        off();
+      }
+    },
+  },
+  {
     name: "events: a superseded run announces flow.canceled naming its superseder",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
@@ -2008,6 +2151,85 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         await drain(s.stream.subscribeStream(runId, "s"), "settled step"),
         [],
         "empty and closed",
+      );
+    },
+  },
+  {
+    name: "stream: a reset step's channel reopens for its rerun",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.stream === undefined) return;
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s", { kind: "streaming" });
+      // A channel must actually open and close on the first attempt for its
+      // key to land in closedKeys — otherwise this case can't exercise the bug.
+      const first = drain(
+        s.stream.subscribeStream(runId, "s"),
+        "first attempt",
+      );
+      s.stream.publishChunk(runId, "s", "one");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, null, new Date()),
+      );
+      eq(
+        await first,
+        [{ kind: "chunk", chunk: "one" }],
+        "first attempt streamed",
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepReset({ runId, stepId: "s", at: new Date() }),
+      );
+      await startStep(s, runId, "s", { attempt: A1, kind: "streaming" });
+      const rerun = drain(
+        s.stream.subscribeStream(runId, "s"),
+        "rerun completed",
+      );
+      s.stream.publishChunk(runId, "s", "again");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, null, new Date()),
+      );
+      eq(
+        await rerun,
+        [{ kind: "chunk", chunk: "again" }],
+        "rerun chunk delivered",
+      );
+    },
+  },
+  {
+    name: "stream: a reaped lease tells subscribers a new attempt started",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });
+      if (s.stream === undefined) return;
+      const queue = new InMemoryQueue();
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s", { kind: "streaming" });
+      ok((await s.claimStep(runId, "s", A1)) !== null, "claim");
+      const events = drain(
+        s.stream.subscribeStream(runId, "s"),
+        "reaped then rerun",
+      );
+      s.stream.publishChunk(runId, "s", "a");
+      await sleep(PAST_LEASE_MS);
+      await s.sweepLeases({ now: new Date(), queue });
+      await startStep(s, runId, "s", { attempt: A2, kind: "streaming" });
+      s.stream.publishChunk(runId, "s", "b");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A2, null, new Date()),
+      );
+      eq(
+        await events,
+        [
+          { kind: "chunk", chunk: "a" },
+          { kind: "retry", attempt: 2 },
+          { kind: "chunk", chunk: "b" },
+        ],
+        "chunk, retry marker, chunk",
       );
     },
   },

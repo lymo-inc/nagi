@@ -11,7 +11,7 @@ import {
   type SubflowDef,
 } from "../internal";
 import { resolveRetry } from "../retry";
-import { deriveChildRunId } from "../run-id";
+import { currentChildRunId } from "../run-id";
 import { isAbortRequested, isTerminalRun, stepStateOf } from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
@@ -32,6 +32,7 @@ import type {
   RunState,
   StepCtx,
   StreamingStepCtx,
+  Tx,
 } from "../types";
 import type { Hooks } from "./hooks";
 import type { Progression } from "./progression";
@@ -172,6 +173,9 @@ export function makeMessage(
       // replay({ from }) resets steps on such runs and re-dispatches them.
       return isTerminalRun(preState) ? { tag: "skip" } : { tag: "recover" };
     }
+
+    // Aborted on a live run: only replay({ from }) re-drives it.
+    if (preStep.tag === "canceled") return { tag: "skip" };
 
     const claim = await store.claimStep(runId, stepId, attempt);
     if (claim === null) return { tag: "skip" };
@@ -381,12 +385,12 @@ export function makeMessage(
     };
 
     let abortedHere = false;
-    const settle = async (output: Json) => {
+    const settle = async (output: Json, tx: Tx) => {
       // A body that honored the deadline by returning still timed out.
       if (ac.signal.reason instanceof NagiStepTimeoutError)
         throw ac.signal.reason;
       const resolved = resolveExecutionFact({
-        postState: await store.loadRunState(runId),
+        postState: await store.loadRunState(runId, tx),
         runId,
         stepId,
         attempt,
@@ -399,7 +403,7 @@ export function makeMessage(
 
     const inTx = (body: (ctx: StepCtx<unknown>) => Promise<Json>) =>
       store.runStep<Json>(runId, stepId, attempt, async (tx) =>
-        settle(await body(makeStepCtx({ ...ctxArgs, tx }))),
+        settle(await body(makeStepCtx({ ...ctxArgs, tx })), tx),
       );
 
     // A handler aborted by its deadline rarely rethrows our error — unwrap at
@@ -434,8 +438,8 @@ export function makeMessage(
         case "activity": {
           const ctx = makeActivityCtx(ctxArgs);
           const out = await runBody(() => def.run({ input, needs, ctx }));
-          output = await store.runStep<Json>(runId, stepId, attempt, () =>
-            settle(out),
+          output = await store.runStep<Json>(runId, stepId, attempt, (tx) =>
+            settle(out, tx),
           );
           break;
         }
@@ -465,7 +469,7 @@ export function makeMessage(
     // logical spawn re-derives the SAME child id (idempotent re-attach); a
     // replay (nagi#6) bumps it and gets a fresh child. See deriveChildRunId.
     const generation = state.resetCounts[stepId] ?? 0;
-    const childRunId = await deriveChildRunId({ runId, stepId, generation });
+    const childRunId = await currentChildRunId(state, stepId);
 
     // Re-entrant: a re-dispatch (lease-reap, or recovery after a lost wake) of a
     // parked subflow step whose child has ALREADY finished settles the parent

@@ -29,6 +29,7 @@ describe("stream frame codec", () => {
       { k: "retry", r: R, s: S, a: 2 },
       { k: "ok", r: R, s: S },
       { k: "err", r: R, s: S },
+      { k: "reopen", r: R, s: S },
       { k: "run", r: R },
     ];
     for (const f of frames) {
@@ -97,5 +98,17 @@ describe("applyFrame drives the hub", () => {
       { kind: "retry", attempt: 2 },
       { kind: "chunk", chunk: "fresh" },
     ]);
+  });
+
+  it("a reopen frame after ok lets a new subscriber receive the rerun's chunk", async () => {
+    const hub = new InMemoryStreamHub();
+    applyFrame(hub, { k: "ok", r: R, s: S });
+    applyFrame(hub, { k: "reopen", r: R, s: S });
+
+    const sub = hub.subscribeStream(R, S);
+    applyFrame(hub, { k: "chunk", r: R, s: S, c: "again" });
+    applyFrame(hub, { k: "ok", r: R, s: S });
+
+    expect(await drain(sub, 5)).toEqual([{ kind: "chunk", chunk: "again" }]);
   });
 });

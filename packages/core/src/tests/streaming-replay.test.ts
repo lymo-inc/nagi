@@ -135,7 +135,7 @@ describe("streamingTask — replay is emit-inert, durable output survives", () =
     expect((await h.result(runId)).output("gen")).toBe("kept");
   });
 
-  it("forced re-execution via replay({ from }) DOES re-run the streaming handler and updates the durable output", async () => {
+  it("forced re-execution via replay({ from }) re-runs the streaming handler, re-emits to a live subscriber, and updates the durable output", async () => {
     let calls = 0;
     const f = flow({
       id: "stream-replay-from",
@@ -167,7 +167,7 @@ describe("streamingTask — replay is emit-inert, durable output survives", () =
     const result = await h.result(runId);
     expect(result.status).toBe("completed");
     expect(result.output("gen")).toBe("out2");
-    expect(chunks(events)).toEqual([]);
+    expect(chunks(events)).toEqual(["call2-chunk"]);
   });
 });
 

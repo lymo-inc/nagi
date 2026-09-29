@@ -526,6 +526,16 @@ export interface TimedOutSignal {
   readonly fireAt: Date;
 }
 
+// The runnable roots of a fresh run. MUST be enqueued in the same
+// transaction as the start (Queue.withTx when the queue has it), and only
+// when started is true: a crash after commit must not leave a running run
+// with nothing queued.
+export interface StartSeed {
+  readonly queue: Queue;
+  readonly flowId: string;
+  readonly steps: readonly StepId[];
+}
+
 // Every MUST below is a case in `storeContract` (@nagi-js/core/testing); run it
 // against any new adapter. Decisions an adapter must not re-make are core pure
 // functions: factConsequences, admitsRunEnd, supersede, decideSignal /
@@ -543,7 +553,11 @@ export interface Store {
   // cancels tryStartRun makes, MUST apply the same refusal.
   endRun(runId: RunId, fact: RunEndFact): Promise<boolean>;
 
-  loadRunState(runId: RunId): Promise<RunState>;
+  // With `tx` (the one runStep handed its body), MUST read on that
+  // transaction: the caller holds its connection, and a second pool
+  // connection per in-flight step deadlocks a pool no larger than the
+  // worker's concurrency.
+  loadRunState(runId: RunId, tx?: Tx): Promise<RunState>;
 
   // Atomically reconcile a signal with its target step under a per-run lock.
   // With `incoming` (a wf.signal call): deliver when the step is awaitingSignal,
@@ -564,6 +578,8 @@ export interface Store {
   // MUST be atomic: concurrent calls with the same runId produce exactly one
   // flow.started fact. When concurrency is supplied, MUST atomically cancel
   // prior active runs sharing (flowId, key) and serialize concurrent starts.
+  // With `seed`, MUST enqueue its steps in the same transaction as the start,
+  // and only when started is true.
   tryStartRun(
     runId: RunId,
     fact: FlowStartedFact,
@@ -571,6 +587,7 @@ export interface Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
+    seed?: StartSeed,
   ): Promise<{
     readonly started: boolean;
     readonly canceled: ReadonlyArray<{
@@ -769,7 +786,13 @@ export type RunEvent =
       readonly type: "step.skipped";
       readonly stepId: StepId;
       readonly reason: SkipReason;
-    };
+    }
+  | {
+      readonly type: "step.canceled";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+    }
+  | { readonly type: "step.reset"; readonly stepId: StepId };
 
 export type RunEventEnvelope = RunEvent & { readonly runId: RunId };
 
@@ -915,9 +938,9 @@ export interface ReplayOpts {
   // pending messages, and the run MUST be recovered with mode "continue".
   readonly fireHooks?: boolean;
   // Resets `from` (and, by scope, its descendants), reopening a settled run.
-  // A `running` `from` step is aborted via step.abort-requested and MUST settle
-  // before the reset is written; the descendants to reset are chosen after it
-  // settles.
+  // Every `running` step in the reset set is aborted via step.abort-requested
+  // and MUST settle before the reset is written; the steps to reset are chosen
+  // after they settle. A reset step parked on a subflow has that child canceled.
   readonly from?: StepId;
   // Only meaningful with `from`. Defaults to "cascade".
   readonly scope?: ResetScope;

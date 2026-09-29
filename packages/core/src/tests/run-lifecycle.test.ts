@@ -64,7 +64,7 @@ const FAKE_TX = { __fakeTx: true } as unknown as Tx;
 const OWN: TxBoundary = { kind: "own" };
 const CALLER: TxBoundary = { kind: "caller", tx: FAKE_TX };
 
-interface Fixture {
+export interface Fixture {
   readonly lifecycle: RunLifecycle;
   readonly registry: FlowRegistry;
   readonly store: InMemoryStore;
@@ -76,7 +76,7 @@ interface Fixture {
   readonly settleSuperseded: ReturnType<typeof vi.fn>;
 }
 
-async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
+export async function makeFixture(flows: readonly Flow[]): Promise<Fixture> {
   const store = new InMemoryStore();
   const queue = new InMemoryQueue();
   const clock = new InMemoryClock();
@@ -146,9 +146,10 @@ interface Scenario {
   readonly prior?: boolean;
   readonly expectDispatch: (runId: RunId) => unknown;
   readonly expectSuperseded: (prior: RunId | undefined) => unknown;
+  // Only queueForTx (the caller-tx path) is counted here.
   readonly expectTxEnqueued: number;
-  // step.skipped facts applyEffects itself records (own-tx skips are recorded
-  // by the real advance, which is a stub here).
+  // step.skipped facts applyEffects itself records via recordSkips — real for
+  // any dispatch that carries a skip list, on either boundary.
   readonly expectSkippedAfterApply?: readonly StepId[];
 }
 
@@ -157,7 +158,7 @@ const scenarios: readonly Scenario[] = [
     name: "plain",
     flow: plainFlow,
     boundary: OWN,
-    expectDispatch: () => ({ kind: "enqueue", steps: ["analyze"] }),
+    expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"], skip: [] }),
     expectSuperseded: () => [],
     expectTxEnqueued: 0,
   },
@@ -166,7 +167,7 @@ const scenarios: readonly Scenario[] = [
     flow: concurrentFlow,
     boundary: OWN,
     prior: true,
-    expectDispatch: () => ({ kind: "enqueue", steps: ["analyze"] }),
+    expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"], skip: [] }),
     expectSuperseded: (prior) => [
       {
         runId: prior,
@@ -186,7 +187,7 @@ const scenarios: readonly Scenario[] = [
     flow: plainFlow,
     boundary: OWN,
     parent: PARENT,
-    expectDispatch: () => ({ kind: "enqueue", steps: ["analyze"] }),
+    expectDispatch: () => ({ kind: "enqueued", steps: ["analyze"], skip: [] }),
     expectSuperseded: () => [],
     expectTxEnqueued: 0,
   },
@@ -208,12 +209,17 @@ const scenarios: readonly Scenario[] = [
     expectTxEnqueued: 1,
   },
   {
-    name: "mixed roots (own): advance records the skip then enqueues once",
+    name: "mixed roots (own): the runnable root rides the start's own tx, skip recorded post-commit",
     flow: mixedFlow,
     boundary: OWN,
-    expectDispatch: () => ({ kind: "advance" }),
+    expectDispatch: () => ({
+      kind: "enqueued",
+      steps: ["always"],
+      skip: [{ stepId: "maybe", reason: "when-false" }],
+    }),
     expectSuperseded: () => [],
     expectTxEnqueued: 0,
+    expectSkippedAfterApply: ["maybe" as StepId],
   },
   {
     name: "mixed roots (staged): runnable root rides the tx, skip recorded post-commit",
@@ -291,15 +297,20 @@ describe("run lifecycle — start scenarios", () => {
         ...(s.parent !== undefined ? { parent: s.parent } : {}),
       });
 
-      // Staging writes the row (+ tx-bound enqueue) and nothing else: no hooks,
-      // no parent propagation, no own-tx enqueue until the effects are applied.
+      // Staging writes the row + its seed steps (own tx: Store.tryStartRun's
+      // seed; caller tx: queueForTx) and nothing else: no hooks, no parent
+      // propagation, no dispatcher.advance until the effects are applied.
       expect(fx.fired).toEqual([]);
       expect(fx.settleSuperseded).not.toHaveBeenCalled();
       expect(fx.advance).not.toHaveBeenCalled();
       expect(fx.txEnqueued).toHaveLength(s.expectTxEnqueued);
       for (const e of fx.txEnqueued) expect(e.tx).toBe(FAKE_TX);
+      const expectQueuedBeforeApply =
+        effects.dispatch.kind === "enqueued" ? effects.dispatch.steps : [];
       const queuedBeforeApply = await fx.queue.dequeue({ count: 10 });
-      expect(queuedBeforeApply).toHaveLength(s.expectTxEnqueued);
+      expect(queuedBeforeApply.map((m) => m.stepId)).toEqual([
+        ...expectQueuedBeforeApply,
+      ]);
 
       if (s.parent !== undefined) {
         expect(state.parent).toEqual({
@@ -329,9 +340,7 @@ describe("run lifecycle — start scenarios", () => {
           : 0,
       );
       const queuedAfterApply = await fx.queue.dequeue({ count: 10 });
-      expect(queuedAfterApply.map((m) => m.stepId)).toEqual(
-        effects.dispatch.kind === "enqueue" ? effects.dispatch.steps : [],
-      );
+      expect(queuedAfterApply).toEqual([]);
       const after = await fx.store.loadRunState(runId);
       expect(
         after.facts.flatMap((f) =>

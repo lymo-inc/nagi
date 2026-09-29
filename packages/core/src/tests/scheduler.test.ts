@@ -67,6 +67,13 @@ function skippedStepFact(
   return { kind: "step.skipped", runId: RUN, stepId, reason, at: new Date() };
 }
 
+function canceledStepFact(stepId: string): Fact[] {
+  return [
+    startedStepFact(stepId),
+    { kind: "step.canceled", runId: RUN, stepId, attempt: 1, at: new Date() },
+  ];
+}
+
 function linearFlow(): Flow {
   return flow({
     id: "linear",
@@ -242,6 +249,16 @@ describe("flowTermination", () => {
     ]);
     expect(flowTermination(f, state)).toEqual({ kind: "succeeded" });
   });
+
+  it("a canceled step is never success", async () => {
+    const f = linearFlow();
+    const state = await projectFacts([
+      startedFact(f.id, { n: 1 }),
+      ...completedStepFact("a", { doubled: 2 }),
+      ...canceledStepFact("c"),
+    ]);
+    expect(flowTermination(f, state)).toEqual({ kind: "running" });
+  });
 });
 
 describe("input projection", () => {
@@ -380,6 +397,37 @@ describe("nextTransition", () => {
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
       startedStepFact("a"),
+    ]);
+    expect(nextTransition(f, state)).toEqual({ kind: "waiting" });
+  });
+
+  it("stalled when a canceled step blocks the run and nothing is in flight", async () => {
+    const f = linearFlow();
+    const state = await projectFacts([
+      startedFact(f.id, { n: 1 }),
+      ...canceledStepFact("a"),
+    ]);
+    expect(nextTransition(f, state)).toEqual({
+      kind: "stalled",
+      canceled: ["a"],
+    });
+  });
+
+  it("waiting, not stalled, while another root step is still running", async () => {
+    const f = flow({
+      id: "canceled-plus-running-root",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const a = b.task({ run: async () => null });
+        const other = b.task({ run: async () => null });
+        const c = b.task({ needs: { a }, run: async () => null });
+        return { a, other, c };
+      },
+    });
+    const state = await projectFacts([
+      startedFact(f.id, {}),
+      ...canceledStepFact("a"),
+      startedStepFact("other"),
     ]);
     expect(nextTransition(f, state)).toEqual({ kind: "waiting" });
   });

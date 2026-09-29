@@ -171,6 +171,7 @@ export type {
   SnapshotGoneDisposition,
   SnapshotGonePolicy,
   StandardSchemaV1,
+  StartSeed,
   Step,
   StepAbortRequestedFact,
   StepCanceledFact,
