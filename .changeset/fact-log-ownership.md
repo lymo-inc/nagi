@@ -1,7 +1,6 @@
 ---
 "@nagi-js/core": patch
 "@nagi-js/postgres": patch
-"@nagi-js/otel": patch
 ---
 
 Own each fact kind in one place (#38). `packages/core/src/facts/` now holds,

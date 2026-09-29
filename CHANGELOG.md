@@ -5,4 +5,3 @@ Per-package changelogs are managed by [changesets](https://github.com/changesets
 - [`@nagi-js/core`](./packages/core/CHANGELOG.md)
 - [`@nagi-js/postgres`](./packages/postgres/CHANGELOG.md)
 - [`@nagi-js/pgmq`](./packages/pgmq/CHANGELOG.md)
-- [`@nagi-js/otel`](./packages/otel/CHANGELOG.md)
