@@ -3,8 +3,6 @@ import {
   type Guard,
   getDef,
   type HandlerDef,
-  type MatchArmDef,
-  type MatchDef,
   needsStepIds,
   type SignalDef,
   type StepDef,
@@ -34,13 +32,6 @@ export interface CanonicalSchema {
   readonly validateHash: string;
 }
 
-export interface CanonicalMatchArm {
-  readonly id: string;
-  readonly otherwise?: true;
-  readonly whenHash?: string;
-  readonly stepIds: readonly StepId[];
-}
-
 export interface CanonicalStep {
   readonly id: StepId;
   readonly kind: StepKind;
@@ -50,7 +41,6 @@ export interface CanonicalStep {
   readonly timeoutMs?: Millis;
   readonly signalSchema?: CanonicalSchema;
   readonly signalNames?: readonly string[];
-  readonly matchArms?: readonly CanonicalMatchArm[];
   readonly childFlowId?: string;
   readonly subflowInputHash?: string;
 }
@@ -107,8 +97,6 @@ async function canonicalizeStep(
       return canonicalizeSignal(base, def);
     case "subflow":
       return canonicalizeSubflow(base, def);
-    case "match":
-      return canonicalizeMatch(base, def);
   }
 }
 
@@ -156,31 +144,6 @@ async function canonicalizeSubflow(
   await applyGuardAndTimeout(out, def);
   out.childFlowId = def.childFlowId;
   out.subflowInputHash = await hashFnSource(def.buildInput);
-  return out;
-}
-
-async function canonicalizeMatch(
-  base: CanonicalStep,
-  def: MatchDef,
-): Promise<CanonicalStep> {
-  const out: Mutable<CanonicalStep> = { ...base };
-  const arms: CanonicalMatchArm[] = [];
-  for (const arm of def.arms) {
-    arms.push(await canonicalizeArm(arm));
-  }
-  out.matchArms = arms;
-  return out;
-}
-
-async function canonicalizeArm(arm: MatchArmDef): Promise<CanonicalMatchArm> {
-  const out: Mutable<CanonicalMatchArm> = {
-    id: arm.id,
-    stepIds: [...arm.stepIds].sort(),
-  };
-  // CanonicalMatchArm stays flat (otherwise?/whenHash?) to keep the flow hash
-  // stable; the guard union is internal-only.
-  if (arm.guard.kind === "otherwise") out.otherwise = true;
-  else out.whenHash = await hashFnSource(arm.guard.when);
   return out;
 }
 

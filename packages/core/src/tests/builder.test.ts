@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { getDef } from "../internal";
-import type { Step } from "../types";
 import { passthroughSchema } from "./test-helpers";
 
 describe("flow()", () => {
@@ -185,36 +184,5 @@ describe("flow() — streamingTask", () => {
     const persistDef = getDef(f.steps.persist as never);
     const upstreamRef = persistDef.needs["gen"] as { step: { id: string } };
     expect(upstreamRef.step.id).toBe("generate");
-  });
-
-  it("nests under a match arm with the arm-prefixed id", () => {
-    const f = flow({
-      id: "streaming-in-match",
-      input: passthroughSchema<{ kind: "a" | "b" }>(),
-      build: (b) =>
-        ({
-          m: b.match({
-            arms: [
-              {
-                when: ({ input }) => input.kind === "a",
-                build: (b1) => ({
-                  gen: b1.streamingTask({ run: async () => ({ text: "x" }) }),
-                }),
-              },
-              {
-                otherwise: true,
-                build: (b1) => ({ noop: b1.task({ run: async () => null }) }),
-              },
-            ],
-          }),
-        }) as never,
-    });
-
-    const allSteps = f.steps as Record<string, Step<unknown>>;
-    const nested = allSteps["m.arm0.gen"];
-    expect(nested?.kind).toBe("streaming");
-    const nestedDef = getDef(nested as never);
-    expect(nestedDef.kind).toBe("streaming");
-    expect(nestedDef.parentMatch).toEqual({ matchId: "m", armId: "arm0" });
   });
 });

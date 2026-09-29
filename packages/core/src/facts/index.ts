@@ -67,7 +67,6 @@ export function foldRun(runId: RunId, facts: readonly Fact[]): RunState {
     flowHash: undefined,
     codeVersion: undefined,
     steps: {},
-    selectedArms: {},
     bufferedSignals: {},
     resetCounts: {},
   };

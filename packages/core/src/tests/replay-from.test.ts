@@ -257,59 +257,6 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     expect(result.factCount("flow.completed")).toBe(1);
   });
 
-  it("`from` on a match step re-selects the arm and re-runs arm steps", async () => {
-    let pickerCalls = 0;
-    let armCalls = 0;
-    const picks: Array<"a" | "b"> = ["a", "b"];
-    const f = flow({
-      id: "from-match",
-      input: passthroughSchema<Record<string, never>>(),
-      build: (b) =>
-        ({
-          m: b.match({
-            arms: [
-              {
-                when: () => {
-                  pickerCalls += 1;
-                  return (picks[pickerCalls - 1] ?? "a") === "a";
-                },
-                build: (b1) => ({
-                  x: b1.task({
-                    run: async () => {
-                      armCalls += 1;
-                      return { arm: "a" };
-                    },
-                  }),
-                }),
-              },
-              {
-                otherwise: true,
-                build: (b1) => ({
-                  x: b1.task({
-                    run: async () => {
-                      armCalls += 1;
-                      return { arm: "b" };
-                    },
-                  }),
-                }),
-              },
-            ],
-          }),
-        }) as never,
-    });
-    const h = await makeHarness(f);
-    const runId = await h.wf.start(f, {});
-    await h.drain();
-    expect(pickerCalls).toBe(1);
-    expect(armCalls).toBe(1);
-
-    await h.wf.replay(runId, { mode: "continue", from: "m" });
-    await h.drain();
-
-    expect(pickerCalls).toBe(2);
-    expect(armCalls).toBe(2);
-  });
-
   it("`from` + `fireHooks: false` still suppresses hooks", async () => {
     const fires: string[] = [];
     const f = flow({

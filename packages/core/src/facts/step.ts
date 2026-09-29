@@ -79,12 +79,6 @@ export interface StepAbortRequestedFact extends FactBase {
   readonly attempt: AttemptNumber;
 }
 
-export interface MatchArmSelectedFact extends FactBase {
-  readonly kind: "match.arm-selected";
-  readonly stepId: StepId;
-  readonly arm: string;
-}
-
 export type StepFact =
   | StepStartedFact
   | StepCompletedFact
@@ -93,8 +87,7 @@ export type StepFact =
   | StepRetriedFact
   | StepSkippedFact
   | StepResetFact
-  | StepAbortRequestedFact
-  | MatchArmSelectedFact;
+  | StepAbortRequestedFact;
 
 export const stepFacts = {
   stepStarted(
@@ -211,15 +204,6 @@ export const stepFacts = {
       at: a.at,
     };
   },
-
-  matchArmSelected(
-    runId: RunId,
-    stepId: StepId,
-    arm: string,
-    at: Date,
-  ): MatchArmSelectedFact {
-    return { kind: "match.arm-selected", runId, stepId, arm, at };
-  },
 } as const;
 
 function startTarget(stepKind: StepKind, attempt: AttemptNumber): StepState {
@@ -231,7 +215,6 @@ function startTarget(stepKind: StepKind, attempt: AttemptNumber): StepState {
     case "task":
     case "activity":
     case "streaming":
-    case "match":
       return { tag: "running", attempt };
   }
 }
@@ -412,7 +395,6 @@ export const stepKinds = {
       draft.steps[fact.stepId] = PENDING;
       draft.resetCounts[fact.stepId] =
         (draft.resetCounts[fact.stepId] ?? 0) + 1;
-      delete draft.selectedArms[fact.stepId];
       // A reset step must wait for a fresh signal, never replay the old one.
       delete draft.bufferedSignals[fact.stepId];
       // A run with a pending step is not settled. Reset reopens completed/failed;
@@ -433,15 +415,6 @@ export const stepKinds = {
           ? { tag: "aborting", attempt: fact.attempt }
           : prev,
       ),
-    rows: null,
-    release: null,
-    stream: null,
-    event: null,
-  },
-  "match.arm-selected": {
-    fold: (draft, fact) => {
-      draft.selectedArms[fact.stepId] = fact.arm;
-    },
     rows: null,
     release: null,
     stream: null,

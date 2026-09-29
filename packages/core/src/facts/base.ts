@@ -27,7 +27,6 @@ export interface RunDraft {
   flowHash: string | undefined;
   codeVersion: string | undefined;
   readonly steps: Record<StepId, StepState>;
-  readonly selectedArms: Record<StepId, string>;
   readonly bufferedSignals: Record<StepId, BufferedSignal>;
   readonly resetCounts: Record<StepId, number>;
 }

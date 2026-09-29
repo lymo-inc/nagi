@@ -77,13 +77,7 @@ export interface Register {}
 
 export type Tx = Register extends { tx: infer T } ? T : unknown;
 
-export type StepKind =
-  | "task"
-  | "activity"
-  | "signal"
-  | "match"
-  | "subflow"
-  | "streaming";
+export type StepKind = "task" | "activity" | "signal" | "subflow" | "streaming";
 
 export interface Step<Output = unknown> {
   readonly kind: StepKind;
@@ -253,38 +247,6 @@ export interface SignalConfig<
   readonly timeoutMs: Millis | "unbounded";
 }
 
-export interface MatchArmGuard<Input, N extends NeedsMap, M extends StepMap> {
-  readonly when: (args: {
-    readonly input: NoInfer<Input>;
-    readonly needs: NoInfer<ResolvedNeeds<N>>;
-  }) => boolean;
-  readonly otherwise?: never;
-  readonly build: (b: Builder<Input>) => M;
-}
-
-export interface MatchArmOtherwise<Input, M extends StepMap> {
-  readonly otherwise: true;
-  readonly when?: never;
-  readonly build: (b: Builder<Input>) => M;
-}
-
-export type MatchArm<Input, N extends NeedsMap, M extends StepMap> =
-  | MatchArmGuard<Input, N, M>
-  | MatchArmOtherwise<Input, M>;
-
-export interface MatchGuardConfig<
-  Input,
-  N extends NeedsMap,
-  M extends StepMap,
-> {
-  readonly needs?: N;
-  readonly arms: ReadonlyArray<MatchArm<Input, N, M>>;
-}
-
-export type MatchArmOutput<M extends StepMap> = {
-  readonly [K in keyof M]: StepOutput<M[K]>;
-};
-
 export interface SubflowConfig<Input, N extends NeedsMap, Child extends Flow>
   extends StepConfigBase<Input, N> {
   readonly input: (args: {
@@ -319,14 +281,6 @@ export interface Builder<Input = unknown> {
     child: Child,
     config: SubflowConfig<Input, N, Child>,
   ): Step<SubflowStepOutput<FlowOutput<Child>>>;
-
-  match<
-    N extends NeedsMap,
-    Arms extends ReadonlyArray<MatchArm<Input, N, StepMap>>,
-  >(config: {
-    readonly needs?: N;
-    readonly arms: Arms;
-  }): Step<MatchArmOutput<ReturnType<Arms[number]["build"]>>>;
 }
 
 export type ConcurrencyMode = "cancel-in-progress";
@@ -435,7 +389,7 @@ export interface StepStartEvent extends StepEvent {
 
 export interface StepCompleteEvent extends StepEvent {
   readonly output: Json;
-  // Absent for match/subflow completions, which have no handler wall-time;
+  // Absent for subflow completions, which have no handler wall-time;
   // consumers that need it recompute from the step's start.
   readonly durationMs?: Millis;
 }
@@ -782,7 +736,7 @@ export interface Store {
 }
 
 // A lifecycle projection of the fact log, for observers. Deliberately smaller
-// than Fact: leases, timers and arm selection are execution bookkeeping, not
+// than Fact: leases and timers are execution bookkeeping, not
 // things a UI or an operator subscribes to.
 export type RunEvent =
   | { readonly type: "flow.started"; readonly flowId: string }

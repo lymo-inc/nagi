@@ -287,53 +287,6 @@ describe("descendantsOf", () => {
     expect([...descendantsOf(f, "c")].sort()).toEqual(["c", "d"]);
     expect([...descendantsOf(f, "a")].sort()).toEqual(["a", "b", "c", "d"]);
   });
-
-  it("match — resetting the match step cascades into all arm steps", () => {
-    const f = flow({
-      id: "match-cascade",
-      input: passthroughSchema<{ kind: "a" | "b" }>(),
-      build: (b) =>
-        ({
-          m: b.match({
-            arms: [
-              {
-                when: ({ input }) => input.kind === "a",
-                build: (b1) => ({ x: b1.task({ run: async () => null }) }),
-              },
-              {
-                otherwise: true,
-                build: (b1) => ({ y: b1.task({ run: async () => null }) }),
-              },
-            ],
-          }),
-        }) as never,
-    });
-    const desc = descendantsOf(f, "m");
-    expect(desc[0]).toBe("m");
-    expect([...desc].slice(1).sort()).toEqual(["m.arm0.x", "m.otherwise.y"]);
-  });
-
-  it("arm step — resetting an arm step does NOT cascade to siblings or parent", () => {
-    const f = flow({
-      id: "match-arm-reset",
-      input: passthroughSchema<{ kind: "a" }>(),
-      build: (b) =>
-        ({
-          m: b.match({
-            arms: [
-              {
-                otherwise: true,
-                build: (b1) => ({
-                  x: b1.task({ run: async () => null }),
-                  y: b1.task({ run: async () => null }),
-                }),
-              },
-            ],
-          }),
-        }) as never,
-    });
-    expect(descendantsOf(f, "m.otherwise.x")).toEqual(["m.otherwise.x"]);
-  });
 });
 
 function startedStepFact(stepId: string): Fact {
@@ -345,36 +298,6 @@ function startedStepFact(stepId: string): Fact {
     stepKind: "task",
     at: new Date(),
   };
-}
-
-function armSelectedFact(stepId: string, arm: string): Fact {
-  return {
-    kind: "match.arm-selected",
-    runId: RUN,
-    stepId,
-    arm,
-    at: new Date(),
-  };
-}
-
-function singleArmMatchFlow(): Flow {
-  return flow({
-    id: "match-promote",
-    input: passthroughSchema<Record<string, never>>(),
-    build: (b) =>
-      ({
-        m: b.match({
-          arms: [
-            {
-              otherwise: true,
-              build: (b1) => ({
-                x: b1.task({ run: async () => ({ ok: true }) }),
-              }),
-            },
-          ],
-        }),
-      }) as never,
-  });
 }
 
 describe("nextTransition", () => {
@@ -465,53 +388,5 @@ describe("nextTransition", () => {
       kind: "skip",
       skip: [{ stepId: "branch", reason: "when-false" }],
     });
-  });
-
-  it("promote-match: a running match whose arm steps are all terminal", async () => {
-    const f = singleArmMatchFlow();
-    const state = await projectFacts([
-      startedFact(f.id, {}),
-      armSelectedFact("m", "otherwise"),
-      startedStepFact("m"),
-      completedStepFact("m.otherwise.x", { ok: true }),
-    ]);
-    expect(nextTransition(f, state)).toEqual({
-      kind: "promote-match",
-      promotions: [
-        {
-          matchId: "m",
-          attempt: 1,
-          result: { kind: "complete", output: { x: { ok: true } } },
-        },
-      ],
-    });
-  });
-
-  it("priority: promote-match wins over an otherwise-runnable step", async () => {
-    const f = flow({
-      id: "match-priority",
-      input: passthroughSchema<Record<string, never>>(),
-      build: (b) =>
-        ({
-          m: b.match({
-            arms: [
-              {
-                otherwise: true,
-                build: (b1) => ({
-                  x: b1.task({ run: async () => ({ ok: true }) }),
-                }),
-              },
-            ],
-          }),
-          indep: b.task({ run: async () => null }),
-        }) as never,
-    });
-    const state = await projectFacts([
-      startedFact(f.id, {}),
-      armSelectedFact("m", "otherwise"),
-      startedStepFact("m"),
-      completedStepFact("m.otherwise.x", { ok: true }),
-    ]);
-    expect(nextTransition(f, state).kind).toBe("promote-match");
   });
 });

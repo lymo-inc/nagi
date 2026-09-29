@@ -1,17 +1,10 @@
 import {
-  type ArmGuard,
   attachDef,
   compact,
-  type Guard,
   type HandlerDef,
   type HandlerKind,
-  type MatchArmDef,
-  type MatchDef,
   type NeedRefDef,
   normalizeNeeds,
-  type ParentMatchRef,
-  type PendingMatchArm,
-  type PendingMatchDef,
   peekDef,
   type SignalDef,
   type StepDef,
@@ -27,8 +20,6 @@ import type {
   FlowOutput,
   InferSchemaOutput,
   Json,
-  MatchArm,
-  MatchArmOutput,
   NeedsMap,
   Optional,
   ResolvedConcurrency,
@@ -102,32 +93,12 @@ function makeBuilder<Input>(): Builder<Input> {
     );
   }
 
-  function match<
-    N extends NeedsMap,
-    Arms extends ReadonlyArray<MatchArm<Input, N, StepMap>>,
-  >(config: {
-    readonly needs?: N;
-    readonly arms: Arms;
-  }): Step<MatchArmOutput<ReturnType<Arms[number]["build"]>>> {
-    const needs = normalizeNeeds(config.needs);
-    const arms: PendingMatchArm[] = config.arms.map((arm, i) => {
-      const guard: ArmGuard = arm.otherwise
-        ? { kind: "otherwise" }
-        : { kind: "when", when: arm.when as Guard };
-      const armId = guard.kind === "otherwise" ? "otherwise" : `arm${i}`;
-      return { id: armId, guard, nested: arm.build(makeBuilder<Input>()) };
-    });
-    const def: PendingMatchDef = { kind: "match", needs, arms };
-    return attachDef({ kind: "match", id: "" }, def);
-  }
-
   return {
     task: (config) => handler("task", config),
     activity: (config) => handler("activity", config),
     streamingTask: (config) => handler("streaming", config),
     signal,
     subflow,
-    match,
   };
 }
 
@@ -142,18 +113,7 @@ export function flow<
   const builder = makeBuilder<InferSchemaOutput<InputSchema>>();
   const built = config.build(builder);
 
-  const idByIdentity = new Map<Step<unknown>, string>();
-  collectIds(built, "", idByIdentity);
-
-  const finalSteps: Record<string, Step<unknown>> = {};
-  walkAndRewrite({
-    flowId: config.id,
-    map: built,
-    prefix: "",
-    parentMatch: undefined,
-    idByIdentity,
-    out: finalSteps,
-  });
+  const finalSteps = rewriteSteps(config.id, built);
 
   assertSignalNameUniqueness(config.id, finalSteps);
 
@@ -196,38 +156,15 @@ function normalizeConcurrency<Input>(
   };
 }
 
-function collectIds(
+function rewriteSteps(
+  flowId: string,
   map: StepMap,
-  prefix: string,
-  idByIdentity: Map<Step<unknown>, string>,
-): void {
-  for (const [key, step] of Object.entries(map)) {
-    const id = prefix ? `${prefix}.${key}` : key;
-    idByIdentity.set(step, id);
-    const def = peekDef(step);
-    if (def?.kind === "match") {
-      const pending = def as PendingMatchDef;
-      for (const arm of pending.arms) {
-        collectIds(arm.nested, `${id}.${arm.id}`, idByIdentity);
-      }
-    }
-  }
-}
+): Record<string, Step<unknown>> {
+  const idByIdentity = new Map<Step<unknown>, string>();
+  for (const [id, step] of Object.entries(map)) idByIdentity.set(step, id);
 
-interface WalkArgs {
-  readonly flowId: string;
-  readonly map: StepMap;
-  readonly prefix: string;
-  readonly parentMatch: ParentMatchRef | undefined;
-  readonly idByIdentity: Map<Step<unknown>, string>;
-  readonly out: Record<string, Step<unknown>>;
-}
-
-function walkAndRewrite(args: WalkArgs): void {
-  const { flowId, map, prefix, parentMatch, idByIdentity, out } = args;
-
-  for (const [key, step] of Object.entries(map)) {
-    const id = prefix ? `${prefix}.${key}` : key;
+  const out: Record<string, Step<unknown>> = {};
+  for (const [id, step] of Object.entries(map)) {
     const def = peekDef(step);
     if (def === undefined) {
       throw new Error(
@@ -264,49 +201,10 @@ function walkAndRewrite(args: WalkArgs): void {
       };
     }
 
-    if (def.kind === "match") {
-      const pending = def as PendingMatchDef;
-      const finalizedArms: MatchArmDef[] = [];
-
-      for (const arm of pending.arms) {
-        const armPrefix = `${id}.${arm.id}`;
-        const nestedStepIds: string[] = [];
-        for (const nestedKey of Object.keys(arm.nested)) {
-          nestedStepIds.push(`${armPrefix}.${nestedKey}`);
-        }
-        walkAndRewrite({
-          flowId,
-          map: arm.nested,
-          prefix: armPrefix,
-          parentMatch: { matchId: id, armId: arm.id },
-          idByIdentity,
-          out,
-        });
-        finalizedArms.push({
-          id: arm.id,
-          guard: arm.guard,
-          stepIds: nestedStepIds,
-        });
-      }
-
-      const finalizedDef: MatchDef = {
-        kind: "match",
-        needs: rewrittenNeeds,
-        arms: finalizedArms,
-        ...compact({ parentMatch }),
-      };
-
-      out[id] = attachDef({ kind: "match", id }, finalizedDef);
-      continue;
-    }
-
-    const finalizedDef = {
-      ...def,
-      needs: rewrittenNeeds,
-      ...compact({ parentMatch }),
-    } as StepDef;
+    const finalizedDef: StepDef = { ...def, needs: rewrittenNeeds };
     out[id] = attachDef({ kind: finalizedDef.kind, id }, finalizedDef);
   }
+  return out;
 }
 
 function assertSignalNameUniqueness(

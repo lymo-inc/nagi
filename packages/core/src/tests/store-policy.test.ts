@@ -215,7 +215,6 @@ describe("factConsequences — the release table", () => {
       }),
       Facts.signalReceived({ runId: R, stepId: "s", payload: null, at: AT }),
       Facts.signalBuffered({ runId: R, stepId: "s", payload: null, at: AT }),
-      Facts.matchArmSelected(R, "s", "arm", AT),
     ];
     for (const fact of none) expect(releaseOf(fact)).toBeNull();
   });

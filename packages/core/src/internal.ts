@@ -60,20 +60,11 @@ export function compact<T extends object>(obj: T): Compacted<T> {
   return out as Compacted<T>;
 }
 
-export interface ParentMatchRef {
-  readonly matchId: string;
-  readonly armId: string;
-}
-
 export type GuardArgs = {
   readonly input: unknown;
   readonly needs: Record<string, unknown>;
 };
 export type Guard = (args: GuardArgs) => boolean;
-
-export type ArmGuard =
-  | { readonly kind: "when"; readonly when: Guard }
-  | { readonly kind: "otherwise" };
 
 export type HandlerKind = "task" | "activity" | "streaming";
 
@@ -92,7 +83,6 @@ export interface HandlerDef extends StepLifecycleHooks<Json> {
     needs: Record<string, unknown>;
     ctx: ActivityCtx<unknown>;
   }) => Promise<Json>;
-  readonly parentMatch?: ParentMatchRef;
 }
 
 export interface SignalDef {
@@ -102,33 +92,6 @@ export interface SignalDef {
   readonly names?: readonly [string, ...string[]];
   readonly timeoutMs: Millis | "unbounded";
   readonly when?: Guard;
-  readonly parentMatch?: ParentMatchRef;
-}
-
-export interface MatchArmDef {
-  readonly id: string;
-  readonly guard: ArmGuard;
-  readonly stepIds: readonly string[];
-}
-
-export interface MatchDef {
-  readonly kind: "match";
-  readonly needs: NeedsDefMap;
-  readonly arms: readonly MatchArmDef[];
-  readonly parentMatch?: ParentMatchRef;
-}
-
-export interface PendingMatchArm {
-  readonly id: string;
-  readonly guard: ArmGuard;
-  readonly nested: StepMap;
-}
-
-export interface PendingMatchDef {
-  readonly kind: "match";
-  readonly needs: NeedsDefMap;
-  readonly arms: readonly PendingMatchArm[];
-  readonly parentMatch?: ParentMatchRef;
 }
 
 export interface SubflowDef {
@@ -137,20 +100,19 @@ export interface SubflowDef {
   readonly childFlowId: string;
   readonly buildInput: (args: GuardArgs) => unknown;
   readonly when?: Guard;
-  readonly parentMatch?: ParentMatchRef;
 }
 
-export type StepDef = HandlerDef | SignalDef | MatchDef | SubflowDef;
+export type StepDef = HandlerDef | SignalDef | SubflowDef;
 
 export const DEF = Symbol("nagi.def");
 
 export type StepWithDef<Output = unknown> = Step<Output> & {
-  readonly [DEF]: StepDef | PendingMatchDef;
+  readonly [DEF]: StepDef;
 };
 
 export function attachDef<Output>(
   meta: { readonly kind: StepDef["kind"]; readonly id: string },
-  def: StepDef | PendingMatchDef,
+  def: StepDef,
 ): StepWithDef<Output> {
   return { kind: meta.kind, id: meta.id, [DEF]: def };
 }
@@ -159,16 +121,11 @@ export function setDef(step: StepWithDef, def: StepDef): void {
   (step as { [DEF]: StepDef })[DEF] = def;
 }
 
-// Runtime/projection-phase read: walkAndRewrite has finalized every match into a
-// MatchDef, so narrowing the widened slot back to StepDef here is sound.
 export function getDef(step: StepWithDef): StepDef {
-  return step[DEF] as StepDef;
+  return step[DEF];
 }
 
-// Builder-phase read: a match may still carry its pre-walk PendingMatchDef.
-export function peekDef(
-  step: Step<unknown>,
-): StepDef | PendingMatchDef | undefined {
+export function peekDef(step: Step<unknown>): StepDef | undefined {
   return (step as Partial<StepWithDef>)[DEF];
 }
 
@@ -179,7 +136,6 @@ export function handlerDef(def: StepDef): HandlerDef | undefined {
     case "streaming":
       return def;
     case "signal":
-    case "match":
     case "subflow":
       return undefined;
   }
@@ -207,14 +163,4 @@ export type StepMapWithDefs = Readonly<Record<string, StepWithDef<unknown>>>;
 
 export function asStepMapWithDefs(steps: StepMap): StepMapWithDefs {
   return steps as StepMapWithDefs;
-}
-
-export function selectArm(def: MatchDef, args: GuardArgs): string {
-  for (const arm of def.arms) {
-    if (arm.guard.kind === "otherwise") return arm.id;
-    if (arm.guard.when(args)) return arm.id;
-  }
-  throw new Error(
-    `match: no arm matched and no { otherwise: true } fallback was provided`,
-  );
 }
