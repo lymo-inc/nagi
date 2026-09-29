@@ -402,6 +402,10 @@ and `ADD CONSTRAINT ... NOT VALID` yourself, `VALIDATE CONSTRAINT` separately
 `0008_canceled_by_run_id_fk` into `<schema>.schema_migrations` so `migrate()`
 skips it.
 
+**`0011_fact_seq`** adds a nullable column with a default. On PostgreSQL 11+
+that is a catalog-only change, with no table rewrite. It still takes a brief
+`ACCESS EXCLUSIVE` lock on `fact`.
+
 **`global_fact`.** Each boot that registers a flow with a changed hash
 appends one `flow_ref.updated` row to `<schema>.global_fact`. nagi only
 writes it, as an audit trail of which flow versions went live when.

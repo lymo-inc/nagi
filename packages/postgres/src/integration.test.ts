@@ -250,6 +250,43 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(reaped).toHaveLength(0);
   }, 15_000);
 
+  it("loadRunState folds facts in insert order even when fact_id sorts them backwards", async () => {
+    const store = postgresStore({ db, schema });
+    const runId = `run-${uuidv7()}` as RunId;
+
+    await store.tryStartRun(runId, {
+      kind: "flow.started",
+      runId,
+      flowId: "fact-seq-order-test",
+      input: null as never,
+      at: new Date(),
+    });
+    await store.appendFact(runId, {
+      kind: "step.started",
+      runId,
+      stepId: "s",
+      attempt: 1,
+      stepKind: "task",
+      at: new Date(),
+    });
+    await sql`
+      INSERT INTO ${sql.raw(`${schema}.fact`)} (run_id, fact_id, kind, at, payload)
+      VALUES (
+        ${runId},
+        '00000000-0000-7000-8000-000000000000',
+        'step.skipped',
+        now(),
+        '{"stepId":"s","reason":"when-false"}'::jsonb
+      )
+    `.execute(db);
+
+    const state = await store.loadRunState(runId);
+    expect(state?.facts.map((f) => f.kind).slice(-2)).toEqual([
+      "step.started",
+      "step.skipped",
+    ]);
+  }, 15_000);
+
   it("concurrent start() with the same runId produces one run and one dispatch", async () => {
     let invocations = 0;
     const f = flow({

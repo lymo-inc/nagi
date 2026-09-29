@@ -502,7 +502,7 @@ class PostgresStore<DB = unknown> implements Store {
       SELECT kind, at, payload
         FROM ${sql.raw(this.t("fact"))}
        WHERE run_id = ${runId}
-       ORDER BY fact_id ASC
+       ORDER BY seq ASC NULLS FIRST, fact_id ASC
     `.execute(executor);
 
     const facts: Fact[] = rows.rows.map((r) =>

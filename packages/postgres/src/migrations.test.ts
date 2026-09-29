@@ -117,6 +117,18 @@ describe("migrations", () => {
     });
   });
 
+  describe("0011_fact_seq", () => {
+    it("adds a nullable seq column defaulting to a sequence", () => {
+      const m = migrations.find((x) => x.id === "0011_fact_seq");
+      expect(m).toBeDefined();
+      const sql = (m as { sql: (schema: string) => string }).sql(
+        "custom_schema",
+      );
+      expect(sql).toContain("nextval('custom_schema.fact_seq')");
+      expect(sql).toContain("ADD COLUMN IF NOT EXISTS seq");
+    });
+  });
+
   describe("migrate — schema validation", () => {
     it("rejects a schema name over the 56-character cap before touching db", async () => {
       await expect(

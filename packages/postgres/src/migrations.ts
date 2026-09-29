@@ -235,6 +235,19 @@ export const migrations: readonly Migration[] = [
         DEFERRABLE INITIALLY DEFERRED;
     `,
   },
+  {
+    // Commit-causal read order across processes. Nullable with a default, so
+    // no rewrite and no backfill: old rows (seq NULL) keep fact_id order and
+    // precede every new fact.
+    id: "0011_fact_seq",
+    sql: (schema) => `
+      CREATE SEQUENCE IF NOT EXISTS ${schema}.fact_seq;
+      ALTER TABLE ${schema}.fact ADD COLUMN IF NOT EXISTS seq bigint;
+      ALTER TABLE ${schema}.fact
+        ALTER COLUMN seq SET DEFAULT nextval('${schema}.fact_seq');
+      ALTER SEQUENCE ${schema}.fact_seq OWNED BY ${schema}.fact.seq;
+    `,
+  },
 ];
 
 export interface MigrateOpts {
