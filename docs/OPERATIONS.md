@@ -193,6 +193,19 @@ If you override `pgmqQueue({ visibilityTimeoutMs })` or
 otherwise every step longer than the visibility timeout is redelivered before
 its first lease extension (defaults: 40s interval, 120s visibility).
 
+## Connection pool sizing
+
+- A task step holds one connection for its whole body (its transaction).
+- A streaming step does the same for the whole stream, and that transaction
+  sits idle between chunks. Keep `idle_in_transaction_session_timeout` (if
+  set) above your longest stream. This is deliberate: streaming bodies keep
+  `ctx.tx` (backlog A-14, decided 2026-09-29).
+- `ctx.once` inside the body takes a second one.
+- Heartbeats, the cancel watcher and the sweeps take connections briefly.
+- Keep `pool.max` ≥ (sum of worker `concurrency` sharing the pool) + 2.
+- Set `connectionTimeoutMillis` so a starved pool surfaces as an error, not a
+  hang.
+
 ## Reading runs with SQL
 
 For one run, use `wf.describe(runId)`. To list or filter runs, or to join them

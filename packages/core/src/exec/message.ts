@@ -32,6 +32,7 @@ import type {
   RunState,
   StepCtx,
   StreamingStepCtx,
+  Tx,
 } from "../types";
 import type { Hooks } from "./hooks";
 import type { Progression } from "./progression";
@@ -381,12 +382,12 @@ export function makeMessage(
     };
 
     let abortedHere = false;
-    const settle = async (output: Json) => {
+    const settle = async (output: Json, tx: Tx) => {
       // A body that honored the deadline by returning still timed out.
       if (ac.signal.reason instanceof NagiStepTimeoutError)
         throw ac.signal.reason;
       const resolved = resolveExecutionFact({
-        postState: await store.loadRunState(runId),
+        postState: await store.loadRunState(runId, tx),
         runId,
         stepId,
         attempt,
@@ -399,7 +400,7 @@ export function makeMessage(
 
     const inTx = (body: (ctx: StepCtx<unknown>) => Promise<Json>) =>
       store.runStep<Json>(runId, stepId, attempt, async (tx) =>
-        settle(await body(makeStepCtx({ ...ctxArgs, tx }))),
+        settle(await body(makeStepCtx({ ...ctxArgs, tx })), tx),
       );
 
     // A handler aborted by its deadline rarely rethrows our error — unwrap at
@@ -434,8 +435,8 @@ export function makeMessage(
         case "activity": {
           const ctx = makeActivityCtx(ctxArgs);
           const out = await runBody(() => def.run({ input, needs, ctx }));
-          output = await store.runStep<Json>(runId, stepId, attempt, () =>
-            settle(out),
+          output = await store.runStep<Json>(runId, stepId, attempt, (tx) =>
+            settle(out, tx),
           );
           break;
         }

@@ -12,7 +12,15 @@ import {
 import { passthroughSchema } from "@nagi-js/core/testing";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import pg from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { migrate } from "./migrations";
 import { postgresStore } from "./store";
 import { uuidv7 } from "./uuidv7";
@@ -1421,6 +1429,132 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       ]);
       expect(a.runsPruned + b.runsPruned).toBe(12);
     });
+  });
+
+  describe("pool pressure", () => {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const A1 = 1 as AttemptNumber;
+
+    it("two concurrent task steps complete on a two-connection pool", async () => {
+      const pool = new pg.Pool({
+        connectionString: url,
+        max: 2,
+        // Larger than the vi.waitFor timeout below: pre-fix, settle()'s second
+        // connection request for both steps hangs for this whole window (the
+        // deadlock), so waitFor's own 10s bound trips first. Post-fix, settle
+        // never needs a second connection, so this never matters.
+        connectionTimeoutMillis: 12_000,
+      });
+      const smallDb = new Kysely<unknown>({
+        dialect: new PostgresDialect({ pool }),
+      });
+      try {
+        const f = flow({
+          id: "pg-pool-pressure-two-tasks",
+          input: passthroughSchema<Record<string, never>>(),
+          build: (b) => ({
+            a: b.task({
+              run: async () => {
+                await sleep(100);
+                return { ok: "a" };
+              },
+            }),
+            b: b.task({
+              run: async () => {
+                await sleep(100);
+                return { ok: "b" };
+              },
+            }),
+          }),
+          output(s) {
+            return { a: s.a, b: s.b };
+          },
+        });
+        const wf = await nagi({
+          store: postgresStore({ db: smallDb, schema }),
+          queue: new InMemoryQueue(),
+          clock: new InMemoryClock(),
+          flows: [f],
+        });
+        const runId = await wf.start(f, {});
+
+        const ac = new AbortController();
+        const worker = wf.worker({
+          concurrency: 2,
+          pollIntervalMs: 5,
+          signal: ac.signal,
+        });
+        const done = worker.run();
+        try {
+          await vi.waitFor(
+            async () => {
+              expect(await loadStatus(db, schema, runId)).toBe("completed");
+            },
+            { timeout: 10_000 },
+          );
+        } finally {
+          ac.abort();
+          await done;
+        }
+      } finally {
+        await smallDb.destroy();
+      }
+    }, 20_000);
+
+    it("runStep's body can read run state on its tx with the pool exhausted", async () => {
+      const pool = new pg.Pool({
+        connectionString: url,
+        max: 1,
+        connectionTimeoutMillis: 3_000,
+      });
+      const smallDb = new Kysely<unknown>({
+        dialect: new PostgresDialect({ pool }),
+      });
+      try {
+        const store = postgresStore({ db: smallDb, schema });
+        const runId = `run-${uuidv7()}` as RunId;
+        const at = new Date();
+        await store.tryStartRun(runId, {
+          kind: "flow.started",
+          runId,
+          flowId: "pg-pool-pressure-tx-read",
+          input: {},
+          at,
+        });
+        await store.appendFact(runId, {
+          kind: "step.started",
+          runId,
+          stepId: "s",
+          attempt: A1,
+          stepKind: "task",
+          at,
+        });
+        await store.claimStep(runId, "s", A1);
+
+        const race = Promise.race([
+          store.runStep(runId, "s", A1, async (tx) => {
+            const seen = await store.loadRunState(runId, tx);
+            return {
+              output: { seen: seen.facts.length },
+              fact: {
+                kind: "step.completed" as const,
+                runId,
+                stepId: "s",
+                attempt: A1,
+                output: null,
+                at: new Date(),
+              },
+            };
+          }),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("runStep timed out")), 5_000),
+          ),
+        ]);
+        await expect(race).resolves.toEqual({ seen: expect.any(Number) });
+      } finally {
+        await smallDb.destroy();
+      }
+    }, 10_000);
   });
 });
 

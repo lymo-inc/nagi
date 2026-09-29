@@ -543,7 +543,11 @@ export interface Store {
   // cancels tryStartRun makes, MUST apply the same refusal.
   endRun(runId: RunId, fact: RunEndFact): Promise<boolean>;
 
-  loadRunState(runId: RunId): Promise<RunState>;
+  // With `tx` (the one runStep handed its body), MUST read on that
+  // transaction: the caller holds its connection, and a second pool
+  // connection per in-flight step deadlocks a pool no larger than the
+  // worker's concurrency.
+  loadRunState(runId: RunId, tx?: Tx): Promise<RunState>;
 
   // Atomically reconcile a signal with its target step under a per-run lock.
   // With `incoming` (a wf.signal call): deliver when the step is awaitingSignal,

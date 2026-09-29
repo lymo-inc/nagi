@@ -281,7 +281,7 @@ export class InMemoryStore implements Store {
     );
   }
 
-  async loadRunState(runId: RunId): Promise<RunState> {
+  async loadRunState(runId: RunId, _tx?: Tx): Promise<RunState> {
     return foldRun(runId, this.facts.get(runId) ?? []);
   }
 

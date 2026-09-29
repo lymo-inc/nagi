@@ -438,8 +438,11 @@ class PostgresStore<DB = unknown> implements Store {
     return insert.rows.length > 0;
   }
 
-  async loadRunState(runId: RunId): Promise<RunState> {
-    return this.loadRunStateWith(this.db, runId);
+  async loadRunState(runId: RunId, tx?: Tx): Promise<RunState> {
+    return this.loadRunStateWith(
+      tx === undefined ? this.db : (tx as unknown as Kysely<DB>),
+      runId,
+    );
   }
 
   private async loadRunStateWith(

@@ -667,6 +667,34 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "runStep: the body reads run state on its tx and sees committed facts",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s");
+      await s.appendFact(
+        runId,
+        Facts.stepAbortRequested({
+          runId,
+          stepId: "s",
+          attempt: A1,
+          at: new Date(),
+        }),
+      );
+      let seenTag: string | undefined;
+      await s.runStep(runId, "s", A1, async (tx) => {
+        const seen = await s.loadRunState(runId, tx);
+        seenTag = stepStateOf(seen, "s").tag;
+        return {
+          output: null,
+          fact: Facts.stepCanceled(runId, "s", A1, new Date()),
+        };
+      });
+      eq(seenTag, "aborting", "tx read sees the abort-requested fold");
+    },
+  },
+  {
     name: "settleSignal(deliver): releases the lease and the armed timer",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
