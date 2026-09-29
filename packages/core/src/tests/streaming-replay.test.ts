@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
+import { Facts } from "../facts";
 import type { Json, StepId, StreamEvent } from "../types";
 import { makeHarness, passthroughSchema } from "./test-helpers";
 
@@ -257,5 +258,66 @@ describe("streamingTask — retried attempt chunks stay ephemeral", () => {
     const result = await h.result(runId);
     expect(result.output("gen")).toBe("done");
     expect(JSON.stringify(result.raw.facts)).not.toContain('"kind":"chunk"');
+  });
+});
+
+describe("streamingTask — replay({ from }) reopens a canceled step's channel", () => {
+  it("a live subscriber of a step canceled on a live run ends; replay({ from }) streams the rerun to a new subscriber", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const f = flow({
+      id: "stream-canceled-live-run",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const gen = b.streamingTask<Record<string, never>, string, string>({
+          run: async ({ ctx }) => {
+            calls += 1;
+            if (calls === 1) {
+              await ctx.emit("first");
+              await gate;
+              return "late";
+            }
+            await ctx.emit("second");
+            return "again";
+          },
+        });
+        return { gen };
+      },
+    });
+
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    const first = collect(h.wf.subscribe<string>(runId, "gen" as StepId));
+    const draining = h.drain();
+    await h.waitForStep(runId, "gen", "running");
+
+    await h.store.appendFact(
+      runId,
+      Facts.stepAbortRequested({
+        runId,
+        stepId: "gen",
+        attempt: 1,
+        at: h.clock.now(),
+      }),
+    );
+    release();
+    await draining;
+
+    const state = await h.store.loadRunState(runId);
+    expect(state.phase.tag).toBe("running");
+    const ended = await Promise.race([
+      first,
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 2_000)),
+    ]);
+    expect(ended).not.toBe("timeout");
+    expect(chunks(ended as StreamEvent<string>[])).toEqual(["first"]);
+
+    await h.wf.replay(runId, { mode: "continue", from: "gen" as StepId });
+    const second = collect(h.wf.subscribe<string>(runId, "gen" as StepId));
+    await h.drain();
+    expect(chunks(await second)).toEqual(["second"]);
   });
 });
