@@ -2012,6 +2012,85 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "stream: a reset step's channel reopens for its rerun",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.stream === undefined) return;
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s", { kind: "streaming" });
+      // A channel must actually open and close on the first attempt for its
+      // key to land in closedKeys — otherwise this case can't exercise the bug.
+      const first = drain(
+        s.stream.subscribeStream(runId, "s"),
+        "first attempt",
+      );
+      s.stream.publishChunk(runId, "s", "one");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, null, new Date()),
+      );
+      eq(
+        await first,
+        [{ kind: "chunk", chunk: "one" }],
+        "first attempt streamed",
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepReset({ runId, stepId: "s", at: new Date() }),
+      );
+      await startStep(s, runId, "s", { attempt: A1, kind: "streaming" });
+      const rerun = drain(
+        s.stream.subscribeStream(runId, "s"),
+        "rerun completed",
+      );
+      s.stream.publishChunk(runId, "s", "again");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, null, new Date()),
+      );
+      eq(
+        await rerun,
+        [{ kind: "chunk", chunk: "again" }],
+        "rerun chunk delivered",
+      );
+    },
+  },
+  {
+    name: "stream: a reaped lease tells subscribers a new attempt started",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });
+      if (s.stream === undefined) return;
+      const queue = new InMemoryQueue();
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s", { kind: "streaming" });
+      ok((await s.claimStep(runId, "s", A1)) !== null, "claim");
+      const events = drain(
+        s.stream.subscribeStream(runId, "s"),
+        "reaped then rerun",
+      );
+      s.stream.publishChunk(runId, "s", "a");
+      await sleep(PAST_LEASE_MS);
+      await s.sweepLeases({ now: new Date(), queue });
+      await startStep(s, runId, "s", { attempt: A2, kind: "streaming" });
+      s.stream.publishChunk(runId, "s", "b");
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A2, null, new Date()),
+      );
+      eq(
+        await events,
+        [
+          { kind: "chunk", chunk: "a" },
+          { kind: "retry", attempt: 2 },
+          { kind: "chunk", chunk: "b" },
+        ],
+        "chunk, retry marker, chunk",
+      );
+    },
+  },
+  {
     name: "sweepLeases: a failing enqueue leaves nothing half-reaped — the lease stays reapable and no lease.reaped is written",
     async run(h) {
       const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });

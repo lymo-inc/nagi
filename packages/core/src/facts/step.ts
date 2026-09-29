@@ -407,7 +407,7 @@ export const stepKinds = {
     },
     rows: (fact) => ({ row: "step", status: "reset", stepId: fact.stepId }),
     release: (fact) => releaseStep(fact.stepId, true),
-    stream: null,
+    stream: (fact) => ({ tag: "reopen", stepId: fact.stepId }),
     event: null,
   },
   "step.abort-requested": {

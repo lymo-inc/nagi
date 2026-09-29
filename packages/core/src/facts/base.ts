@@ -147,6 +147,7 @@ export type StreamEffect =
       readonly stepId: StepId;
       readonly nextAttempt: AttemptNumber;
     }
+  | { readonly tag: "reopen"; readonly stepId: StepId }
   | { readonly tag: "close-run" };
 
 type Consequence<F, T> = ((fact: F) => T) | null;

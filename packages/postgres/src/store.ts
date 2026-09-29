@@ -1328,6 +1328,8 @@ function frameOf(runId: RunId, effect: StreamEffect): StreamFrame {
       return { k: "err", r: runId, s: effect.stepId };
     case "retry":
       return { k: "retry", r: runId, s: effect.stepId, a: effect.nextAttempt };
+    case "reopen":
+      return { k: "reopen", r: runId, s: effect.stepId };
     case "close-run":
       return { k: "run", r: runId };
   }

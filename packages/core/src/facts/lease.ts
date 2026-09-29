@@ -48,7 +48,12 @@ export const leaseKinds = {
       stepId: fact.stepId,
       attempt: fact.attempt,
     }),
-    stream: null,
+    // Subscribers are told the reaped attempt is superseded, same as a normal retry.
+    stream: (fact) => ({
+      tag: "retry",
+      stepId: fact.stepId,
+      nextAttempt: (fact.attempt + 1) as AttemptNumber,
+    }),
     event: null,
   },
 } satisfies KindTable<LeaseFact>;

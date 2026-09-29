@@ -181,6 +181,15 @@ export class InMemoryStreamHub {
     }
   }
 
+  // A reset step runs again: forget that it closed, and drop the superseded
+  // run's buffered chunks from any channel still open.
+  reopen(runId: RunId, stepId: StepId): void {
+    const key = InMemoryStreamHub.key(runId, stepId);
+    this.closedKeys.delete(key);
+    const channel = this.channels.get(key);
+    if (channel !== undefined) channel.replay.length = 0;
+  }
+
   apply(runId: RunId, effect: StreamEffect): void {
     switch (effect.tag) {
       case "close-ok":
@@ -191,6 +200,9 @@ export class InMemoryStreamHub {
         return;
       case "retry":
         this.signalRetry(runId, effect.stepId, effect.nextAttempt);
+        return;
+      case "reopen":
+        this.reopen(runId, effect.stepId);
         return;
       case "close-run":
         this.closeRun(runId);

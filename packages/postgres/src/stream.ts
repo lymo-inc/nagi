@@ -44,6 +44,7 @@ export type StreamFrame =
     }
   | { readonly k: "ok"; readonly r: RunId; readonly s: StepId }
   | { readonly k: "err"; readonly r: RunId; readonly s: StepId }
+  | { readonly k: "reopen"; readonly r: RunId; readonly s: StepId }
   | { readonly k: "run"; readonly r: RunId };
 
 export function encodeFrame(frame: StreamFrame): string {
@@ -77,6 +78,9 @@ export function applyFrame(hub: InMemoryStreamHub, frame: StreamFrame): void {
       return;
     case "err":
       hub.closeError(frame.r, frame.s);
+      return;
+    case "reopen":
+      hub.reopen(frame.r, frame.s);
       return;
     case "run":
       hub.closeRun(frame.r);
