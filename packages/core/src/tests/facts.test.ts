@@ -38,6 +38,26 @@ describe("foldRun on persisted logs", () => {
     expect(rowsOf(foreign)).toBeNull();
   });
 
+  it("folds a removed match.arm-selected fact as a no-op", () => {
+    const removed = {
+      kind: "match.arm-selected",
+      runId,
+      stepId: "m",
+      arm: "otherwise",
+      at,
+    } as unknown as Fact;
+    const started = Facts.stepStarted(runId, "s", 1, "task", at);
+    const { facts: _a, ...withRemoved } = foldRun(runId, [started, removed]);
+    const { facts: _b, ...without } = foldRun(runId, [started]);
+    expect(withRemoved).toEqual(without);
+    expect(factConsequences(removed)).toEqual({
+      rows: null,
+      release: null,
+      stream: null,
+      event: null,
+    });
+  });
+
   it("keeps the prior step state on a contradictory fact", () => {
     const state = foldRun(runId, [
       Facts.stepCompleted(runId, "s", 1, 1, at),
@@ -84,7 +104,6 @@ describe("factConsequences", () => {
       attempt: 1,
       at,
     }),
-    "match.arm-selected": Facts.matchArmSelected(runId, stepId, "a", at),
     "signal.received": Facts.signalReceived({ runId, stepId, payload: 1, at }),
     "signal.buffered": Facts.signalBuffered({ runId, stepId, payload: 1, at }),
     "lease.reaped": Facts.leaseReaped({
@@ -103,7 +122,6 @@ describe("factConsequences", () => {
       .sort();
     expect(logOnly).toEqual([
       "lease.reaped",
-      "match.arm-selected",
       "signal.buffered",
       "signal.received",
       "step.abort-requested",

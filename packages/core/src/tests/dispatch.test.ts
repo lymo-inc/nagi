@@ -214,7 +214,7 @@ describe("dispatchMessage — driver", () => {
     expect(start?.input).toEqual({ prompt: "hello", n: 7 });
   });
 
-  it("onStepStart hook passes null for signal and match steps", async () => {
+  it("onStepStart hook passes null for signal steps", async () => {
     const events: StepStartEvent[] = [];
     const f = flow({
       id: "hook-signal-null",

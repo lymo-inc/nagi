@@ -6,11 +6,9 @@ import {
   getDef,
   type HandlerDef,
   handlerDef,
-  type MatchDef,
   resolveNeeds,
   type StepDef,
   type SubflowDef,
-  selectArm,
 } from "../internal";
 import { resolveRetry } from "../retry";
 import { deriveChildRunId } from "../run-id";
@@ -56,7 +54,7 @@ export interface MessageHandler {
 }
 
 // Start events surface the flow input only where the start is an
-// input-processing moment; signal/match start with null by contract.
+// input-processing moment; signal starts with null by contract.
 function startInput(def: StepDef, input: Json): Json {
   switch (def.kind) {
     case "task":
@@ -65,7 +63,6 @@ function startInput(def: StepDef, input: Json): Json {
     case "subflow":
       return input;
     case "signal":
-    case "match":
       return null;
   }
 }
@@ -275,9 +272,6 @@ export function makeMessage(
         }
         return { tag: "parked" };
       }
-      case "match":
-        await executeMatch({ def, runId, stepId, state });
-        return { tag: "advance" };
       case "subflow":
         return await executeSubflow({ def, runId, stepId, attempt, state });
     }
@@ -482,26 +476,6 @@ export function makeMessage(
       generation,
     });
     return { tag: "parked" };
-  }
-
-  async function executeMatch(args: {
-    def: MatchDef;
-    runId: RunId;
-    stepId: string;
-    state: RunState;
-  }): Promise<void> {
-    const { def, runId, stepId, state } = args;
-    const { store, clock } = deps;
-
-    const input = state.input;
-    const needs = resolveNeeds(def, state);
-
-    const armId = selectArm(def, { input, needs });
-
-    await store.appendFact(
-      runId,
-      Facts.matchArmSelected(runId, stepId, armId, clock.now()),
-    );
   }
 
   async function handleStepError(args: {

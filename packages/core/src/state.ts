@@ -78,7 +78,6 @@ export interface RunState {
   readonly input: Json;
   readonly phase: RunPhase;
   readonly steps: Readonly<Record<StepId, StepState>>;
-  readonly selectedArms: Readonly<Record<StepId, string>>;
   readonly bufferedSignals: Readonly<
     Record<StepId, { readonly payload: Json; readonly signalName?: string }>
   >;

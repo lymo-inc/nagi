@@ -355,51 +355,6 @@ describe("canonicalize — byte-difference invariants (different hash)", () => {
     });
     expect(await hashOf(f1)).not.toBe(await hashOf(f2));
   });
-
-  it("differs when match arms add a new step inside an arm", async () => {
-    const f1 = flow({
-      id: "match-arm",
-      input: passthroughSchema<{ kind: "a" | "b" }>(),
-      build: (b) =>
-        ({
-          m: b.match({
-            arms: [
-              {
-                when: ({ input }) => input.kind === "a",
-                build: (b1) => ({ x: b1.task({ run: async () => null }) }),
-              },
-              {
-                otherwise: true,
-                build: (b1) => ({ y: b1.task({ run: async () => null }) }),
-              },
-            ],
-          }),
-        }) as never,
-    });
-    const f2 = flow({
-      id: "match-arm",
-      input: passthroughSchema<{ kind: "a" | "b" }>(),
-      build: (b) =>
-        ({
-          m: b.match({
-            arms: [
-              {
-                when: ({ input }) => input.kind === "a",
-                build: (b1) => ({
-                  x: b1.task({ run: async () => null }),
-                  z: b1.task({ run: async () => null }),
-                }),
-              },
-              {
-                otherwise: true,
-                build: (b1) => ({ y: b1.task({ run: async () => null }) }),
-              },
-            ],
-          }),
-        }) as never,
-    });
-    expect(await hashOf(f1)).not.toBe(await hashOf(f2));
-  });
 });
 
 describe("canonicalize — shape", () => {

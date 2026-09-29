@@ -2,11 +2,7 @@ import type { DispatchDeps, EndingRun, RunEnd } from "../dispatch";
 import { NagiCanceledError } from "../errors";
 import { Facts, runCancelCause } from "../facts";
 import { type FlowResolution, requireCurrent } from "../flows";
-import {
-  type MatchPromotion,
-  nextTransition,
-  type SkipDecision,
-} from "../scheduler";
+import { nextTransition, type SkipDecision } from "../scheduler";
 import {
   isTerminalRun,
   type RunCancelCause,
@@ -24,7 +20,6 @@ import type {
   FlowFailedFact,
   Json,
   RunId,
-  RunState,
   SerializedError,
   StepId,
 } from "../types";
@@ -144,9 +139,6 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
         case "skip":
           await recordSkips(runId, t.skip);
           continue;
-        case "promote-match":
-          await applyPromotions(flow, runState, t.promotions);
-          continue;
       }
     }
 
@@ -173,24 +165,23 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
     }
   }
 
-  // match/subflow settlements route through here; the task path writes its own
-  // fact inside the runStep tx and does not.
-  async function markStepSettled(args: {
+  // The task path writes its own settle fact inside the runStep tx; a subflow
+  // step settles here, when its child run ends.
+  async function settleSubflowStep(args: {
     readonly flow: Flow;
     readonly runId: RunId;
     readonly stepId: StepId;
     readonly attempt: AttemptNumber;
-    readonly stepKind: "match" | "subflow";
     readonly settlement: StepSettlement;
   }): Promise<void> {
-    const { flow, runId, stepId, attempt, stepKind, settlement } = args;
+    const { flow, runId, stepId, attempt, settlement } = args;
     const at = deps.clock.now();
     const base = {
       runId,
       flowId: flow.id,
       stepId,
       attempt,
-      kind: stepKind,
+      kind: "subflow" as const,
       at,
     };
     if (settlement.kind === "complete") {
@@ -213,23 +204,6 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
         { ...base, error: settlement.error },
         "onStepError",
       );
-    }
-  }
-
-  async function applyPromotions(
-    flow: Flow,
-    runState: RunState,
-    promotions: readonly MatchPromotion[],
-  ): Promise<void> {
-    for (const { matchId, attempt, result } of promotions) {
-      await markStepSettled({
-        flow,
-        runId: runState.runId,
-        stepId: matchId,
-        attempt,
-        stepKind: "match",
-        settlement: result,
-      });
     }
   }
 
@@ -352,12 +326,11 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
 
     const parentFlow = requireCurrent(await deps.flowOf(parentRunId));
 
-    await markStepSettled({
+    await settleSubflowStep({
       flow: parentFlow,
       runId: parentRunId,
       stepId: parentStepId,
       attempt,
-      stepKind: "subflow",
       settlement:
         end.tag === "completed"
           ? { kind: "complete", output: { childRunId, output: end.output } }

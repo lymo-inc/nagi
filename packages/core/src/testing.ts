@@ -1952,7 +1952,12 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       );
       await s.appendFact(
         runId,
-        Facts.matchArmSelected(runId, "m", "arm", new Date()),
+        Facts.stepAbortRequested({
+          runId,
+          stepId: "s",
+          attempt: A1,
+          at: new Date(),
+        }),
       );
       await endRun(s, runId, "completed");
       const want = [

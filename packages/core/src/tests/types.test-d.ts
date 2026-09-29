@@ -8,15 +8,12 @@ import type {
   FlowIdOf,
   FlowOutput,
   Json,
-  MatchArm,
   NeedsOutputs,
   Queue,
-  ResolvedNeeds,
   RunId,
   RunSummary,
   Step,
   StepCtx,
-  StepMap,
   StepOutput,
   Store,
   Tx,
@@ -26,11 +23,9 @@ import { passthroughSchema } from "./test-helpers";
 declare const taskStep: Step<{ doubled: number }>;
 declare const transcribeStep: Step<{ text: string; recipientEmail: string }>;
 declare const classifyStep: Step<{ category: "hot" | "warm" | "cold" }>;
-declare const scoreStep: Step<{ value: number; intent: boolean }>;
 
 declare const ctxCall: StepCtx<{ callId: string }>;
 declare const builderX: Builder<{ x: number }>;
-declare const builderU: Builder<unknown>;
 declare const factEx: Fact;
 declare const wfEx: Wf;
 
@@ -141,43 +136,6 @@ describe("Builder.task", () => {
       },
       run: async () => null,
     });
-  });
-});
-
-describe("Builder.match — guard mode", () => {
-  it("guard arms can use predicates over needs and produce an arm output type", () => {
-    const route = builderU.match({
-      needs: { s: scoreStep },
-      arms: [
-        {
-          when: ({ needs }) => needs.s.value >= 90,
-          build: (b) => ({
-            f: b.task({ run: async () => ({ tier: "premium" as const }) }),
-          }),
-        },
-        {
-          otherwise: true,
-          build: (b) => ({
-            f: b.task({ run: async () => ({ tier: "default" as const }) }),
-          }),
-        },
-      ],
-    });
-    expectTypeOf<StepOutput<typeof route>>().toMatchTypeOf<{
-      readonly f: { tier: "premium" } | { tier: "default" };
-    }>();
-  });
-
-  it("an arm cannot have both `when` and `otherwise`", () => {
-    type ScoreNeeds = { s: typeof scoreStep };
-    // @ts-expect-error
-    const _badArm: MatchArm<unknown, ScoreNeeds, StepMap> = {
-      when: (args: { input: unknown; needs: ResolvedNeeds<ScoreNeeds> }) =>
-        args.needs.s.intent,
-      otherwise: true,
-      build: (b) => ({ f: b.task({ run: async () => null }) }),
-    };
-    void _badArm;
   });
 });
 
@@ -303,9 +261,6 @@ describe("Fact discriminated union", () => {
         break;
       case "signal.received":
         expectTypeOf(factEx.payload).toEqualTypeOf<Json>();
-        break;
-      case "match.arm-selected":
-        expectTypeOf(factEx.arm).toBeString();
         break;
     }
   });

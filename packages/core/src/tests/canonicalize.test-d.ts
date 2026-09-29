@@ -1,7 +1,6 @@
 import { describe, expectTypeOf, it } from "vitest";
 import type {
   CanonicalDag,
-  CanonicalMatchArm,
   CanonicalRetryPolicy,
   CanonicalSchema,
   CanonicalStep,
@@ -34,19 +33,6 @@ describe("CanonicalDag — type shape", () => {
       CanonicalRetryPolicy["initialDelayMs"]
     >().toEqualTypeOf<number>();
     expectTypeOf<CanonicalRetryPolicy["maxDelayMs"]>().toEqualTypeOf<number>();
-  });
-
-  it("CanonicalMatchArm has id, stepIds, optional whenHash and otherwise", () => {
-    expectTypeOf<CanonicalMatchArm["id"]>().toEqualTypeOf<string>();
-    expectTypeOf<CanonicalMatchArm["stepIds"]>().toEqualTypeOf<
-      readonly string[]
-    >();
-    expectTypeOf<CanonicalMatchArm["whenHash"]>().toEqualTypeOf<
-      string | undefined
-    >();
-    expectTypeOf<CanonicalMatchArm["otherwise"]>().toEqualTypeOf<
-      true | undefined
-    >();
   });
 
   it("canonicalize returns Promise<CanonicalDag>", () => {
