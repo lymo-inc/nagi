@@ -5,7 +5,7 @@ import {
   serializeError,
 } from "./errors";
 import type { Hooks } from "./exec/hooks";
-import { Facts } from "./facts";
+import { Facts, type Release } from "./facts";
 import { type FlowOf, requireCurrent } from "./flows";
 import {
   asStepMapWithDefs,
@@ -52,6 +52,15 @@ export type SignalDecision =
       readonly received: SignalReceivedFact;
       readonly completed: StepCompletedFact;
       readonly result: SettleSignalResult;
+    }
+  // The worker consumed and nothing was buffered: the step parks. Its lease
+  // goes with the park, or the reaper re-dispatches it every lease period for
+  // the whole wait. release-step, not release-lease: it frees every attempt's
+  // lease, including one a dead attempt left behind. The timer stays.
+  | {
+      readonly kind: "park";
+      readonly release: Release;
+      readonly result: SettleSignalResult;
     };
 
 const NOOP: SignalDecision = { kind: "noop", result: { tag: "noop" } };
@@ -78,7 +87,13 @@ export function decideSignal(args: {
 
   if (step.tag === "awaitingSignal") {
     const source = incoming ?? runState.bufferedSignals[stepId];
-    if (source === undefined) return NOOP;
+    if (source === undefined) {
+      return {
+        kind: "park",
+        release: { tag: "release-step", stepId, timer: false },
+        result: { tag: "noop" },
+      };
+    }
     const { attempt } = step;
     return {
       kind: "deliver",

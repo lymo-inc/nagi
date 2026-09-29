@@ -174,6 +174,21 @@ describe("decideSignal — pre-awaiting state buffering (N7 audit pins)", () => 
     expect(d.result.tag).toBe("delivered");
   });
 
+  it("a consume call on an awaiting step with nothing buffered parks and releases the step's leases", () => {
+    const runState = foldRun(runId, startedFacts(runId, stepId));
+    expect(runState.steps[stepId]?.tag).toBe("awaitingSignal");
+    const d = decideSignal({ runState, stepId, at });
+    expect(d.kind).toBe("park");
+    expect(d.result).toEqual({ tag: "noop" });
+    if (d.kind === "park") {
+      expect(d.release).toEqual({
+        tag: "release-step",
+        stepId,
+        timer: false,
+      });
+    }
+  });
+
   it("on terminal step returns noop (no buffer, no throw)", () => {
     const runState = foldRun(runId, [
       Facts.flowStarted({ runId, flowId: "f", input: {}, at: new Date(0) }),

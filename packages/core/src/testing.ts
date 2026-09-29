@@ -692,6 +692,34 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "settleSignal(consume): parking an awaiting step releases its lease and keeps its timer",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });
+      const queue = new InMemoryQueue();
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "gate", { kind: "signal" });
+      ok((await s.claimStep(runId, "gate", A1)) !== null, "claim");
+      const fireAt = new Date(Date.now() + HOUR_MS);
+      await s.upsertTimer(runId, "gate", fireAt);
+      eq(
+        await s.settleSignal({ runId, stepId: "gate", at: new Date() }),
+        { tag: "noop" },
+        "parks",
+      );
+      await sleep(PAST_LEASE_MS);
+      eq(
+        await s.sweepLeases({ now: new Date(), queue }),
+        [],
+        "nothing to reap",
+      );
+      const timedOut = await s.sweepSignalTimeouts({
+        now: new Date(fireAt.getTime() + 1),
+      });
+      eq(timedOut.length, 1, "timer survived the park");
+    },
+  },
+  {
     name: "sweepSignalTimeouts: fails an awaiting step past its deadline with NagiSignalTimeoutError, releases its lease, consumes the timer",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });

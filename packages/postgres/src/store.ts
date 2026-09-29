@@ -496,6 +496,9 @@ class PostgresStore<DB = unknown> implements Store {
             await this.writeFact(trx, runId, decision.received);
             await this.writeFact(trx, runId, decision.completed);
             return decision.result;
+          case "park":
+            await this.applyRelease(trx, runId, decision.release);
+            return decision.result;
         }
       });
   }
