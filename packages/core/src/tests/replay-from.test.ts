@@ -298,6 +298,115 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     expect((await h.result(runId)).status).toBe("completed");
   });
 
+  it("aborts a running descendant of `from` so its stale result cannot stick", async () => {
+    let aRuns = 0;
+    let bAttempts = 0;
+    const f = flow({
+      id: "from-aborts-descendant",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => {
+        const a = b.task({
+          run: async () => {
+            aRuns += 1;
+            return { v: aRuns };
+          },
+        });
+        const bStep = b.task({
+          needs: { a },
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ needs, ctx }) => {
+            bAttempts += 1;
+            if (bAttempts === 1) {
+              for (let i = 0; i < 60; i++) {
+                if (ctx.signal.aborted) throw new Error("aborted");
+                await new Promise((r) => setTimeout(r, 5));
+              }
+            } else {
+              // Outlasts the first run, so an unaborted first run settles first.
+              await new Promise((r) => setTimeout(r, 600));
+            }
+            return { sawA: needs.a.v };
+          },
+        });
+        const c = b.task({
+          needs: { b: bStep },
+          run: async ({ needs }) => needs.b,
+        });
+        return { a, b: bStep, c };
+      },
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    const worker = h.startWorker({ pollIntervalMs: 5 });
+    try {
+      await h.waitForStep(runId, "b", "running", 2_000);
+      await h.wf.replay(runId, { mode: "continue", from: "a" });
+      await h.waitForStep(runId, "c", "completed", 3_000);
+    } finally {
+      await worker.stop();
+    }
+
+    const r = await h.result(runId);
+    expect(r.output("c")).toEqual({ sawA: 2 });
+    expect(r.factsOf("step.abort-requested").map((x) => x.stepId)).toEqual([
+      "b",
+    ]);
+  });
+
+  it.each([
+    ["enqueue", true],
+    ["inline", false],
+  ] as const)("resetting a parked subflow step cancels its old child; only the new child settles it (%s)", async (_, fireHooks) => {
+    const child = flow({
+      id: "from-subflow-child",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        wait: b.signal({
+          timeoutMs: "unbounded" as const,
+          schema: passthroughSchema<{ ok: true }>(),
+        }),
+      }),
+      output: (steps) => steps.wait,
+    });
+    const parent = flow({
+      id: "from-subflow-parent",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({ sub: b.subflow(child, { input: () => ({}) }) }),
+    });
+    const h = await makeHarness([parent, child]);
+    const runId = await h.wf.start(parent, {});
+    await h.drain();
+    expect((await h.result(runId)).stepStatus("sub")).toBe("running");
+    const [oldChild] = await h.store.listChildren(runId);
+    if (oldChild === undefined) throw new Error("expected a child run");
+
+    await h.wf.replay(runId, { mode: "continue", from: "sub", fireHooks });
+    await h.drain();
+
+    expect((await h.store.loadRunState(oldChild)).phase).toMatchObject({
+      tag: "canceled",
+      cause: {
+        kind: "explicit",
+        reason: 'superseded by replay({ from: "sub" })',
+      },
+    });
+    expect((await h.result(runId)).stepStatus("sub")).toBe("running");
+    const newChild = (await h.store.listChildren(runId)).find(
+      (c) => c !== oldChild,
+    );
+    if (newChild === undefined) throw new Error("expected a new child run");
+
+    await h.wf.signal(newChild, "wait", { ok: true });
+    await h.drain();
+
+    const r = await h.result(runId);
+    expect(r.status).toBe("completed");
+    expect(r.output("sub")).toEqual({
+      childRunId: newChild,
+      output: { ok: true },
+    });
+  });
+
   it("throws NagiRuntimeError on a canceled run", async () => {
     const f = flow({
       id: "from-canceled-run",

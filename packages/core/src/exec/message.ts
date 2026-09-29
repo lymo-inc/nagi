@@ -11,7 +11,7 @@ import {
   type SubflowDef,
 } from "../internal";
 import { resolveRetry } from "../retry";
-import { deriveChildRunId } from "../run-id";
+import { currentChildRunId } from "../run-id";
 import { isAbortRequested, isTerminalRun, stepStateOf } from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
@@ -465,7 +465,7 @@ export function makeMessage(
     // logical spawn re-derives the SAME child id (idempotent re-attach); a
     // replay (nagi#6) bumps it and gets a fresh child. See deriveChildRunId.
     const generation = state.resetCounts[stepId] ?? 0;
-    const childRunId = await deriveChildRunId({ runId, stepId, generation });
+    const childRunId = await currentChildRunId(state, stepId);
 
     // Re-entrant: a re-dispatch (lease-reap, or recovery after a lost wake) of a
     // parked subflow step whose child has ALREADY finished settles the parent

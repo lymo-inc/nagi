@@ -1,4 +1,5 @@
 import { validationError } from "./errors";
+import type { RunState } from "./state";
 import type { RunId as RunIdType } from "./types";
 
 // Runtime constructor for the RunId brand. `parse` validates for consumer
@@ -59,4 +60,18 @@ export async function deriveChildRunId(key: {
   );
   const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
   return `run-${uuid}` as RunId;
+}
+
+// The child a step is currently attached to, given its live reset count
+// (generation). Callers that need the id a step spawned/wakes through use
+// this instead of re-deriving `generation` themselves.
+export function currentChildRunId(
+  state: RunState,
+  stepId: string,
+): Promise<RunId> {
+  return deriveChildRunId({
+    runId: state.runId,
+    stepId,
+    generation: state.resetCounts[stepId] ?? 0,
+  });
 }

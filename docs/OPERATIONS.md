@@ -382,9 +382,10 @@ deploy.
 ## Recovery actions
 
 - `wf.replay(runId, { mode: "continue", from: stepId })` — reset the step
-  **and its descendants** and re-dispatch. A `running` step is aborted first
-  (its handler sees `ctx.signal` abort, and replay waits up to 30s for it to
-  settle). Works on a live run — including a `canceled` step holding it open —
+  **and its descendants** and re-dispatch. Every `running` step it resets is
+  aborted first (its handler sees `ctx.signal` abort, and replay waits up to
+  30s in total for them to settle), and a reset subflow step's old child run is
+  canceled. Works on a live run — including a `canceled` step holding it open —
   and on a completed/failed run, which the reset reopens.
 - `wf.replay(runId, { mode: "continue", from: stepId, scope: "step" })` — rerun
   that step, plus any descendant that holds no value (`failed`, `canceled` or

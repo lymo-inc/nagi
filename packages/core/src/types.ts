@@ -915,9 +915,9 @@ export interface ReplayOpts {
   // pending messages, and the run MUST be recovered with mode "continue".
   readonly fireHooks?: boolean;
   // Resets `from` (and, by scope, its descendants), reopening a settled run.
-  // A `running` `from` step is aborted via step.abort-requested and MUST settle
-  // before the reset is written; the descendants to reset are chosen after it
-  // settles.
+  // Every `running` step in the reset set is aborted via step.abort-requested
+  // and MUST settle before the reset is written; the steps to reset are chosen
+  // after they settle. A reset step parked on a subflow has that child canceled.
   readonly from?: StepId;
   // Only meaningful with `from`. Defaults to "cascade".
   readonly scope?: ResetScope;

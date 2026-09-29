@@ -2,6 +2,7 @@ import type { DispatchDeps, EndingRun, RunEnd } from "../dispatch";
 import { NagiCanceledError } from "../errors";
 import { Facts, runCancelCause } from "../facts";
 import { type FlowResolution, requireCurrent } from "../flows";
+import { currentChildRunId } from "../run-id";
 import { nextTransition, type SkipDecision } from "../scheduler";
 import {
   isTerminalRun,
@@ -324,6 +325,14 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
           childRunId,
           parentStepStatus: stepStatusOf(parentStep),
         },
+      });
+      return;
+    }
+    if ((await currentChildRunId(parentState, parentStepId)) !== childRunId) {
+      deps.emitLog({
+        level: "info",
+        msg: "nagi: subflow wake skipped — child is from a superseded generation",
+        attrs: { parentRunId, parentStepId, childRunId },
       });
       return;
     }

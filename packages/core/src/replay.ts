@@ -7,6 +7,7 @@ import {
 import { Facts } from "./facts";
 import type { FlowRegistry, FlowResolution } from "./flows";
 import { compact } from "./internal";
+import { currentChildRunId } from "./run-id";
 import { resetFactsOf } from "./scheduler";
 import { isStepTerminal, isTerminalRun, stepStateOf } from "./state";
 import type {
@@ -94,74 +95,102 @@ export function makeReplay(deps: ReplayDeps): {
     }
     const { flow } = resolution;
 
-    if (opts.from !== undefined) {
-      if (!(opts.from in flow.steps)) {
-        throw validationError(
-          `replay({ from }): step "${opts.from}" is not a step in flow "${flow.id}".`,
-          ["from"],
-        );
-      }
-      await abortInFlight(runState, opts.from);
-      // Descendants can settle during the abort wait; the reset set is chosen
-      // from their state.
-      const current = await store.loadRunState(runId);
-      const resets = resetFactsOf(flow, current, {
-        runId,
-        stepId: opts.from,
-        at: clock.now(),
-        ...compact({ scope: opts.scope }),
-      });
-      for (const fact of resets) await store.appendFact(runId, fact);
+    if (opts.from !== undefined && !(opts.from in flow.steps)) {
+      throw validationError(
+        `replay({ from }): step "${opts.from}" is not a step in flow "${flow.id}".`,
+        ["from"],
+      );
     }
 
     const run: ReplayedRun = { runId, flow };
-    if (opts.fireHooks !== false) {
-      await deps.dispatcherFor({ kind: "enqueue", run }).advance(runId);
-      return;
-    }
-    const inline = makeInlineQueue(queue);
-    const dispatcher = deps.dispatcherFor({
-      kind: "inline",
-      run,
-      queue: inline,
-    });
+    const inline =
+      opts.fireHooks === false ? makeInlineQueue(queue) : undefined;
+    const dispatcher = deps.dispatcherFor(
+      inline === undefined
+        ? { kind: "enqueue", run }
+        : { kind: "inline", run, queue: inline },
+    );
     try {
+      if (opts.from !== undefined) {
+        await resetFrom(flow, runState, opts.from, opts.scope, dispatcher);
+      }
       await dispatcher.advance(runId);
-      await drainInline(dispatcher, inline);
+      if (inline !== undefined) await drainInline(dispatcher, inline);
     } finally {
-      await inline.handOff();
+      await inline?.handOff();
     }
   }
 
-  // A lease reap can start a newer attempt while we wait (the one we aborted
-  // was dead), so every attempt that starts is aborted in turn: resetting
-  // under a live attempt would let its pre-reset result settle the step.
-  async function abortInFlight(state: RunState, stepId: StepId): Promise<void> {
-    if (stepStateOf(state, stepId).tag !== "running") return;
+  async function resetFrom(
+    flow: Flow,
+    runState: RunState,
+    from: StepId,
+    scope: ReplayOpts["scope"],
+    dispatcher: Dispatcher,
+  ): Promise<void> {
+    const { runId } = runState;
+    const origin = { runId, stepId: from, ...compact({ scope }) };
+    const inFlight = resetFactsOf(flow, runState, {
+      ...origin,
+      at: clock.now(),
+    }).map((f) => f.stepId);
+    await abortInFlight(runState, inFlight);
+    // Descendants can settle during the abort wait; the reset set is chosen
+    // from their state.
+    const current = await store.loadRunState(runId);
+    const resets = resetFactsOf(flow, current, { ...origin, at: clock.now() });
+    for (const fact of resets) await store.appendFact(runId, fact);
+
+    // After the resets, so the old child's end finds its parent step no longer
+    // awaitingChild and cannot settle it.
+    for (const { stepId } of resets) {
+      if (stepStateOf(current, stepId).tag !== "awaitingChild") continue;
+      await dispatcher.cancel(await currentChildRunId(current, stepId), {
+        cause: "explicit",
+        reason: `superseded by replay({ from: "${from}" })`,
+      });
+    }
+  }
+
+  // Every running member of stepIds is aborted under one shared deadline. A
+  // lease reap can start a newer attempt while we wait (the one we aborted was
+  // dead), so every attempt that starts is aborted in turn: resetting under a
+  // live attempt would let its pre-reset result settle the step.
+  async function abortInFlight(
+    state: RunState,
+    stepIds: readonly StepId[],
+  ): Promise<void> {
+    const waiting = new Map<StepId, number>();
+    for (const id of stepIds) {
+      if (stepStateOf(state, id).tag === "running") waiting.set(id, 0);
+    }
     const { runId } = state;
-    let aborted = 0;
     const start = Date.now();
-    for (let s = state; ; s = await store.loadRunState(runId)) {
-      const step = stepStateOf(s, stepId);
-      if (step.tag === "pending" || isStepTerminal(step) || isTerminalRun(s)) {
-        return;
-      }
-      if (step.tag === "running" && step.attempt > aborted) {
-        aborted = step.attempt;
-        await store.appendFact(
-          runId,
-          Facts.stepAbortRequested({
+    for (let s = state; waiting.size > 0; s = await store.loadRunState(runId)) {
+      if (isTerminalRun(s)) return;
+      for (const [stepId, aborted] of waiting) {
+        const step = stepStateOf(s, stepId);
+        if (step.tag === "pending" || isStepTerminal(step)) {
+          waiting.delete(stepId);
+        } else if (step.tag === "running" && step.attempt > aborted) {
+          waiting.set(stepId, step.attempt);
+          await store.appendFact(
             runId,
-            stepId,
-            attempt: step.attempt,
-            at: clock.now(),
-          }),
-        );
+            Facts.stepAbortRequested({
+              runId,
+              stepId,
+              attempt: step.attempt,
+              at: clock.now(),
+            }),
+          );
+        }
       }
+      const [stuck] = waiting;
+      if (stuck === undefined) return;
       if (Date.now() - start >= ABORT_SETTLE_DEADLINE_MS) {
         throw new NagiRuntimeError(
-          `replay({ from }): timed out after ${ABORT_SETTLE_DEADLINE_MS}ms waiting for step "${stepId}" ` +
-            `(attempt ${aborted}) to honor abort signal. Handler may be ignoring ctx.signal.`,
+          `replay({ from }): timed out after ${ABORT_SETTLE_DEADLINE_MS}ms waiting for step "${stuck[0]}" ` +
+            `(attempt ${stuck[1]}) to honor abort signal. Handler may be ignoring ctx.signal.`,
         );
       }
       await new Promise((r) => setTimeout(r, ABORT_SETTLE_POLL_MS));
