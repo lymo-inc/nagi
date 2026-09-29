@@ -93,13 +93,6 @@ const cases: readonly Case[] = [
     end: (h, id) => h.wf.cancel(id, { reason: "stop" }),
     message: /was canceled: stop/,
   },
-  {
-    name: "operator abort",
-    mode: "park",
-    phase: "canceled",
-    end: (h, id) => h.wf.operator().abort(id, { actor: "alice", note: "why" }),
-    message: /was canceled by alice: why/,
-  },
 ];
 
 describe("run termination — every end fires the error hooks and wakes the parent with one error", () => {

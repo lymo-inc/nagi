@@ -36,18 +36,9 @@ export interface FlowCanceledExplicitlyFact extends FactBase {
   readonly note?: string;
 }
 
-export interface FlowCanceledByOperatorFact extends FactBase {
-  readonly kind: "flow.canceled";
-  readonly cause: "operator";
-  readonly actor: string;
-  readonly reason: string;
-  readonly note?: string;
-}
-
 export type FlowCanceledFact =
   | FlowCanceledByConcurrencyFact
-  | FlowCanceledExplicitlyFact
-  | FlowCanceledByOperatorFact;
+  | FlowCanceledExplicitlyFact;
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
@@ -55,8 +46,8 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
 
 // Derived from the fact types so cancel intent can't drift from the recorded
 // fact. Concurrency cancellation is system-internal and intentionally excluded.
-export type CancelArgs = DistributiveOmit<
-  FlowCanceledExplicitlyFact | FlowCanceledByOperatorFact,
+export type CancelArgs = Omit<
+  FlowCanceledExplicitlyFact,
   "kind" | "runId" | "at"
 >;
 
@@ -164,13 +155,6 @@ export function runCancelCause(
     case "explicit":
       return {
         kind: "explicit",
-        reason: fact.reason,
-        ...compact({ note: fact.note }),
-      };
-    case "operator":
-      return {
-        kind: "operator",
-        actor: fact.actor,
         reason: fact.reason,
         ...compact({ note: fact.note }),
       };

@@ -933,7 +933,7 @@ class PostgresStore<DB = unknown> implements Store {
       case "skipped":
         return this.settleStepRow(trx, runId, delta, null, null, null);
       case "reset": {
-        // Reopen a completed/failed run (replay, operator.retry). Read the
+        // Reopen a completed/failed run (replay({ from })). Read the
         // identity first: after a unique violation the tx is aborted and no
         // further SELECT would succeed.
         const row = await sql<{

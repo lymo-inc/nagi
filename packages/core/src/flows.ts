@@ -68,7 +68,7 @@ export function requireCurrent(resolution: FlowResolution): Flow {
 }
 
 // The one answer to "which Flow runs this run", for every consumer: dispatch,
-// signals, the operator, lifecycle, cancel and replay.
+// signals, lifecycle, cancel and replay.
 export type FlowOf = (runId: RunId) => Promise<FlowResolution>;
 
 // Under "synthesize" a drifted run, live or settled, resolves to its pinned

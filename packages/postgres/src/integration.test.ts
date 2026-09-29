@@ -1185,7 +1185,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
   });
 
   describe("step.reset — reopens a settled run via PG", () => {
-    it("operator.retry on a failed run reopens it and describe() reports completed", async () => {
+    it("replay({ from }) on a failed run reopens it and describe() reports completed", async () => {
       let shouldFail = true;
       const f = flow({
         id: "pg-reopen-retry",
@@ -1211,7 +1211,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(failed?.run.completedAt).toBeDefined();
 
       shouldFail = false;
-      await wf.operator().retry(runId, "s", { actor: "ops" });
+      await wf.replay(runId, { mode: "continue", from: "s" });
       // The reset materialized status = 'running', so runToEnd waits for the
       // re-run instead of returning on the stale 'failed'.
       await runToEnd(wf, runId);
@@ -1223,7 +1223,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(await loadOutput(db, schema, runId)).toEqual({ ok: true });
     }, 20_000);
 
-    it("operator.retry rejects with NagiConcurrencyConflictError when another run holds the key", async () => {
+    it("replay({ from }) rejects with NagiConcurrencyConflictError when another run holds the key", async () => {
       let shouldFail = true;
       const f = flow({
         id: "pg-reopen-conflict",
@@ -1258,7 +1258,7 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
       expect(await loadStatus(db, schema, run2)).toBe("running");
 
       await expect(
-        wf.operator().retry(run1, "s", { actor: "ops" }),
+        wf.replay(run1, { mode: "continue", from: "s" }),
       ).rejects.toBeInstanceOf(NagiConcurrencyConflictError);
 
       // The conflict rolled the appendFact transaction back: no reset fact,

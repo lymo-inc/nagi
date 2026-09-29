@@ -795,7 +795,7 @@ export type RunEvent =
     }
   | {
       readonly type: "flow.canceled";
-      readonly cause: "explicit" | "operator";
+      readonly cause: "explicit";
     }
   | {
       readonly type: "step.started";
@@ -1001,29 +1001,10 @@ export interface ReplayOpts {
   // false drains a private in-memory queue: a crash mid-replay loses its
   // pending messages, and the run MUST be recovered with mode "continue".
   readonly fireHooks?: boolean;
+  // Resets `from` (and, by scope, its descendants), reopening a settled run.
+  // A `running` `from` step is aborted via step.abort-requested and MUST settle
+  // before the reset is written.
   readonly from?: StepId;
   // Only meaningful with `from`. Defaults to "cascade".
   readonly scope?: ResetScope;
-}
-
-export interface OperatorAuditOpts {
-  readonly actor: string;
-  readonly note?: string;
-}
-
-export interface OperatorRetryOpts extends OperatorAuditOpts {
-  // Defaults to "cascade" — the historical behavior.
-  readonly scope?: ResetScope;
-}
-
-export interface Operator {
-  skip(runId: RunId, stepId: StepId, opts: OperatorAuditOpts): Promise<void>;
-
-  // For a `running` step, MUST first abort the in-flight handler via
-  // step.abort-requested and wait for it to settle before resetting.
-  // `opts.scope: "step"` reruns ONLY this step, leaving completed descendants
-  // untouched (they keep outputs derived from the old value).
-  retry(runId: RunId, stepId: StepId, opts: OperatorRetryOpts): Promise<void>;
-
-  abort(runId: RunId, opts: OperatorAuditOpts): Promise<void>;
 }

@@ -133,7 +133,7 @@ describe("wf.watchRun", () => {
     const afterTerminal = seen.length;
 
     // Reopening the settled run must not reach the auto-disposed watcher.
-    await h.wf.operator().retry(runId, "only", { actor: "ops", scope: "step" });
+    await h.wf.replay(runId, { mode: "continue", from: "only", scope: "step" });
     await h.drain();
     expect(seen).toHaveLength(afterTerminal);
   });

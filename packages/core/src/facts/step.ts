@@ -60,29 +60,23 @@ export interface StepSkippedFact extends FactBase {
   readonly kind: "step.skipped";
   readonly stepId: StepId;
   readonly reason: SkipReason;
-  readonly actor?: string;
-  readonly note?: string;
 }
 
 export interface StepResetFact extends FactBase {
   readonly kind: "step.reset";
   readonly stepId: StepId;
   readonly cascadedFrom?: StepId;
-  // The operator's INTENT, recorded on the origin step only. Absence of
+  // The caller's INTENT, recorded on the origin step only. Absence of
   // cascadedFrom siblings cannot be read as "isolated": a leaf step has no
-  // descendants either, so a cascading retry on a leaf looks identical. Omitted
+  // descendants either, so a cascading reset on a leaf looks identical. Omitted
   // for "cascade" so existing facts keep their shape.
   readonly scope?: ResetScope;
-  readonly actor?: string;
-  readonly note?: string;
 }
 
 export interface StepAbortRequestedFact extends FactBase {
   readonly kind: "step.abort-requested";
   readonly stepId: StepId;
   readonly attempt: AttemptNumber;
-  readonly actor: string;
-  readonly note?: string;
 }
 
 export interface MatchArmSelectedFact extends FactBase {
@@ -174,8 +168,6 @@ export const stepFacts = {
     readonly stepId: StepId;
     readonly at: Date;
     readonly reason: SkipReason;
-    readonly actor?: string;
-    readonly note?: string;
   }): StepSkippedFact {
     return {
       kind: "step.skipped",
@@ -183,7 +175,6 @@ export const stepFacts = {
       stepId: a.stepId,
       reason: a.reason,
       at: a.at,
-      ...compact({ actor: a.actor, note: a.note }),
     };
   },
 
@@ -193,8 +184,6 @@ export const stepFacts = {
     readonly at: Date;
     readonly cascadedFrom?: StepId;
     readonly scope?: ResetScope;
-    readonly actor?: string;
-    readonly note?: string;
   }): StepResetFact {
     return {
       kind: "step.reset",
@@ -204,8 +193,6 @@ export const stepFacts = {
       ...compact({
         cascadedFrom: a.cascadedFrom,
         scope: a.scope === "cascade" ? undefined : a.scope,
-        actor: a.actor,
-        note: a.note,
       }),
     };
   },
@@ -215,17 +202,13 @@ export const stepFacts = {
     readonly stepId: StepId;
     readonly attempt: AttemptNumber;
     readonly at: Date;
-    readonly actor: string;
-    readonly note?: string;
   }): StepAbortRequestedFact {
     return {
       kind: "step.abort-requested",
       runId: a.runId,
       stepId: a.stepId,
       attempt: a.attempt,
-      actor: a.actor,
       at: a.at,
-      ...compact({ note: a.note }),
     };
   },
 
@@ -406,7 +389,6 @@ export const stepKinds = {
     }),
   },
   "step.skipped": {
-    // An operator may skip an in-flight step, not just a pending one.
     fold: (draft, fact) =>
       foldStep(draft, fact.stepId, (prev) =>
         isStepTerminal(prev) ? prev : { tag: "skipped", reason: fact.reason },
@@ -433,8 +415,8 @@ export const stepKinds = {
       delete draft.selectedArms[fact.stepId];
       // A reset step must wait for a fresh signal, never replay the old one.
       delete draft.bufferedSignals[fact.stepId];
-      // A run with a pending step is not settled. Reset reopens completed/failed
-      // (replay, operator.retry); canceled stays canceled — retry rejects those.
+      // A run with a pending step is not settled. Reset reopens completed/failed;
+      // canceled stays canceled — replay rejects those.
       if (draft.phase.tag === "completed" || draft.phase.tag === "failed") {
         draft.phase = { tag: "running" };
       }

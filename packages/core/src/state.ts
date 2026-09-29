@@ -10,7 +10,7 @@ import type {
   StepStatus,
 } from "./types";
 
-export type SkipReason = "when-false" | "transitive" | "manual";
+export type SkipReason = "when-false" | "transitive";
 
 export type StepCancelCause =
   | { readonly kind: "run-canceled" }
@@ -24,12 +24,6 @@ export type RunCancelCause =
     }
   | {
       readonly kind: "explicit";
-      readonly reason: string;
-      readonly note?: string;
-    }
-  | {
-      readonly kind: "operator";
-      readonly actor: string;
       readonly reason: string;
       readonly note?: string;
     };

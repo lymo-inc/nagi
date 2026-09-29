@@ -172,7 +172,7 @@ export function makeMessage(
     ) {
       // Settled step on a live run: re-drive. On a settled run there is nothing
       // to drive — but do NOT skip non-terminal steps of a completed/failed run:
-      // operator.retry / replay reset steps on such runs and re-dispatch them.
+      // replay({ from }) resets steps on such runs and re-dispatches them.
       return isTerminalRun(preState) ? { tag: "skip" } : { tag: "recover" };
     }
 

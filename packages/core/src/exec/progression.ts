@@ -77,11 +77,6 @@ function cancelCauseToError(
         name: "NagiCanceledError",
         message: `Run ${runId} was canceled: ${cause.reason}`,
       };
-    case "operator":
-      return {
-        name: "NagiCanceledError",
-        message: `Run ${runId} was canceled by ${cause.actor}: ${cause.reason}`,
-      };
   }
 }
 
@@ -286,10 +281,7 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
       await cancel(childId, {
         cause: "explicit",
         reason: `parent ${runId} canceled: ${args.reason}`,
-        note:
-          args.cause === "operator"
-            ? `cascade from operator ${args.actor} aborting parent ${runId}`
-            : `cascade from parent ${runId}`,
+        note: `cascade from parent ${runId}`,
       });
     }
 

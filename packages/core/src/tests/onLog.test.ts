@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
+import { Facts } from "../facts";
 import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
 import { nagi } from "../runtime";
 import { stepStateOf, stepStatusOf } from "../state";
@@ -179,33 +180,6 @@ describe("onLog — record shape & level routing", () => {
     }
   });
 
-  it("operator.skip-noop: one info entry when the target step is already terminal", async () => {
-    const { onLog, entries } = spyOnLog();
-    const f = flow({
-      id: "skip-noop",
-      input: passthroughSchema<Record<string, never>>(),
-      build: (b) => ({
-        a: b.task({ run: async () => ({ ok: true }) }),
-      }),
-    });
-    const h = await makeHarness(f, { onLog });
-    const runId = await h.wf.start(f, {});
-    await h.drain();
-    await h.wf.operator().skip(runId, "a", { actor: "tester" });
-
-    const noop = entries.filter(
-      (e) => e.msg === "nagi: operator.skip noop — step already terminal",
-    );
-    expect(noop).toHaveLength(1);
-    const entry = noop[0] as LogEntry;
-    expect(entry.level).toBe("info");
-    expect(entry.attrs).toMatchObject({
-      runId,
-      stepId: "a",
-      status: "completed",
-    });
-  });
-
   it("subflow-wake (parent run terminal): info entry when child finishes after parent canceled", async () => {
     const { onLog, entries } = spyOnLog();
     const child = flow({
@@ -283,10 +257,14 @@ describe("onLog — record shape & level routing", () => {
     await h.drain();
     const childRunId = (await h.store.listChildren(parentRunId))[0] as RunId;
 
-    await h.wf.operator().skip(parentRunId, "sub", { actor: "tester" });
+    // A reset written without its advance: the parent step is pending.
+    await h.store.appendFact(
+      parentRunId,
+      Facts.stepReset({ runId: parentRunId, stepId: "sub", at: new Date() }),
+    );
     const parentState = await h.store.loadRunState(parentRunId);
     expect(parentState.phase.tag).toBe("running");
-    expect(stepStatusOf(stepStateOf(parentState, "sub"))).toBe("skipped");
+    expect(stepStatusOf(stepStateOf(parentState, "sub"))).toBe("pending");
 
     await h.wf.signal(childRunId, "gate", { ok: true });
     await h.drain();
@@ -302,7 +280,7 @@ describe("onLog — record shape & level routing", () => {
       parentRunId,
       parentStepId: "sub",
       childRunId,
-      parentStepStatus: "skipped",
+      parentStepStatus: "pending",
     });
   });
 

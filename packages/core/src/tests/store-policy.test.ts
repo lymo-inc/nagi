@@ -212,7 +212,6 @@ describe("factConsequences — the release table", () => {
         stepId: "s",
         attempt: A1,
         at: AT,
-        actor: "op",
       }),
       Facts.signalReceived({ runId: R, stepId: "s", payload: null, at: AT }),
       Facts.signalBuffered({ runId: R, stepId: "s", payload: null, at: AT }),

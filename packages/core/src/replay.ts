@@ -4,9 +4,11 @@ import {
   NagiSnapshotDriftError,
   validationError,
 } from "./errors";
+import { Facts } from "./facts";
 import type { FlowRegistry, FlowResolution } from "./flows";
 import { compact } from "./internal";
 import { resetFactsOf } from "./scheduler";
+import { attemptOf, isStepTerminal, isTerminalRun, stepStateOf } from "./state";
 import type {
   Clock,
   DriftPolicy,
@@ -15,6 +17,8 @@ import type {
   QueueMessage,
   ReplayOpts,
   RunId,
+  RunState,
+  StepId,
   Store,
 } from "./types";
 
@@ -73,8 +77,7 @@ export function makeReplay(deps: ReplayDeps): {
     const runState = await store.loadRunState(runId);
     if (runState.phase.tag === "canceled") {
       throw new NagiRuntimeError(
-        `Run ${runId} was canceled (superseded by a newer run with the same concurrency key). ` +
-          `Replay is not supported for canceled runs — start a new run instead.`,
+        `Run ${runId} was canceled. Replay is not supported for canceled runs — start a new run instead.`,
       );
     }
     if (opts.mode === "inspect") return;
@@ -92,18 +95,13 @@ export function makeReplay(deps: ReplayDeps): {
     const { flow } = resolution;
 
     if (opts.from !== undefined) {
-      if (runState.phase.tag === "running") {
-        throw new NagiRuntimeError(
-          `Run ${runId} is still running — replay({ from }) would race in-flight workers. ` +
-            `Wait for the run to settle (completed / failed) before resetting from a step.`,
-        );
-      }
       if (!(opts.from in flow.steps)) {
         throw validationError(
           `replay({ from }): step "${opts.from}" is not a step in flow "${flow.id}".`,
           ["from"],
         );
       }
+      await abortInFlight(runState, opts.from);
       const resets = resetFactsOf(flow, {
         runId,
         stepId: opts.from,
@@ -132,8 +130,46 @@ export function makeReplay(deps: ReplayDeps): {
     }
   }
 
+  async function abortInFlight(state: RunState, stepId: StepId): Promise<void> {
+    const step = stepStateOf(state, stepId);
+    if (step.tag !== "running") return;
+    const { runId } = state;
+    await store.appendFact(
+      runId,
+      Facts.stepAbortRequested({
+        runId,
+        stepId,
+        attempt: step.attempt,
+        at: clock.now(),
+      }),
+    );
+    const start = Date.now();
+    while (Date.now() - start < ABORT_SETTLE_DEADLINE_MS) {
+      const s = await store.loadRunState(runId);
+      const ss = s.steps[stepId];
+      if (
+        ss === undefined ||
+        isStepTerminal(ss) ||
+        isTerminalRun(s) ||
+        attemptOf(ss) > step.attempt
+      ) {
+        return;
+      }
+      await new Promise((r) => setTimeout(r, ABORT_SETTLE_POLL_MS));
+    }
+    throw new NagiRuntimeError(
+      `replay({ from }): timed out after ${ABORT_SETTLE_DEADLINE_MS}ms waiting for step "${stepId}" ` +
+        `(attempt ${step.attempt}) to honor abort signal. Handler may be ignoring ctx.signal.`,
+    );
+  }
+
   return { replay };
 }
+
+// Wall-clock bounds (not the injected clock): the abort waits on a real
+// handler that may be ignoring ctx.signal, so these must elapse in real time.
+const ABORT_SETTLE_DEADLINE_MS = 30_000;
+const ABORT_SETTLE_POLL_MS = 50;
 
 const MAX_REPLAY_DISPATCHES = 4096;
 async function drainInline(

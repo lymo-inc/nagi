@@ -46,7 +46,7 @@ function gate() {
 }
 
 describe("signal step reset", () => {
-  it("re-parks after operator.retry instead of replaying the old payload, and accepts a new signal", async () => {
+  it("re-parks after replay({ from }) instead of replaying the old payload, and accepts a new signal", async () => {
     const f = gate();
     const h = await makeHarness(f);
     const runId = await h.wf.start(f, {});
@@ -55,7 +55,7 @@ describe("signal step reset", () => {
     await h.drain();
     expect((await h.result(runId)).output("answer")).toEqual({ text: "first" });
 
-    await h.wf.operator().retry(runId, "answer", { actor: "ops" });
+    await h.wf.replay(runId, { mode: "continue", from: "answer" });
     await h.drain();
 
     const parked = await h.store.loadRunState(runId);
