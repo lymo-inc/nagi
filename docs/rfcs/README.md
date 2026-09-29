@@ -9,7 +9,7 @@ Research notes and implementation handoffs sit next to the RFC they belong to.
 | 0002 | [Record-literal builder API](0002-record-literal-builder-api.md) | [research](0002-research.md) |
 | 0003 | [Auto-compute `codeVersion` from registered flows](0003-auto-code-version.md) | [research](0003-auto-code-version.research.md) |
 | 0004 | [Multi-name signal waits](0004-multi-name-signal-waits.md) | [research](0004-multi-name-signal-waits.research.md) |
-| 0005 | `wf.queryRuns()` — removed; list runs with SQL (see [OPERATIONS](../OPERATIONS.md)) | [research + plan](0005-query-runs.research.md) (no separate RFC) |
+| 0005 | `wf.queryRuns()` — removed; list runs with SQL (see [OPERATIONS](../OPERATIONS.md#reading-runs-with-sql)) | [research + plan](0005-query-runs.research.md) (no separate RFC) |
 | 0009 | `wf.pruneFacts()` | [research + plan](0009-prune-facts.research.md) (no separate RFC) |
 | 0010 | [OTel parent-span linkage for subflow runs](0010-otel-subflow-span-linkage.md) — removed along with `@nagi-js/otel` | [handoff](0010-otel-subflow-span-linkage.handoff.md) |
 | 0011 | [Extract `nextTransition` from the `advance` loop](0011-next-transition-state-machine.md) | [handoff](0011-next-transition-state-machine.handoff.md) |

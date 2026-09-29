@@ -193,6 +193,57 @@ If you override `pgmqQueue({ visibilityTimeoutMs })` or
 otherwise every step longer than the visibility timeout is redelivered before
 its first lease extension (defaults: 40s interval, 120s visibility).
 
+## Reading runs with SQL
+
+For one run, use `wf.describe(runId)`. To list or filter runs, or to join them
+to your own tables, query the store's tables directly. The columns below are a
+read contract: a migration may add columns, but it will not rename, retype or
+drop these without a changeset that says so. Everything else in the schema
+(`fact`, `dedupe`, snapshot tables, other columns) is internal. Never write to
+any nagi table.
+
+`workflow_run`, one row per run:
+
+| column               | type        | meaning                                                            |
+| -------------------- | ----------- | ------------------------------------------------------------------ |
+| `run_id`             | text        | primary key                                                        |
+| `flow_id`            | text        |                                                                    |
+| `status`             | text        | `pending` `running` `completed` `failed` `canceled`                |
+| `input`              | jsonb       | the validated flow input                                           |
+| `output`             | jsonb       | set when `completed`                                               |
+| `error`              | jsonb       | a `SerializedError` when `failed`                                  |
+| `started_at`         | timestamptz |                                                                    |
+| `completed_at`       | timestamptz | set on every terminal status; cleared if a replay reopens the run  |
+| `canceled_by_run_id` | text        | the superseding run, for a concurrency cancel                      |
+| `parent_run_id`      | text        | set on a subflow child, with `parent_step_id`                      |
+| `parent_step_id`     | text        |                                                                    |
+
+`step_run`, one row per started step (primary key `(run_id, step_id)`), updated
+in place to its latest attempt. A replay's reset deletes the row until the step
+starts again:
+
+| column         | type        | meaning                                                                  |
+| -------------- | ----------- | ------------------------------------------------------------------------ |
+| `run_id`       | text        |                                                                          |
+| `step_id`      | text        |                                                                          |
+| `attempt`      | integer     | starts at 1; 0 for a step skipped before it ever ran                     |
+| `status`       | text        | `running` `completed` `failed` `canceled` `skipped`; a step parked on a signal or child reads `running` |
+| `output`       | jsonb       |                                                                          |
+| `error`        | jsonb       | a `SerializedError`; set on a `running` row while it backs off to retry  |
+| `started_at`   | timestamptz |                                                                          |
+| `completed_at` | timestamptz |                                                                          |
+
+For monitoring, `lease (run_id, step_id, attempt, expires_at)` has a row while
+an attempt holds its lease, and `timer (run_id, step_id, fire_at)` has a row
+while a signal wait's timeout is pending.
+
+`input @> '{"key": "value"}'` is served by a GIN index (`jsonb_path_ops`), and
+`(flow_id, status)`, `completed_at` and `parent_run_id` are indexed. Rows are
+written in the same transaction as the fact that changes them, so a reader never
+sees a status the fact log does not back. `pruneFacts` deletes `step_run`,
+`lease` and `timer` rows of pruned runs, and the `workflow_run` row too unless
+`keepSummary` is set.
+
 ## Watching runs live
 
 `wf.watchRun(runId, handler)` and `wf.watchRuns(handler)` push lifecycle events
