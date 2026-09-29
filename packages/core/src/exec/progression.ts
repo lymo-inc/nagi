@@ -120,6 +120,13 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
         case "settled":
         case "waiting":
           return;
+        case "stalled":
+          deps.emitLog({
+            level: "warn",
+            msg: "nagi: run stalled on canceled step(s) — replay({ from }) to recover",
+            attrs: { runId, stepIds: t.canceled },
+          });
+          return;
         case "complete":
           await terminate(
             { kind: "resolved", runId, flow },

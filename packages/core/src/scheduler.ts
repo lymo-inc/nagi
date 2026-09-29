@@ -124,7 +124,10 @@ export function flowTermination(
   let failure: SerializedError | undefined;
   for (const stepId of Object.keys(flow.steps)) {
     const state = stepStateOf(runState, stepId);
-    if (!isStepTerminal(state)) return { kind: "running" };
+    // A canceled step on a live run is neither success nor an end: it waits
+    // for replay({ from }). (A canceled RUN never reaches here — it is settled.)
+    if (!isStepTerminal(state) || state.tag === "canceled")
+      return { kind: "running" };
     if (state.tag === "failed" && failure === undefined) failure = state.error;
   }
   if (failure !== undefined) return { kind: "failed", error: failure };
@@ -141,6 +144,7 @@ export type Transition =
     }
   | { readonly kind: "skip"; readonly skip: readonly SkipDecision[] }
   | { readonly kind: "settled" }
+  | { readonly kind: "stalled"; readonly canceled: readonly StepId[] }
   | { readonly kind: "waiting" };
 
 export function nextTransition(flow: Flow, runState: RunState): Transition {
@@ -160,7 +164,33 @@ export function nextTransition(flow: Flow, runState: RunState): Transition {
   const { runnable, skip } = nextRunnable({ flow, runState, input });
   if (runnable.length > 0) return { kind: "dispatch", runnable, skip };
   if (skip.length > 0) return { kind: "skip", skip };
-  return { kind: "waiting" };
+  const canceled = canceledStepsIfIdle(flow, runState);
+  return canceled.length > 0
+    ? { kind: "stalled", canceled }
+    : { kind: "waiting" };
+}
+
+// A step in one of these tags has a handler in flight, or is about to — the
+// run is not idle yet, so a canceled step elsewhere cannot be called a stall.
+const IN_FLIGHT_TAGS: ReadonlySet<StepState["tag"]> = new Set([
+  "running",
+  "awaitingSignal",
+  "awaitingChild",
+  "backoff",
+  "aborting",
+]);
+
+function canceledStepsIfIdle(
+  flow: Flow,
+  runState: RunState,
+): readonly StepId[] {
+  const canceled: StepId[] = [];
+  for (const stepId of Object.keys(flow.steps)) {
+    const state = stepStateOf(runState, stepId);
+    if (state.tag === "canceled") canceled.push(stepId as StepId);
+    else if (IN_FLIGHT_TAGS.has(state.tag)) return [];
+  }
+  return canceled;
 }
 
 export function computeFlowOutput(flow: Flow, runState: RunState): Json {

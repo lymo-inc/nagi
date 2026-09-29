@@ -174,6 +174,9 @@ export function makeMessage(
       return isTerminalRun(preState) ? { tag: "skip" } : { tag: "recover" };
     }
 
+    // Aborted on a live run: only replay({ from }) re-drives it.
+    if (preStep.tag === "canceled") return { tag: "skip" };
+
     const claim = await store.claimStep(runId, stepId, attempt);
     if (claim === null) return { tag: "skip" };
 

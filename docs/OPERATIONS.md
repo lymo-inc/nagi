@@ -110,6 +110,7 @@ const q = await wf.inspectQueue(runId); // in-queue messages for the run
 | running, signal step `running`    | no entries                     | Parked on a signal/child — check the signal source, not the pool |
 | running, no lease, no entries     | —                              | Advance was lost — self-heals on next redelivery; `replay(runId, { mode: "continue", from: stepId })` re-drives immediately |
 | any status                        | entry with high `readCount`    | Redelivery loop — see poison messages below                      |
+| running, a step `canceled`        | —                              | Stalled on an abort whose replay did not finish (logged as `run stalled on canceled step(s)`) — `wf.replay(runId, { mode: "continue", from: stepId })` |
 
 ## Nothing is being consumed (fleet-wide stall)
 
