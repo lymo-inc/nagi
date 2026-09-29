@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { NagiRuntimeError, NagiValidationError } from "../errors";
 import { Facts } from "../facts";
-import type { AttemptNumber, RunId, StepResetFact } from "../types";
+import type {
+  AttemptNumber,
+  RunId,
+  StepErrorEvent,
+  StepResetFact,
+} from "../types";
 import { type Harness, makeHarness, passthroughSchema } from "./test-helpers";
 
 // Attempt 1's worker claims the step, starts it, and dies; the reaper then
@@ -159,6 +164,50 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     expect(r.factCount("step.abort-requested")).toBe(1);
     expect(r.factCount("step.canceled")).toBe(1);
     expect(r.status).toBe("completed");
+  });
+
+  it("fires onStepError once for the aborted attempt, naming replay({ from })", async () => {
+    let aAttempts = 0;
+    const f = flow({
+      id: "from-in-flight-onstep-error",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ ctx }) => {
+            aAttempts += 1;
+            if (aAttempts === 1) {
+              for (let i = 0; i < 200; i++) {
+                if (ctx.signal.aborted) throw new Error("aborted");
+                await new Promise((r) => setTimeout(r, 5));
+              }
+              return { ran: 1 };
+            }
+            return { ran: 2 };
+          },
+        }),
+      }),
+    });
+    const stepErrors: StepErrorEvent[] = [];
+    const h = await makeHarness(f, {
+      hooks: {
+        onStepError: (e) => {
+          stepErrors.push(e);
+        },
+      },
+    });
+    const runId = await h.wf.start(f, {});
+    const worker = h.startWorker({ pollIntervalMs: 5 });
+    try {
+      await h.waitForStep(runId, "a", "running", 2_000);
+      await h.wf.replay(runId, { mode: "continue", from: "a" });
+      await h.waitForStep(runId, "a", "completed", 3_000);
+    } finally {
+      await worker.stop();
+    }
+    expect(stepErrors).toHaveLength(1);
+    expect(stepErrors[0]?.attempt).toBe(1);
+    expect(stepErrors[0]?.error.message).toContain("replay({ from })");
   });
 
   it("after a lease reap, aborts the re-dispatched attempt rather than the dead one", async () => {

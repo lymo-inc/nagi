@@ -18,6 +18,7 @@ import {
   classifyFailure,
   makeActivityCtx,
   makeStepCtx,
+  NagiAbortError,
   resolveExecutionFact,
   startCancelWatcher,
   startDeadline,
@@ -30,7 +31,9 @@ import type {
   QueueMessage,
   RunId,
   RunState,
+  SerializedError,
   StepCtx,
+  StepEvent,
   StreamingStepCtx,
   Tx,
 } from "../types";
@@ -40,7 +43,24 @@ import type { Progression } from "./progression";
 type Dispatched =
   | { readonly tag: "completed"; readonly output: Json }
   | { readonly tag: "advance" }
-  | { readonly tag: "parked" };
+  | { readonly tag: "parked" }
+  | { readonly tag: "canceled"; readonly cause: "run" | "step" };
+
+type ExecOutcome = ReturnType<typeof resolveExecutionFact>["outcome"];
+
+// A standalone exhaustive switch, so reading `outcome` here isn't subject to
+// the control-flow narrowing loss that a closure-mutated `let` suffers at the
+// call site (see executeHandler's `settle`).
+function dispatchedOf(outcome: ExecOutcome, output: Json): Dispatched {
+  switch (outcome) {
+    case "completed":
+      return { tag: "completed", output };
+    case "run-canceled":
+      return { tag: "canceled", cause: "run" };
+    case "aborted":
+      return { tag: "canceled", cause: "step" };
+  }
+}
 
 type Admission =
   | { readonly tag: "skip" }
@@ -75,6 +95,20 @@ export function makeMessage(
 ): MessageHandler {
   const { fireHook, fireStepLifecycle } = hooks;
   const { advance } = progression;
+
+  // A canceled step fires the global onStepError (not the step-level onError,
+  // which is business logic) so a tracing consumer sees every step end exactly
+  // once.
+  async function fireStepCanceled(
+    base: Omit<StepEvent, "at">,
+    error: SerializedError,
+  ): Promise<void> {
+    await fireHook(
+      deps.hooks?.onStepError,
+      { ...base, error, at: deps.clock.now() },
+      "onStepError",
+    );
+  }
 
   async function dispatchMessage(
     message: QueueMessage,
@@ -294,6 +328,14 @@ export function makeMessage(
     switch (outcome.tag) {
       case "parked":
         return;
+      case "canceled":
+        // No advance: a run-canceled advance was already a no-op, and an
+        // aborted step is re-driven by replay({ from }), as before.
+        await fireStepCanceled(
+          { runId, flowId: flow.id, stepId, attempt, kind: def.kind },
+          serializeError(new NagiAbortError(runId, outcome.cause)),
+        );
+        return;
       case "advance":
         await advance(runId);
         return;
@@ -384,7 +426,7 @@ export function makeMessage(
       emitLog: deps.emitLog,
     };
 
-    let abortedHere = false;
+    let outcome: ExecOutcome = "completed";
     const settle = async (output: Json, tx: Tx) => {
       // A body that honored the deadline by returning still timed out.
       if (ac.signal.reason instanceof NagiStepTimeoutError)
@@ -397,7 +439,7 @@ export function makeMessage(
         output,
         at: clock.now(),
       });
-      abortedHere = resolved.abortedHere;
+      outcome = resolved.outcome;
       return { output, fact: resolved.fact };
     };
 
@@ -444,7 +486,7 @@ export function makeMessage(
           break;
         }
       }
-      return abortedHere ? { tag: "parked" } : { tag: "completed", output };
+      return dispatchedOf(outcome, output);
     } finally {
       await watcher.stop();
       deadline?.stop();
@@ -531,6 +573,13 @@ export function makeMessage(
             outcome.includeError ? error : undefined,
           ),
         );
+        const cause = postState.phase.tag === "canceled" ? "run" : "step";
+        await fireStepCanceled(
+          base,
+          outcome.includeError
+            ? error
+            : serializeError(new NagiAbortError(runId, cause)),
+        );
         return outcome.advanceAfter ? { tag: "advance" } : { tag: "parked" };
       }
       case "retry": {
@@ -572,6 +621,7 @@ export function makeMessage(
           runId,
           Facts.stepCanceled(runId, stepId, attempt, clock.now(), error),
         );
+        await fireStepCanceled(base, error);
         await progression.terminate(
           { kind: "resolved", runId, flow },
           {
