@@ -759,9 +759,8 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       for (const status of ["completed", "failed"] as const) {
-        const flowId = fid();
         const runId = rid();
-        await startRun(s, runId, { flowId });
+        await startRun(s, runId);
         await startStep(s, runId, "s");
         await endRun(s, runId, status);
         await s.appendFact(
@@ -773,12 +772,9 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
           "running",
           `fold after flow.${status}`,
         );
-        const { runs } = await s.queryRuns({
-          where: { flowId, status: ["running"] },
-        });
         eq(
-          runs.map((r) => r.runId),
-          [runId],
+          (await s.describe(runId))?.run.status,
+          "running",
           `read model after flow.${status}`,
         );
       }
@@ -1253,179 +1249,6 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
-    name: "queryRuns: orders by (startedAt DESC, runId DESC)",
-    async run(h) {
-      const s = await h.makeStore({ leaseMs: LEASE_MS });
-      const flowId = fid();
-      const t0 = new Date(1_700_000_000_000);
-      const t1 = new Date(1_700_000_001_000);
-      const base = crypto.randomUUID();
-      const a = `run-${base}-a` as RunId;
-      const b = `run-${base}-b` as RunId;
-      const c = `run-${base}-c` as RunId;
-      const later = `run-${base}-0` as RunId;
-      for (const runId of [b, a, c])
-        await startRun(s, runId, { flowId, at: t0 });
-      await startRun(s, later, { flowId, at: t1 });
-      const r = await s.queryRuns({ where: { flowId } });
-      eq(
-        r.runs.map((x) => x.runId),
-        [later, c, b, a],
-        "order",
-      );
-      eq(r.cursor, null, "single page");
-    },
-  },
-  {
-    name: "queryRuns: input containment follows jsonb @> — subset, nested, arrays, empty object, type mismatch",
-    async run(h) {
-      const s = await h.makeStore({ leaseMs: LEASE_MS });
-      const flowId = fid();
-      await startRun(s, rid(), {
-        flowId,
-        input: { videoId: "abc", userId: 7 },
-      });
-      await startRun(s, rid(), {
-        flowId,
-        input: { customer: { id: 1, plan: { seats: 5 } } },
-      });
-      await startRun(s, rid(), { flowId, input: { tags: ["a", "b", "c"] } });
-      await startRun(s, rid(), { flowId, input: { x: "string" } });
-      const count = async (input: Record<string, Json>) =>
-        (await s.queryRuns({ where: { flowId, input } })).runs.length;
-      eq(await count({ videoId: "abc" }), 1, "subset of keys");
-      eq(await count({ videoId: "abc", userId: 7 }), 1, "all keys");
-      eq(await count({ videoId: "abc", missing: 1 }), 0, "superset of keys");
-      eq(await count({ videoId: "MISS" }), 0, "value mismatch");
-      eq(await count({ customer: { plan: { seats: 5 } } }), 1, "nested");
-      eq(await count({ customer: {} }), 1, "empty object matches any object");
-      eq(await count({ tags: ["a", "b"] }), 1, "array subset");
-      eq(await count({ tags: ["b", "a"] }), 1, "array order-insensitive");
-      eq(await count({ tags: ["a", "z"] }), 0, "array with a missing element");
-      eq(await count({ x: 42 }), 0, "type mismatch");
-      eq(await count({}), 4, "empty filter matches all");
-    },
-  },
-  {
-    name: "queryRuns: filters by flowId and status",
-    async run(h) {
-      const s = await h.makeStore({ leaseMs: LEASE_MS });
-      const flowId = fid();
-      const running = rid();
-      const completed = rid();
-      const failed = rid();
-      await startRun(s, running, { flowId });
-      await startRun(s, completed, { flowId });
-      await endRun(s, completed, "completed");
-      await startRun(s, failed, { flowId });
-      await endRun(s, failed, "failed");
-      await startRun(s, rid(), { flowId: fid() });
-      eq((await s.queryRuns({ where: { flowId } })).runs.length, 3, "flowId");
-      const terminal = await s.queryRuns({
-        where: { flowId, status: ["completed", "failed"] },
-      });
-      eq(
-        terminal.runs.map((r) => r.runId).sort(),
-        [completed, failed].sort(),
-        "status array",
-      );
-      const one = await s.queryRuns({
-        where: { flowId, status: ["completed"] },
-      });
-      eq(
-        one.runs.map((r) => r.status),
-        ["completed"],
-        "single status",
-      );
-      ok(one.runs[0]?.completedAt instanceof Date, "completedAt populated");
-    },
-  },
-  {
-    name: "queryRuns: latest:true returns the single newest matching run and no cursor",
-    async run(h) {
-      const s = await h.makeStore({ leaseMs: LEASE_MS });
-      const flowId = fid();
-      await startRun(s, rid(), { flowId, at: new Date(1_700_000_000_000) });
-      const newest = rid();
-      await startRun(s, newest, { flowId, at: new Date(1_700_000_005_000) });
-      await startRun(s, rid(), { flowId, at: new Date(1_700_000_002_000) });
-      const r = await s.queryRuns({ where: { flowId }, latest: true });
-      eq(
-        r.runs.map((x) => x.runId),
-        [newest],
-        "newest",
-      );
-      eq(r.cursor, null, "no cursor");
-      eq(
-        await s.queryRuns({ where: { flowId: fid() }, latest: true }),
-        { runs: [], cursor: null },
-        "no match",
-      );
-    },
-  },
-  {
-    name: "queryRuns: cursor pagination visits every row exactly once and ends with a null cursor",
-    async run(h) {
-      const s = await h.makeStore({ leaseMs: LEASE_MS });
-      const flowId = fid();
-      const seeded: RunId[] = [];
-      for (let i = 0; i < 5; i++) {
-        const runId = rid();
-        seeded.push(runId);
-        await startRun(s, runId, {
-          flowId,
-          at: new Date(1_700_000_000_000 + i * 1000),
-        });
-      }
-      const seen: RunId[] = [];
-      let cursor: string | null = null;
-      let pages = 0;
-      do {
-        const page = await s.queryRuns({
-          where: { flowId },
-          limit: 2,
-          ...(cursor !== null ? { cursor } : {}),
-        });
-        ok(page.runs.length <= 2, "page size");
-        seen.push(...page.runs.map((r) => r.runId));
-        cursor = page.cursor;
-        pages++;
-      } while (cursor !== null && pages < 10);
-      eq(pages, 3, "three pages");
-      eq([...seen].sort(), [...seeded].sort(), "every row once");
-    },
-  },
-  {
-    name: "queryRuns: rejects a malformed cursor",
-    async run(h) {
-      const s = await h.makeStore({ leaseMs: LEASE_MS });
-      await rejects(s.queryRuns({ cursor: "not-a-cursor" }), "throws");
-    },
-  },
-  {
-    name: "queryRuns: a non-positive or non-integer limit falls back to the default",
-    async run(h) {
-      const s = await h.makeStore({ leaseMs: LEASE_MS });
-      const flowId = fid();
-      for (let i = 0; i < 3; i++) await startRun(s, rid(), { flowId });
-      eq(
-        (await s.queryRuns({ where: { flowId }, limit: 0 })).runs.length,
-        3,
-        "0",
-      );
-      eq(
-        (await s.queryRuns({ where: { flowId }, limit: 1.5 })).runs.length,
-        3,
-        "1.5",
-      );
-      eq(
-        (await s.queryRuns({ where: { flowId }, limit: 2 })).runs.length,
-        2,
-        "2",
-      );
-    },
-  },
-  {
     name: "describe: returns null for an unknown runId",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
@@ -1495,11 +1318,10 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     name: "describe: a retried step is ONE view of its latest attempt, timestamped by its facts' `at`",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
-      const flowId = fid();
       const runId = rid();
       const t = (n: number) => new Date(1_700_000_000_000 + n * 1000);
       const error = { name: "E", message: "boom" };
-      await startRun(s, runId, { flowId, at: t(0) });
+      await startRun(s, runId, { at: t(0) });
       await s.appendFact(
         runId,
         Facts.stepStarted(runId, "s", A1, "task", t(1)),
@@ -1536,9 +1358,8 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         "attempt 2 supersedes attempt 1; a stale attempt-1 start changes nothing",
       );
       eq(
-        (await s.queryRuns({ where: { flowId, status: ["running"] } })).runs
-          .length,
-        1,
+        (await s.describe(runId))?.run.status,
+        "running",
         "a retry leaves the run running",
       );
 
@@ -1564,10 +1385,6 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       );
       eq(d?.run.startedAt, t(0), "run startedAt");
       eq(d?.run.completedAt, t(6), "run completedAt");
-      const [summary] = (
-        await s.queryRuns({ where: { flowId, status: ["completed"] } })
-      ).runs;
-      eq(summary?.completedAt, t(6), "queryRuns completedAt");
     },
   },
   {
@@ -1774,7 +1591,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
-    name: "pruneFacts keepSummary:true: the run stays queryable and describable with no steps, and its runId stays reserved",
+    name: "pruneFacts keepSummary:true: the run stays describable with no steps, and its runId stays reserved",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       const flowId = fid();
@@ -1790,12 +1607,9 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         batchSize: 100,
         keepSummary: true,
       });
-      const q = await s.queryRuns({ where: { flowId } });
-      eq(q.runs.length, 1, "still listed");
-      eq(q.runs[0]?.runId, runId, "runId");
-      eq(q.runs[0]?.status, "completed", "status");
-      eq(q.runs[0]?.input, { keep: 1 }, "input");
       const d = await s.describe(runId);
+      eq(d?.run.runId, runId, "describe runId");
+      eq(d?.run.flowId, flowId, "describe flowId");
       eq(d?.run.status, "completed", "describe status");
       eq(d?.run.input, { keep: 1 }, "describe input");
       eq(d?.steps, [], "no steps");
@@ -1822,7 +1636,6 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         batchSize: 100,
         keepSummary: false,
       });
-      eq((await s.queryRuns({ where: { flowId } })).runs, [], "not listed");
       eq(await s.describe(runId), null, "not describable");
       eq(
         (await startRun(s, runId, { flowId })).started,

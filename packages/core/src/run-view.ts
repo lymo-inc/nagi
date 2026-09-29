@@ -9,7 +9,7 @@ import type {
 
 // Step-level run status — exposes the durable lifecycle states an inspector
 // cares about. `pending` is reserved on the materialized column but never
-// projected here; surfaced statuses match RunSummary's RunStatus shape.
+// projected here; surfaced statuses match the RunStatus shape.
 export type StepRunStatus = StepStatus;
 
 export interface RunView {

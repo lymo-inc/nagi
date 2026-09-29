@@ -18,13 +18,7 @@ import type { RunDescription, StepView } from "./run-view";
 import { decideSignal, decideTimeout } from "./signals";
 import {
   admitsRunEnd,
-  clampQueryLimit,
-  compareRunOrder,
   DEFAULT_SWEEP_LIMIT,
-  decodeRunCursor,
-  encodeRunCursor,
-  isPastCursor,
-  jsonContains,
   type PruneCandidate,
   type Superseded,
   selectExpired,
@@ -45,8 +39,6 @@ import type {
   Millis,
   PruneOpts,
   PruneResult,
-  QueryRunsOpts,
-  QueryRunsResult,
   Queue,
   QueueDequeueOpts,
   QueueEnqueueOpts,
@@ -56,7 +48,6 @@ import type {
   RunEventTransport,
   RunId,
   RunState,
-  RunSummary,
   SettleSignalResult,
   StepCanceledFact,
   StepCompletedFact,
@@ -515,42 +506,6 @@ export class InMemoryStore implements Store {
     return this.globalFacts;
   }
 
-  async queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult> {
-    const where = opts.where ?? {};
-    const wanted = where.status && new Set(where.status);
-
-    const matches = (summary: RunSummary): boolean =>
-      (where.flowId === undefined || summary.flowId === where.flowId) &&
-      (!wanted || wanted.has(summary.status)) &&
-      (where.input === undefined || jsonContains(summary.input, where.input));
-
-    const summaries: RunSummary[] = [];
-    for (const [runId, row] of this.runRows) {
-      const summary = summaryOf(runId, row);
-      if (matches(summary)) summaries.push(summary);
-    }
-    summaries.sort(compareRunOrder);
-
-    if (opts.latest === true) {
-      return { runs: summaries.slice(0, 1), cursor: null };
-    }
-
-    const limit = clampQueryLimit(opts.limit);
-    const cursor =
-      opts.cursor === undefined ? null : decodeRunCursor(opts.cursor);
-    const rest =
-      cursor === null
-        ? summaries
-        : summaries.filter((s) => isPastCursor(s, cursor));
-    const page = rest.slice(0, limit);
-    const last = page[page.length - 1];
-    const next =
-      rest.length > limit && last !== undefined
-        ? encodeRunCursor({ startedAt: last.startedAt, runId: last.runId })
-        : null;
-    return { runs: page, cursor: next };
-  }
-
   async describe(runId: RunId): Promise<RunDescription> {
     const row = this.runRows.get(runId);
     if (row === undefined) return null;
@@ -668,17 +623,6 @@ export class InMemoryStore implements Store {
 
 interface PruneVictim extends PruneCandidate {
   readonly factCount: number;
-}
-
-function summaryOf(runId: RunId, row: RunRow): RunSummary {
-  return {
-    runId,
-    flowId: row.flowId,
-    status: row.status,
-    startedAt: row.startedAt,
-    completedAt: row.completedAt,
-    input: row.input,
-  };
 }
 
 // Postgres: ORDER BY started_at ASC NULLS LAST, step_id ASC.

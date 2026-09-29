@@ -11,8 +11,6 @@ import type {
   PrunableStatus,
   PruneOpts,
   PruneResult,
-  QueryRunsOpts,
-  QueryRunsResult,
   Queue,
   ReapedLease,
   Release,
@@ -24,7 +22,6 @@ import type {
   RunId,
   RunState,
   RunStatus,
-  RunSummary,
   RunView,
   SerializedError,
   SettleSignalResult,
@@ -43,13 +40,10 @@ import type {
 } from "@nagi-js/core";
 import {
   admitsRunEnd,
-  clampQueryLimit,
   DEFAULT_SWEEP_LIMIT,
   decideExpiredLeaseAction,
   decideSignal,
   decideTimeout,
-  decodeRunCursor,
-  encodeRunCursor,
   factConsequences,
   InMemoryRunEventHub,
   InMemoryStreamHub,
@@ -1078,74 +1072,6 @@ class PostgresStore<DB = unknown> implements Store {
       INSERT INTO ${sql.raw(this.t("global_fact"))} (fact_id, kind, at, payload)
       VALUES (${uuidv7()}, ${fact.kind}, ${fact.at}, ${jsonb(serializeGlobalFactPayload(fact))})
     `.execute(this.db);
-  }
-
-  async queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult> {
-    const where = opts.where ?? {};
-    const flowId = where.flowId;
-    const statuses = where.status ? Array.from(where.status) : undefined;
-    // Typed null: an untyped `$n IS NULL` cannot be planned.
-    const inputJson =
-      where.input === undefined ? null : JSON.stringify(where.input);
-
-    const isLatest = opts.latest === true;
-    const limit = isLatest ? 1 : clampQueryLimit(opts.limit);
-    const cursor =
-      !isLatest && opts.cursor !== undefined
-        ? decodeRunCursor(opts.cursor)
-        : null;
-
-    const fetchLimit = isLatest ? 1 : limit + 1;
-
-    const rows = await sql<{
-      run_id: string;
-      flow_id: string;
-      status: RunStatus;
-      input: Json;
-      started_at: Date;
-      completed_at: Date | null;
-    }>`
-      SELECT run_id, flow_id, status, input, started_at, completed_at
-        FROM ${sql.raw(this.t("workflow_run"))}
-       WHERE (${flowId ?? null}::text IS NULL OR flow_id = ${flowId ?? null})
-         AND (${statuses === undefined ? null : statuses}::text[] IS NULL
-              OR status = ANY(${statuses === undefined ? null : statuses}::text[]))
-         AND (${inputJson}::jsonb IS NULL OR input @> ${inputJson}::jsonb)
-         AND (${cursor === null ? null : cursor.startedAt}::timestamptz IS NULL
-              OR (started_at, run_id) <
-                 (${cursor === null ? null : cursor.startedAt}::timestamptz,
-                  ${cursor === null ? null : cursor.runId}::text))
-       ORDER BY started_at DESC, run_id DESC
-       LIMIT ${fetchLimit}
-    `.execute(this.db);
-
-    const summaries: RunSummary[] = rows.rows.map((r) => ({
-      runId: r.run_id as RunId,
-      flowId: r.flow_id,
-      status: r.status,
-      startedAt:
-        r.started_at instanceof Date ? r.started_at : new Date(r.started_at),
-      completedAt:
-        r.completed_at === null
-          ? null
-          : r.completed_at instanceof Date
-            ? r.completed_at
-            : new Date(r.completed_at),
-      input: r.input,
-    }));
-
-    if (isLatest) {
-      return { runs: summaries.slice(0, 1), cursor: null };
-    }
-
-    const hasMore = summaries.length > limit;
-    const page = hasMore ? summaries.slice(0, limit) : summaries;
-    const last = page[page.length - 1];
-    const nextCursor =
-      hasMore && last !== undefined
-        ? encodeRunCursor({ startedAt: last.startedAt, runId: last.runId })
-        : null;
-    return { runs: page, cursor: nextCursor };
   }
 
   async describe(runId: RunId): Promise<RunDescription> {

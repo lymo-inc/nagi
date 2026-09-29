@@ -533,8 +533,7 @@ export interface TimedOutSignal {
 // Every MUST below is a case in `storeContract` (@nagi-js/core/testing); run it
 // against any new adapter. Decisions an adapter must not re-make are core pure
 // functions: factConsequences, admitsRunEnd, supersede, decideSignal /
-// decideTimeout / decideExpiredLeaseAction, the queryRuns cursor codec,
-// selectExpired, selectPruneBatch.
+// decideTimeout / decideExpiredLeaseAction, selectExpired, selectPruneBatch.
 export interface Store {
   // Every fact this Store writes, through any method, MUST get all of its
   // factConsequences (rows, releases, stream close, run event) in the same
@@ -699,16 +698,10 @@ export interface Store {
 
   appendGlobalFact(fact: GlobalFact): Promise<void>;
 
-  // queryRuns, describe and pruneFacts MUST answer from the rows the facts'
-  // `rows` deltas materialize, applied as nextRunRow / nextStepRow do, never by
+  // describe and pruneFacts MUST answer from the rows the facts' `rows`
+  // deltas materialize, applied as nextRunRow / nextStepRow do, never by
   // re-deriving them from the log. Every timestamp is a fact's `at`, never the
   // store's clock.
-
-  // MUST order by (startedAt DESC, runId DESC) with cursors from
-  // encodeRunCursor / decodeRunCursor and limits from clampQueryLimit, and
-  // treat opts.where.input as JSONB containment (Postgres `@>`; jsonContains
-  // is the reference).
-  queryRuns(opts: QueryRunsOpts): Promise<QueryRunsResult>;
 
   // MUST return null (never throw) for an unknown runId. One StepView per
   // step, its latest attempt: a retry supersedes the view in place, a settled
@@ -807,40 +800,6 @@ export interface StreamTransport {
 
   // Fire-and-forget and out-of-band — MUST NOT be routed through `tx`.
   publishChunk(runId: RunId, stepId: StepId, chunk: Json): void;
-}
-
-export interface QueryRunsWhere<FlowId extends string = string> {
-  readonly flowId?: FlowId;
-  readonly status?: ReadonlyArray<RunStatus>;
-  readonly input?: Record<string, Json>;
-}
-
-export type QueryRunsOpts<FlowId extends string = string> =
-  | {
-      readonly where?: QueryRunsWhere<FlowId>;
-      readonly latest: true;
-      readonly limit?: never;
-      readonly cursor?: never;
-    }
-  | {
-      readonly where?: QueryRunsWhere<FlowId>;
-      readonly latest?: false;
-      readonly limit?: number;
-      readonly cursor?: string;
-    };
-
-export interface RunSummary<FlowId extends string = string> {
-  readonly runId: RunId;
-  readonly flowId: FlowId;
-  readonly status: RunStatus;
-  readonly startedAt: Date;
-  readonly completedAt: Date | null;
-  readonly input: Json;
-}
-
-export interface QueryRunsResult<FlowId extends string = string> {
-  readonly runs: ReadonlyArray<RunSummary<FlowId>>;
-  readonly cursor: string | null;
 }
 
 export type PrunableStatus = Extract<

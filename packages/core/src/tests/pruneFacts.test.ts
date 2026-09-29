@@ -98,9 +98,17 @@ describe("InMemoryStore.pruneFacts — selection", () => {
     const r = await store.pruneFacts(defaults({ olderThan: new Date(10_000) }));
     expect(r.runsPruned).toBe(3);
     expect(r.factsPruned).toBe(6);
-    const remaining = await store.queryRuns({});
-    expect(remaining.runs.map((s) => s.runId)).toContain(runIds[3]);
-    expect(remaining.runs).toHaveLength(4);
+    const statuses = await Promise.all(
+      runIds.map(async (id) => (await store.describe(id))?.run.status),
+    );
+    expect(statuses).toEqual([
+      "completed",
+      "completed",
+      "completed",
+      "running",
+    ]);
+    const running = await store.loadRunState(runIds[3] as RunId);
+    expect(running.facts).toHaveLength(1);
   });
 
   it("respects the olderThan cutoff", async () => {
@@ -184,18 +192,19 @@ describe("InMemoryStore.pruneFacts — selection", () => {
         terminal: { kind: "completed", atMs: 2000 + i },
       });
     }
-    const { store } = await seedRuns(cases);
+    const { store, runIds } = await seedRuns(cases);
     const r = await store.pruneFacts(
       defaults({ olderThan: new Date(10_000), batchSize: 2 }),
     );
     expect(r).toEqual({ runsPruned: 5, factsPruned: 10 });
-    const kept = await store.queryRuns({ where: { status: ["completed"] } });
-    expect(kept.runs).toHaveLength(5);
+    for (const id of runIds) {
+      expect((await store.describe(id))?.run.status).toBe("completed");
+    }
   });
 });
 
 describe("InMemoryStore.pruneFacts — keepSummary", () => {
-  it("keepSummary: true → run still listed by queryRuns", async () => {
+  it("keepSummary: true → run still describable", async () => {
     const { store, runIds } = await seedRuns([
       {
         flowId: "f",
@@ -208,15 +217,15 @@ describe("InMemoryStore.pruneFacts — keepSummary", () => {
     await store.pruneFacts(
       defaults({ olderThan: new Date(10_000), keepSummary: true }),
     );
-    const r = await store.queryRuns({});
-    expect(r.runs).toHaveLength(1);
-    expect(r.runs[0]?.runId).toBe(runId);
-    expect(r.runs[0]?.status).toBe("completed");
-    expect(r.runs[0]?.input).toEqual({ videoId: "abc" });
+    const d = await store.describe(runId as RunId);
+    expect(d?.run.runId).toBe(runId);
+    expect(d?.run.status).toBe("completed");
+    expect(d?.run.input).toEqual({ videoId: "abc" });
+    expect(d?.steps).toEqual([]);
   });
 
-  it("keepSummary: false → run no longer listed by queryRuns", async () => {
-    const { store } = await seedRuns([
+  it("keepSummary: false → run no longer describable", async () => {
+    const { store, runIds } = await seedRuns([
       {
         flowId: "f",
         startedAtMs: 1000,
@@ -226,8 +235,7 @@ describe("InMemoryStore.pruneFacts — keepSummary", () => {
     await store.pruneFacts(
       defaults({ olderThan: new Date(10_000), keepSummary: false }),
     );
-    const r = await store.queryRuns({});
-    expect(r.runs).toEqual([]);
+    expect(await store.describe(runIds[0] as RunId)).toBeNull();
   });
 
   it("keepSummary: true → tryStartRun with the same runId returns started:false", async () => {
