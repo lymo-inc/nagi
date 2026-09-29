@@ -1,3 +1,4 @@
+import { validationError } from "./errors";
 import {
   attachDef,
   compact,
@@ -33,6 +34,32 @@ import type {
   TaskConfig,
 } from "./types";
 
+const MAX_TIMER_MS = 2_147_483_647;
+
+// Node's setTimeout treats any delay above 2^31-1ms, below 1, or NaN as 1ms —
+// an unrepresentable deadline would fire on every attempt instead of the one
+// the caller configured. Reject at build time rather than at every runtime
+// attempt.
+function assertHandlerTimeout(ms: number | undefined): void {
+  if (ms === undefined) return;
+  if (!Number.isInteger(ms) || ms < 1 || ms > MAX_TIMER_MS) {
+    throw validationError(
+      `timeoutMs must be an integer between 1 and ${MAX_TIMER_MS} (got ${ms}). Omit it for no deadline.`,
+      ["timeoutMs"],
+    );
+  }
+}
+
+function assertSignalTimeout(ms: number | "unbounded"): void {
+  if (ms === "unbounded") return;
+  if (!Number.isFinite(ms) || ms < 1) {
+    throw validationError(
+      `timeoutMs must be "unbounded" or a finite number >= 1 (got ${ms}).`,
+      ["timeoutMs"],
+    );
+  }
+}
+
 function makeBuilder<Input>(): Builder<Input> {
   function handler<N extends NeedsMap, O>(
     kind: HandlerKind,
@@ -41,6 +68,7 @@ function makeBuilder<Input>(): Builder<Input> {
       | ActivityConfig<Input, N, O>
       | StreamingTaskConfig<Input, N, O, unknown>,
   ): Step<O> {
+    assertHandlerTimeout(config.timeoutMs);
     const def: HandlerDef = {
       kind,
       needs: normalizeNeeds(config.needs),
@@ -61,6 +89,7 @@ function makeBuilder<Input>(): Builder<Input> {
   function signal<N extends NeedsMap, S extends StandardSchemaV1>(
     config: SignalConfig<Input, N, S>,
   ): Step<InferSchemaOutput<S>> {
+    assertSignalTimeout(config.timeoutMs);
     const def: SignalDef = {
       kind: "signal",
       needs: normalizeNeeds(config.needs),

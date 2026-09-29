@@ -1,5 +1,5 @@
 import type { DispatchDeps, DispatchResult } from "../dispatch";
-import { serializeError } from "../errors";
+import { NagiStepTimeoutError, serializeError } from "../errors";
 import { Facts } from "../facts";
 import {
   asStepMapWithDefs,
@@ -382,6 +382,9 @@ export function makeMessage(
 
     let abortedHere = false;
     const settle = async (output: Json) => {
+      // A body that honored the deadline by returning still timed out.
+      if (ac.signal.reason instanceof NagiStepTimeoutError)
+        throw ac.signal.reason;
       const resolved = resolveExecutionFact({
         postState: await store.loadRunState(runId),
         runId,
@@ -399,16 +402,29 @@ export function makeMessage(
         settle(await body(makeStepCtx({ ...ctxArgs, tx }))),
       );
 
+    // A handler aborted by its deadline rarely rethrows our error — unwrap at
+    // the source so only what the handler itself threw is relabelled, never a
+    // later commit failure.
+    const runBody = async (body: () => Promise<Json>): Promise<Json> => {
+      try {
+        return await body();
+      } catch (err) {
+        throw unwrapDeadline(err, ac.signal);
+      }
+    };
+
     try {
       let output: Json;
       switch (def.kind) {
         case "task":
-          output = await inTx((ctx) => def.run({ input, needs, ctx }));
+          output = await inTx((ctx) =>
+            runBody(() => def.run({ input, needs, ctx })),
+          );
           break;
         case "streaming":
           output = await inTx((base) =>
             withEmit(runId, stepId, base, (ctx) =>
-              def.run({ input, needs, ctx }),
+              runBody(() => def.run({ input, needs, ctx })),
             ),
           );
           break;
@@ -417,7 +433,7 @@ export function makeMessage(
         // in a short runStep tx, through the same settle as a task.
         case "activity": {
           const ctx = makeActivityCtx(ctxArgs);
-          const out = await def.run({ input, needs, ctx });
+          const out = await runBody(() => def.run({ input, needs, ctx }));
           output = await store.runStep<Json>(runId, stepId, attempt, () =>
             settle(out),
           );
@@ -425,8 +441,6 @@ export function makeMessage(
         }
       }
       return abortedHere ? { tag: "parked" } : { tag: "completed", output };
-    } catch (err) {
-      throw unwrapDeadline(err, ac.signal);
     } finally {
       await watcher.stop();
       deadline?.stop();
