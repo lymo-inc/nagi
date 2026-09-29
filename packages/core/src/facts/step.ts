@@ -338,7 +338,7 @@ export const stepKinds = {
       completedAt: fact.at,
     }),
     release: (fact) => releaseStep(fact.stepId, false),
-    stream: null,
+    stream: (fact) => ({ tag: "close-ok", stepId: fact.stepId }),
     event: (fact) => ({
       type: "step.canceled",
       stepId: fact.stepId,

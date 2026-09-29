@@ -26,6 +26,8 @@ export type RemovedSurface = [
   Removed<core.NagiConfig, "streamTransport">,
   Removed<typeof postgres, "postgresTrigger">,
   Removed<postgres.PostgresStoreOpts, "notifyChannel">,
+  Removed<core.WorkerRunUntilEmptyOpts, "deadline">,
+  Removed<typeof core, "isStreamOver">,
 ];
 export const removedSurfaceOk: RemovedSurface extends true[] ? true : never =
   true;

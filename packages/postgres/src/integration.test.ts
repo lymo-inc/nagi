@@ -1476,11 +1476,9 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
         flows: [flowB],
         driftPolicy: "synthesize",
       });
-      // deadline is an absolute epoch ms (compared against clock.now()), not
-      // a duration — InMemoryClock.now() returns the real wall clock.
       await wfB
         .worker({ timerSweepIntervalMs: 0 })
-        .runUntilEmpty({ deadline: Date.now() + 10_000 });
+        .runUntilEmpty({ timeoutMs: 10_000 });
 
       expect(await loadStatus(db, schema, runId)).toBe("completed");
       const described = await wfB.describe(runId);

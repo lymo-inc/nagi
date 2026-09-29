@@ -140,13 +140,17 @@ describe("factConsequences — stream effects", () => {
   const streamOf = (fact: Fact) => factConsequences(fact).stream;
   const error = { name: "E", message: "x" };
 
-  it("closes the step on completion or terminal failure, signals retry with the NEXT attempt", () => {
+  it("closes the step when it completes, fails for good or is canceled; signals retry with the NEXT attempt", () => {
     expect(streamOf(Facts.stepCompleted(R, "s", A1, null, AT))).toEqual({
       tag: "close-ok",
       stepId: "s",
     });
     expect(streamOf(Facts.stepFailed(R, "s", A1, error, AT))).toEqual({
       tag: "close-error",
+      stepId: "s",
+    });
+    expect(streamOf(Facts.stepCanceled(R, "s", A1, AT))).toEqual({
+      tag: "close-ok",
       stepId: "s",
     });
     expect(streamOf(Facts.stepRetried(R, "s", A1, AT, error, AT))).toEqual({
@@ -164,7 +168,6 @@ describe("factConsequences — stream effects", () => {
     ]) {
       expect(streamOf(fact)).toEqual({ tag: "close-run" });
     }
-    expect(streamOf(Facts.stepCanceled(R, "s", A1, AT))).toBeNull();
     expect(streamOf(Facts.stepStarted(R, "s", A1, "task", AT))).toBeNull();
   });
 });

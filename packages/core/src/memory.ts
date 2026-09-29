@@ -25,7 +25,7 @@ import {
   selectPruneBatch,
   supersede,
 } from "./store-policy";
-import { InMemoryStreamHub, isStreamOver } from "./stream-hub";
+import { InMemoryStreamHub, streamEndOf } from "./stream-hub";
 import type {
   AttemptNumber,
   ClaimToken,
@@ -619,7 +619,10 @@ export class InMemoryStore implements Store {
       opts?: { readonly replayBuffered?: boolean },
     ): AsyncIterable<StreamEvent<Json>> => {
       // Delegating to a finished step would open a channel that hangs.
-      if (isStreamOver(foldRun(runId, this.facts.get(runId) ?? []), stepId)) {
+      if (
+        streamEndOf(foldRun(runId, this.facts.get(runId) ?? []), stepId) !==
+        "open"
+      ) {
         return EMPTY_CLOSED_STREAM;
       }
       return this.streamHub.subscribeStream(runId, stepId, opts);
