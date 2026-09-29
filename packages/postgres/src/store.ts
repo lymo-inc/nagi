@@ -76,7 +76,6 @@ export interface PostgresStoreOpts<DB = unknown> {
   readonly db: Kysely<DB>;
   readonly schema?: string;
   readonly leaseMs?: Millis;
-  readonly notifyChannel?: string;
   // One LISTEN connection, powering both `b.streamingTask` chunks and
   // wf.watchRun / wf.watchRuns lifecycle events. Without it the store exposes
   // neither transport: nagi() refuses to register a streaming flow, and the
@@ -101,7 +100,6 @@ class PostgresStore<DB = unknown> implements Store {
   private readonly db: Kysely<DB>;
   private readonly schema: string;
   private readonly leaseMs: Millis;
-  private readonly notifyChannel: string | undefined;
   private readonly streamChannel: string;
   private readonly eventChannel: string;
   private readonly eventHub: InMemoryRunEventHub | undefined;
@@ -125,7 +123,6 @@ class PostgresStore<DB = unknown> implements Store {
     this.db = opts.db;
     this.schema = opts.schema ?? "nagi";
     this.leaseMs = opts.leaseMs ?? DEFAULT_LEASE_MS;
-    this.notifyChannel = opts.notifyChannel;
     // SCHEMA_RE already bounded this to an identifier, so the channel name is
     // safe and stays inside PostgreSQL's 63-byte limit.
     this.streamChannel = `${this.schema}_stream`;
@@ -793,10 +790,6 @@ class PostgresStore<DB = unknown> implements Store {
       await sql`SELECT pg_notify(${this.eventChannel}, ${payload})`.execute(
         trx,
       );
-    }
-    // Identical payloads within one tx collapse into a single notification.
-    if (this.notifyChannel !== undefined) {
-      await sql`SELECT pg_notify(${this.notifyChannel}, ${runId})`.execute(trx);
     }
     return true;
   }
