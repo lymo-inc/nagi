@@ -3,7 +3,6 @@
   "tag": "rc",
   "initialVersions": {
     "@nagi-js/core": "0.1.1-rc.0",
-    "@nagi-js/otel": "0.1.1-rc.0",
     "@nagi-js/pgmq": "0.1.1-rc.0",
     "@nagi-js/postgres": "0.1.1-rc.0"
   },

@@ -4,7 +4,7 @@ nagi is a durable workflow engine for multi-turn LLM backend workflows. It is
 not a general job queue, a realtime or fire-and-forget system, or a scheduler.
 Packages: `@nagi-js/core` (runtime, builder, in-memory adapters, the
 `@nagi-js/core/testing` Store conformance suite), `@nagi-js/postgres` (Store),
-`@nagi-js/pgmq` (Queue), `@nagi-js/otel` (tracing hooks).
+`@nagi-js/pgmq` (Queue).
 
 ## Commands
 

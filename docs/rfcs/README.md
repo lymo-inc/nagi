@@ -11,7 +11,7 @@ Research notes and implementation handoffs sit next to the RFC they belong to.
 | 0004 | [Multi-name signal waits](0004-multi-name-signal-waits.md) | [research](0004-multi-name-signal-waits.research.md) |
 | 0005 | `wf.queryRuns()` | [research + plan](0005-query-runs.research.md) (no separate RFC) |
 | 0009 | `wf.pruneFacts()` | [research + plan](0009-prune-facts.research.md) (no separate RFC) |
-| 0010 | [OTel parent-span linkage for subflow runs](0010-otel-subflow-span-linkage.md) | [handoff](0010-otel-subflow-span-linkage.handoff.md) |
+| 0010 | [OTel parent-span linkage for subflow runs](0010-otel-subflow-span-linkage.md) — removed along with `@nagi-js/otel` | [handoff](0010-otel-subflow-span-linkage.handoff.md) |
 | 0011 | [Extract `nextTransition` from the `advance` loop](0011-next-transition-state-machine.md) | [handoff](0011-next-transition-state-machine.handoff.md) |
 | 0012 | [Shorthand concurrency config](0012-shorthand-concurrency-config.md) | [handoff](0012-shorthand-concurrency-config.handoff.md) |
 | 0013 | [Activity steps](0013-activity-steps.md) | [research](0013-activity-steps.research.md) |
@@ -27,5 +27,7 @@ Numbering notes:
 - `0013` is used twice. Both RFCs are cited by number elsewhere (changesets,
   RFC 0014), so neither is renumbered; cite them by number plus title.
 - `0006`–`0008` and `0015`–`0017` were never written as RFC documents.
+- `0010` shipped in `@nagi-js/otel`, which has since been removed from the
+  repo; its `Status:` line predates the removal and is kept as history.
 - RFC numbers are not GitHub issue numbers. A commit saying "rfc#13" means
   this directory's `0013`, not issue #13.

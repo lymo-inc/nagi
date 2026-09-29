@@ -1,6 +1,5 @@
 ---
 "@nagi-js/core": patch
-"@nagi-js/otel": patch
 ---
 
 `@nagi-js/otel` now nests a subflow child flow's root span under its
