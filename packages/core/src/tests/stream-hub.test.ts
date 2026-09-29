@@ -341,3 +341,46 @@ describe("InMemoryStreamHub — scoping by (runId, stepId)", () => {
     expect(await onY).toEqual([]);
   });
 });
+
+describe("InMemoryStreamHub — openStreams()", () => {
+  it("lists every open channel, and only the ones still open", () => {
+    const hub = new InMemoryStreamHub();
+    const stepA = "a" as StepId;
+    const stepB = "b" as StepId;
+    collect(hub.subscribeStream(RUN, stepA));
+    collect(hub.subscribeStream(RUN, stepB));
+
+    expect(hub.openStreams()).toEqual(
+      expect.arrayContaining([
+        { runId: RUN, stepId: stepA },
+        { runId: RUN, stepId: stepB },
+      ]),
+    );
+    expect(hub.openStreams()).toHaveLength(2);
+
+    hub.closeOk(RUN, stepA);
+    expect(hub.openStreams()).toEqual([{ runId: RUN, stepId: stepB }]);
+  });
+
+  it("a publish with no subscriber opens a channel, so it is listed too", () => {
+    const hub = new InMemoryStreamHub();
+    hub.publishChunk(RUN, STEP, "chunk");
+    expect(hub.openStreams()).toEqual([{ runId: RUN, stepId: STEP }]);
+  });
+
+  it("closeRun('a') does not also close run 'a::b' (regression: ids, not key prefixes)", async () => {
+    const hub = new InMemoryStreamHub();
+    const runA = "a" as RunId;
+    const runAB = "a::b" as RunId;
+
+    const onA = collect(hub.subscribeStream(runA, STEP));
+    const onAB = collect(hub.subscribeStream(runAB, STEP));
+
+    hub.closeRun(runA);
+    hub.publishChunk(runAB, STEP, "still-open");
+    hub.closeOk(runAB, STEP);
+
+    expect(await onA).toEqual([]);
+    expect(await onAB).toEqual([{ kind: "chunk", chunk: "still-open" }]);
+  });
+});

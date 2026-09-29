@@ -16,11 +16,14 @@ import type {
 // wires one, the same way it already wires `db`.
 //
 // `listen` MUST deliver every NOTIFY on `channel` to `onNotify` until the
-// returned disposer is called.
+// returned disposer is called. A listener that reconnects after losing its
+// connection MUST re-LISTEN and then call `onReconnect`: NOTIFYs sent in
+// between are lost, and the store re-checks what they could have closed.
 export interface StreamListener {
   listen(
     channel: string,
     onNotify: (payload: string) => void,
+    onReconnect?: () => void,
   ): Promise<() => void | Promise<void>>;
 }
 

@@ -364,7 +364,13 @@ export const stepKinds = {
       attempt: fact.attempt,
       error: fact.error,
     }),
-    release: null,
+    // The failed attempt is over; a lingering lease would be reaped mid-backoff
+    // and re-dispatch the retry early.
+    release: (fact) => ({
+      tag: "release-lease",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+    }),
     stream: (fact) => ({
       tag: "retry",
       stepId: fact.stepId,

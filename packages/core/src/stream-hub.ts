@@ -98,6 +98,8 @@ class Subscriber {
 export const STREAM_CLOSED_KEYS_CAP = 1024;
 
 interface Channel {
+  readonly runId: RunId;
+  readonly stepId: StepId;
   readonly subscribers: Set<Subscriber>;
   readonly replay: StreamEvent<Json>[];
 }
@@ -117,11 +119,12 @@ export class InMemoryStreamHub {
     return `${runId}::${stepId}`;
   }
 
-  private openChannel(key: string): Channel | undefined {
+  private openChannel(runId: RunId, stepId: StepId): Channel | undefined {
+    const key = InMemoryStreamHub.key(runId, stepId);
     if (this.closedKeys.has(key)) return undefined;
     let channel = this.channels.get(key);
     if (channel === undefined) {
-      channel = { subscribers: new Set(), replay: [] };
+      channel = { runId, stepId, subscribers: new Set(), replay: [] };
       this.channels.set(key, channel);
     }
     return channel;
@@ -146,7 +149,7 @@ export class InMemoryStreamHub {
   }
 
   publishChunk(runId: RunId, stepId: StepId, chunk: Json): void {
-    const channel = this.openChannel(InMemoryStreamHub.key(runId, stepId));
+    const channel = this.openChannel(runId, stepId);
     if (channel === undefined) return;
     const event: StreamEvent<Json> = { kind: "chunk", chunk };
     channel.replay.push(event);
@@ -211,11 +214,23 @@ export class InMemoryStreamHub {
   }
 
   closeRun(runId: RunId): void {
-    const prefix = `${runId}::`;
-    for (const key of this.channels.keys()) {
-      if (!key.startsWith(prefix)) continue;
+    const keys = [...this.channels.entries()]
+      .filter(([, channel]) => channel.runId === runId)
+      .map(([key]) => key);
+    for (const key of keys) {
       for (const sub of this.closeChannel(key) ?? []) sub.close();
     }
+  }
+
+  // Open channels only — the ones a lost close frame could leave hanging.
+  openStreams(): ReadonlyArray<{
+    readonly runId: RunId;
+    readonly stepId: StepId;
+  }> {
+    return [...this.channels.values()].map(({ runId, stepId }) => ({
+      runId,
+      stepId,
+    }));
   }
 
   subscribeStream(
@@ -223,7 +238,7 @@ export class InMemoryStreamHub {
     stepId: StepId,
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<Json>> {
-    const channel = this.openChannel(InMemoryStreamHub.key(runId, stepId));
+    const channel = this.openChannel(runId, stepId);
     if (channel === undefined) return EMPTY_CLOSED_STREAM;
 
     const sub = new Subscriber();

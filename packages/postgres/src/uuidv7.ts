@@ -16,53 +16,58 @@ function toHex(bytes: Uint8Array): string {
 const COUNTER_MAX = 0xfff;
 const COUNTER_SEED_MAX = 0x800;
 
-let lastMs = -1;
-let counter = 0;
-
 function seedCounter(): number {
   const b = new Uint8Array(2);
   crypto.getRandomValues(b);
   return (((b[0] as number) << 8) | (b[1] as number)) % COUNTER_SEED_MAX;
 }
 
-// Sortable, collision-resistant id. Ordering matters beyond neatness: the fact
-// table is read back with ORDER BY fact_id, so fact_id order IS append order,
-// and foldRun replays a run from it. A purely random rand_a — what this used to
-// have — let two facts written in the same millisecond come back reversed.
-export function uuidv7(now: number = Date.now()): string {
-  const bytes = new Uint8Array(16);
+// Sortable, collision-resistant id. fact_id orders facts written before
+// 0011_fact_seq (seq NULL) and breaks ties, so ids from one generator must sort
+// in creation order. A purely random rand_a — what this used to have — let two
+// ids from the same millisecond sort reversed.
+export function createUuidv7(): (now?: number) => string {
+  let lastMs = -1;
+  let counter = 0;
+  return (now = Date.now()) => {
+    const bytes = new Uint8Array(16);
 
-  const ts = Math.floor(now);
-  if (ts === lastMs) {
-    // Saturate rather than wrap: wrapping would sort this id BEFORE the one it
-    // follows, which is the exact failure the counter exists to prevent.
-    if (counter < COUNTER_MAX) counter += 1;
-  } else {
-    lastMs = ts;
-    counter = seedCounter();
-  }
+    // A clock that steps back must not mint a smaller id: hold the last
+    // timestamp and keep counting within it.
+    const ts = Math.max(Math.floor(now), lastMs);
+    if (ts === lastMs) {
+      // Saturate rather than wrap: wrapping would sort this id BEFORE the one it
+      // follows, which is the exact failure the counter exists to prevent.
+      if (counter < COUNTER_MAX) counter += 1;
+    } else {
+      lastMs = ts;
+      counter = seedCounter();
+    }
 
-  const hi = Math.floor(ts / 0x1_0000_0000);
-  const lo = ts >>> 0;
-  bytes[0] = (hi >>> 8) & 0xff;
-  bytes[1] = hi & 0xff;
-  bytes[2] = (lo >>> 24) & 0xff;
-  bytes[3] = (lo >>> 16) & 0xff;
-  bytes[4] = (lo >>> 8) & 0xff;
-  bytes[5] = lo & 0xff;
+    const hi = Math.floor(ts / 0x1_0000_0000);
+    const lo = ts >>> 0;
+    bytes[0] = (hi >>> 8) & 0xff;
+    bytes[1] = hi & 0xff;
+    bytes[2] = (lo >>> 24) & 0xff;
+    bytes[3] = (lo >>> 16) & 0xff;
+    bytes[4] = (lo >>> 8) & 0xff;
+    bytes[5] = lo & 0xff;
 
-  // rand_a carries the counter; rand_b stays fully random, so uniqueness never
-  // depends on the counter having headroom.
-  const rand = new Uint8Array(8);
-  crypto.getRandomValues(rand);
-  for (let i = 0; i < 8; i++) {
-    bytes[8 + i] = rand[i] as number;
-  }
+    // rand_a carries the counter; rand_b stays fully random, so uniqueness never
+    // depends on the counter having headroom.
+    const rand = new Uint8Array(8);
+    crypto.getRandomValues(rand);
+    for (let i = 0; i < 8; i++) {
+      bytes[8 + i] = rand[i] as number;
+    }
 
-  bytes[6] = 0x70 | ((counter >>> 8) & 0x0f);
-  bytes[7] = counter & 0xff;
-  bytes[8] = ((bytes[8] as number) & 0x3f) | 0x80;
+    bytes[6] = 0x70 | ((counter >>> 8) & 0x0f);
+    bytes[7] = counter & 0xff;
+    bytes[8] = ((bytes[8] as number) & 0x3f) | 0x80;
 
-  const hex = toHex(bytes);
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    const hex = toHex(bytes);
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
 }
+
+export const uuidv7 = createUuidv7();

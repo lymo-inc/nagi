@@ -327,7 +327,7 @@ await client.connect();
 const store = postgresStore({
   db,
   listener: {
-    async listen(channel, onNotify) {
+    async listen(channel, onNotify, onReconnect) {
       client.on("notification", (m) => {
         if (m.channel === channel && m.payload) onNotify(m.payload);
       });
@@ -343,17 +343,21 @@ await store.ready(); // both channels live; safe to start runs
 This client never reconnects. When its connection drops, a bare `pg.Client`
 with no `error` listener crashes the process on the unhandled `error` event;
 with one, it silently stops delivering. In production, on `error`/`end` open a
-new client, re-`LISTEN` every channel `listen()` was called with, and route its
-notifications to the same `onNotify` callbacks. What was published during the
-gap stays lost:
+new client, re-`LISTEN` every channel `listen()` was called with, route its
+notifications to the same `onNotify` callbacks, and — for the channel whose
+`listen()` call received one — call `onReconnect()` once re-`LISTEN` has
+succeeded. What was published during the gap stays lost:
 
-- Streaming: chunks in the gap are gone, and if the step's close frame falls
-  in it, an open `wf.subscribe()` iterator never ends. Subscribe again after
-  reconnecting — a new subscription checks durable state and closes at once
-  if the step has settled — and take the output from `describe()`.
+- Streaming: calling `onReconnect` after re-LISTEN makes the store re-check
+  every open stream and end the ones whose step has settled. A listener that
+  does not call it leaves them hanging; subscribing again also works — a new
+  subscription checks durable state and closes at once if the step has
+  settled. Either way, take the output from `describe()`.
 - Watching: events in the gap are gone, and a `watchRun` whose terminal event
   was missed never stops on its own; call its disposer. Catch up with
   `describe()`.
+
+Shut down with `await store.close()`.
 
 Operational limits:
 
@@ -397,6 +401,10 @@ and `ADD CONSTRAINT ... NOT VALID` yourself, `VALIDATE CONSTRAINT` separately
 (it takes only `SHARE UPDATE EXCLUSIVE`), then insert the id
 `0008_canceled_by_run_id_fk` into `<schema>.schema_migrations` so `migrate()`
 skips it.
+
+**`0011_fact_seq`** adds a nullable column with a default. On PostgreSQL 11+
+that is a catalog-only change, with no table rewrite. It still takes a brief
+`ACCESS EXCLUSIVE` lock on `fact`.
 
 **`global_fact`.** Each boot that registers a flow with a changed hash
 appends one `flow_ref.updated` row to `<schema>.global_fact`. nagi only

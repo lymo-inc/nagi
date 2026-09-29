@@ -329,7 +329,7 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     expect(errors.length).toBe(1);
   });
 
-  it("a step that throws after the run was canceled records step.canceled (no retry, no onStepError)", async () => {
+  it("a step that throws after the run was canceled records step.canceled (no retry; onStepError reports the cancellation)", async () => {
     const barrier = createBarrier();
     const f = flow({
       id: "videoThrowOnCanceled",
@@ -382,7 +382,65 @@ describe("@nagi-js/core — flow concurrency groups (cancel-in-progress)", () =>
     const canceled = result.factsOf("step.canceled")[0];
     expect(canceled?.error).toBeUndefined();
 
-    expect(stepErrors.length).toBe(0);
+    expect(stepErrors).toHaveLength(1);
+    expect(stepErrors[0]?.error.name).toBe("AbortError");
+  });
+
+  it("a body that returns after its run was canceled fires onStepError, not onStepComplete", async () => {
+    const barrier = createBarrier();
+    const f = flow({
+      id: "videoReturnOnCanceled",
+      input: passthroughSchema<VideoInput>(),
+      concurrency: {
+        keyFn: (input) => input.videoId,
+        mode: "cancel-in-progress",
+      },
+      build: (b) => ({
+        analyze: b.task({
+          run: async () => {
+            await barrier.wait;
+            return { ok: 1 };
+          },
+        }),
+      }),
+    });
+
+    const stepErrors: StepErrorEvent[] = [];
+    const stepCompletes: unknown[] = [];
+    const h = await makeHarness(f, {
+      hooks: {
+        onStepError: (e) => {
+          stepErrors.push(e);
+        },
+        onStepComplete: (e) => {
+          stepCompletes.push(e);
+        },
+      },
+    });
+
+    const firstRunId = await h.wf.start(f, { videoId: "v1" });
+    const dispatching = h.drainOnce(1);
+
+    await vi.waitFor(
+      async () =>
+        expect(
+          (await h.store.loadRunState(firstRunId)).steps["analyze"]?.tag,
+        ).toBe("running"),
+      { interval: 2 },
+    );
+
+    await h.wf.start(f, { videoId: "v1" });
+
+    barrier.release();
+    await dispatching;
+
+    const result = await h.result(firstRunId);
+    expect(result.factCount("step.canceled")).toBe(1);
+    expect(result.stepStatus("analyze")).toBe("canceled");
+
+    expect(stepCompletes.length).toBe(0);
+    expect(stepErrors).toHaveLength(1);
+    expect(stepErrors[0]?.error.name).toBe("AbortError");
   });
 
   it("classifies a handler-thrown AbortError on a canceled run as step.canceled and preserves the error", async () => {
