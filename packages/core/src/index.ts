@@ -1,22 +1,5 @@
 export { flow, optional } from "./builder";
 export {
-  type CanonicalDag,
-  type CanonicalMatchArm,
-  type CanonicalRetryPolicy,
-  type CanonicalSchema,
-  type CanonicalStep,
-  canonicalize,
-  fingerprintFlows,
-  sha256Canonical,
-} from "./canonicalize";
-export {
-  diffSnapshots,
-  type SnapshotChangedEdge,
-  type SnapshotChangedField,
-  type SnapshotChangedFlowField,
-  type SnapshotDiff,
-} from "./diff";
-export {
   NagiCanceledError,
   NagiConcurrencyConflictError,
   NagiFlowSnapshotGoneError,
