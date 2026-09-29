@@ -118,9 +118,10 @@ export function nextRunRow(
   }
 }
 
-// Mirrors the fold's totality: a settled row changes only by reset, and a
-// start or retry for an attempt older than the row's is stale. Settling deltas
-// skip the attempt check — they carry authoritative outcomes, as in the fold.
+// Mirrors the fold: a settled row changes only by reset, a start applies only
+// for a newer attempt, and a retry only to the attempt in flight (error null:
+// not already backing off). Settling deltas skip the attempt check — they
+// carry authoritative outcomes, as in the fold.
 export function nextStepRow(
   prev: StepRow | undefined,
   delta: Extract<RowDelta, { row: "step" }>,
@@ -129,7 +130,7 @@ export function nextStepRow(
   if (prev !== undefined && SETTLED.has(prev.status)) return prev;
   switch (delta.status) {
     case "running":
-      if (prev !== undefined && prev.attempt > delta.attempt) return prev;
+      if (prev !== undefined && prev.attempt >= delta.attempt) return prev;
       return {
         attempt: delta.attempt,
         status: "running",
@@ -139,8 +140,14 @@ export function nextStepRow(
         error: null,
       };
     case "backoff":
-      if (prev === undefined || prev.attempt > delta.attempt) return prev;
-      return { ...prev, attempt: delta.attempt, error: delta.error };
+      if (
+        prev === undefined ||
+        prev.error !== null ||
+        prev.attempt !== delta.attempt
+      ) {
+        return prev;
+      }
+      return { ...prev, error: delta.error };
     case "completed":
       return settle(prev, delta.attempt, delta, delta.output, null);
     case "failed":

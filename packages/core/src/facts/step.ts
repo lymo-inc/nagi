@@ -1,5 +1,6 @@
 import { compact } from "../internal";
 import {
+  attemptOf,
   isStepTerminal,
   PENDING,
   type SkipReason,
@@ -256,6 +257,21 @@ function releaseStep(stepId: StepId, timer: boolean): Release {
   return { tag: "release-step", stepId, timer };
 }
 
+// Attempts only move forward: a start supersedes the step only for a newer
+// attempt (a lease reap re-dispatches at attempt+1 while the dead attempt still
+// reads as running), and a retry or abort applies only to the attempt in
+// flight. Anything else is a stale or duplicate delivery. nextStepRow applies
+// the same rules to the read model.
+function inFlight(prev: StepState, attempt: AttemptNumber): boolean {
+  return (
+    (prev.tag === "running" ||
+      prev.tag === "awaitingSignal" ||
+      prev.tag === "awaitingChild" ||
+      prev.tag === "aborting") &&
+    prev.attempt === attempt
+  );
+}
+
 // Every transition is total: a pair that isn't a real transition keeps the
 // prior state, so the fold never throws on a contradictory log. Terminal facts
 // carry authoritative outcomes and settle a step from any non-terminal state.
@@ -263,7 +279,7 @@ export const stepKinds = {
   "step.started": {
     fold: (draft, fact) =>
       foldStep(draft, fact.stepId, (prev) =>
-        prev.tag === "pending" || prev.tag === "backoff"
+        !isStepTerminal(prev) && fact.attempt > attemptOf(prev)
           ? startTarget(fact.stepKind, fact.attempt)
           : prev,
       ),
@@ -360,7 +376,7 @@ export const stepKinds = {
   "step.retried": {
     fold: (draft, fact) =>
       foldStep(draft, fact.stepId, (prev) =>
-        prev.tag === "running"
+        inFlight(prev, fact.attempt)
           ? {
               tag: "backoff",
               failedAttempt: fact.attempt,
@@ -431,9 +447,7 @@ export const stepKinds = {
   "step.abort-requested": {
     fold: (draft, fact) =>
       foldStep(draft, fact.stepId, (prev) =>
-        prev.tag === "running" ||
-        prev.tag === "awaitingSignal" ||
-        prev.tag === "awaitingChild"
+        inFlight(prev, fact.attempt) && prev.tag !== "aborting"
           ? { tag: "aborting", attempt: fact.attempt }
           : prev,
       ),
