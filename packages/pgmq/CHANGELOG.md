@@ -1,5 +1,46 @@
 # @nagi-js/pgmq
 
+## 0.1.1-rc.25
+
+### Patch Changes
+
+- a564da3: `sweepLeases` now judges lease expiry on the database clock instead of the
+  reaping worker's app clock, matching `claimStep`/`extendLease`. A worker
+  clock running ahead of the database could previously reap a still-live
+  lease before its first heartbeat and double-run the step.
+
+  `pgmq` `dequeue` now archives a malformed message envelope instead of
+  throwing. Previously one bad envelope in a batch left the good messages in
+  that batch hidden for the visibility timeout, and kept failing every
+  subsequent batch that read it back — forever.
+
+- 9c73f9e: `@nagi-js/core` is now a peer dependency of every adapter, pinned to the exact core version it was released with, instead of a private dependency.
+
+  Install core alongside the adapter (`pnpm add @nagi-js/core @nagi-js/postgres`). Most apps already do, since they import `nagi` from it.
+
+  Before this, upgrading `@nagi-js/core` alone installed a second copy of core inside the adapter. Errors thrown by the store were then not `instanceof` the engine's classes, and the store applied the older core's fact rules. A mismatched pair now fails at install time (npm `ERESOLVE`, pnpm unmet-peer warning). Upgrade core and adapters together.
+
+- Updated dependencies [f4fda8d]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [3740cc6]
+- Updated dependencies [a564da3]
+- Updated dependencies [158e8ac]
+- Updated dependencies [eded7cd]
+- Updated dependencies [a564da3]
+- Updated dependencies [8207d4c]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [623c89e]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+  - @nagi-js/core@0.1.1-rc.24
+
 ## 0.1.1-rc.24
 
 ### Patch Changes
