@@ -1893,6 +1893,55 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "events: step.canceled and step.reset are events",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.events === undefined) return;
+      const runId = rid();
+      const seen: RunEventEnvelope[] = [];
+      const off = s.events.watchRuns((e) => {
+        if (e.runId === runId) seen.push(e);
+      });
+      try {
+        await startRun(s, runId);
+        await startStep(s, runId, "s");
+        await s.appendFact(
+          runId,
+          Facts.stepCanceled(runId, "s", A1, new Date()),
+        );
+        await s.appendFact(
+          runId,
+          Facts.stepReset({ runId, stepId: "s", at: new Date() }),
+        );
+        const want = [
+          "flow.started",
+          "step.started",
+          "step.canceled",
+          "step.reset",
+        ];
+        await eventually(() => seen.length >= want.length, "all four events");
+        eq(
+          seen.map((e) => e.type),
+          want,
+          "cancel and reset are observable",
+        );
+        eq(
+          seen.slice(2).map((e) => ({
+            type: e.type,
+            stepId: (e as { stepId?: string }).stepId,
+          })),
+          [
+            { type: "step.canceled", stepId: "s" },
+            { type: "step.reset", stepId: "s" },
+          ],
+          "carry the stepId",
+        );
+      } finally {
+        off();
+      }
+    },
+  },
+  {
     name: "events: a superseded run announces flow.canceled naming its superseder",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });

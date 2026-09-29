@@ -769,7 +769,13 @@ export type RunEvent =
       readonly type: "step.skipped";
       readonly stepId: StepId;
       readonly reason: SkipReason;
-    };
+    }
+  | {
+      readonly type: "step.canceled";
+      readonly stepId: StepId;
+      readonly attempt: AttemptNumber;
+    }
+  | { readonly type: "step.reset"; readonly stepId: StepId };
 
 export type RunEventEnvelope = RunEvent & { readonly runId: RunId };
 

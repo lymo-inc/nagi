@@ -248,7 +248,9 @@ sees a status the fact log does not back. `pruneFacts` deletes `step_run`,
 
 `wf.watchRun(runId, handler)` and `wf.watchRuns(handler)` push lifecycle events
 as their facts commit. Both return a disposer; `watchRun` also stops on its own
-once the run is terminal.
+at the run's next terminal event. A run that is already terminal stays watched
+until the disposer is called or a replay finishes it again, so `watchRun` then
+`replay` works.
 
 ```ts
 const off = wf.watchRun(runId, (e) => {
@@ -281,6 +283,9 @@ What it is not:
 - **Not a payload channel.** Events carry identity and status only; read
   outputs and errors with `describe()`. (A NOTIFY is capped at 8000 bytes,
   and any role that can connect to the database can LISTEN.)
+- A `step.reset` event on a completed or failed run means `replay({ from })`
+  reopened it. A per-run watcher that already saw the terminal event is gone;
+  `watchRuns` sees the reopen.
 
 Concurrency supersession IS observable (`flow.canceled`, `cause:
 "concurrency"`), which matters when a run vanishes from under a client: the

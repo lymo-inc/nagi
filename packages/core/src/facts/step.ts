@@ -339,7 +339,11 @@ export const stepKinds = {
     }),
     release: (fact) => releaseStep(fact.stepId, false),
     stream: null,
-    event: null,
+    event: (fact) => ({
+      type: "step.canceled",
+      stepId: fact.stepId,
+      attempt: fact.attempt,
+    }),
   },
   "step.retried": {
     fold: (draft, fact) =>
@@ -408,7 +412,8 @@ export const stepKinds = {
     rows: (fact) => ({ row: "step", status: "reset", stepId: fact.stepId }),
     release: (fact) => releaseStep(fact.stepId, true),
     stream: (fact) => ({ tag: "reopen", stepId: fact.stepId }),
-    event: null,
+    // On a completed/failed run this is the reopen.
+    event: (fact) => ({ type: "step.reset", stepId: fact.stepId }),
   },
   "step.abort-requested": {
     fold: (draft, fact) =>

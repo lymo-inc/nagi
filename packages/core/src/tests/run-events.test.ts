@@ -186,6 +186,81 @@ describe("wf.watchRuns", () => {
     await h.wf.startById("watch-started", {});
     expect(types(seen)).toContain("flow.started");
   });
+
+  it("announces a reopen: step.reset precedes the rerun", async () => {
+    const f = flow({
+      id: "watch-reopen",
+      input: emptySchema(),
+      build: (b) => ({ only: b.task({ run: async () => ({}) }) }),
+    });
+    const h = await makeHarness(f);
+    const seen: RunEventEnvelope[] = [];
+    h.wf.watchRuns((e) => seen.push(e));
+    const runId = await h.wf.startById("watch-reopen", {});
+    await h.drain();
+
+    const firstCompletedAt = seen.findIndex((e) => e.type === "flow.completed");
+    await h.wf.replay(runId, { mode: "continue", from: "only", scope: "step" });
+    await h.drain();
+
+    const afterReopen = seen
+      .slice(firstCompletedAt + 1)
+      .filter((e) => e.runId === runId);
+    expect(types(afterReopen)).toEqual([
+      "step.reset",
+      "step.started",
+      "step.completed",
+      "flow.completed",
+    ]);
+  });
+
+  it("reports a replay abort of a running step as step.canceled", async () => {
+    let abortObserved = false;
+    let aAttempts = 0;
+    const f = flow({
+      id: "watch-abort",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ ctx }) => {
+            aAttempts += 1;
+            if (aAttempts === 1) {
+              for (let i = 0; i < 200; i++) {
+                if (ctx.signal.aborted) {
+                  abortObserved = true;
+                  throw new Error("aborted");
+                }
+                await new Promise((r) => setTimeout(r, 5));
+              }
+              return { ran: 1 };
+            }
+            return { ran: 2 };
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const seen: RunEventEnvelope[] = [];
+    h.wf.watchRuns((e) => seen.push(e));
+    const runId = await h.wf.start(f, {});
+    const worker = h.startWorker({ pollIntervalMs: 5 });
+    try {
+      await h.waitForStep(runId, "a", "running", 2_000);
+      await h.wf.replay(runId, { mode: "continue", from: "a" });
+      await h.waitForStep(runId, "a", "completed", 3_000);
+    } finally {
+      await worker.stop();
+    }
+    expect(abortObserved).toBe(true);
+
+    const runEvents = seen.filter((e) => e.runId === runId);
+    const canceled = runEvents.find((e) => e.type === "step.canceled");
+    expect(canceled).toMatchObject({ stepId: "a", attempt: 1 });
+    const canceledIdx = runEvents.indexOf(canceled!);
+    const resetIdx = runEvents.findIndex((e) => e.type === "step.reset");
+    expect(resetIdx).toBeGreaterThan(canceledIdx);
+  });
 });
 
 describe("concurrency supersession", () => {
