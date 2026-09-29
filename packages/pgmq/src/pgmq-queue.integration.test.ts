@@ -145,6 +145,21 @@ d("@nagi-js/pgmq — against the real pgmq extension", () => {
     expect(await q.dequeue({ count: 2 })).toEqual([]);
   });
 
+  it("archives a malformed envelope and returns only the valid ones", async () => {
+    const { q, name } = await makeQueue();
+    await sql`SELECT pgmq.send(${name}, ${JSON.stringify({ stepId: "x" })}::jsonb)`.execute(
+      db,
+    );
+    await q.enqueue(runA, s1);
+
+    const messages = await q.dequeue({ count: 10 });
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.stepId).toBe(s1);
+    expect(await q.dequeue({ count: 10 })).toEqual([]);
+    expect(await archivedCount(name)).toBe(1);
+  });
+
   it("a dequeued message stays hidden for the visibility timeout, then is redelivered", async () => {
     const { q } = await makeQueue({ visibilityTimeoutMs: 2_000 });
     await q.enqueue(runA, s1);

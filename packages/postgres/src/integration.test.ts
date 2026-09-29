@@ -209,6 +209,39 @@ d("@nagi-js/postgres — end-to-end conformance", () => {
     expect(factRows.rows.length).toBe(1);
   }, 15_000);
 
+  it("sweepLeases judges expiry on the database clock, not a fast app clock", async () => {
+    const store = postgresStore({ db, schema });
+    const queue = new InMemoryQueue();
+    const runId = `run-${uuidv7()}` as RunId;
+
+    await store.tryStartRun(runId, {
+      kind: "flow.started",
+      runId,
+      flowId: "sweep-fast-clock-test",
+      input: null as never,
+      at: new Date(),
+    });
+    await store.appendFact(runId, {
+      kind: "step.started",
+      runId,
+      stepId: "s1",
+      attempt: 1,
+      stepKind: "task",
+      at: new Date(),
+    });
+    expect(await store.claimStep(runId, "s1", 1)).not.toBeNull();
+
+    // App clock 10 minutes fast: with the store's default 60s lease, a
+    // now()-comparison sweep must not reap this still-live lease.
+    const reaped = (
+      await store.sweepLeases({
+        now: new Date(Date.now() + 10 * 60_000),
+        queue,
+      })
+    ).filter((r) => r.runId === runId);
+    expect(reaped).toHaveLength(0);
+  }, 15_000);
+
   it("concurrent start() with the same runId produces one run and one dispatch", async () => {
     let invocations = 0;
     const f = flow({

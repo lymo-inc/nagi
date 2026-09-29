@@ -546,7 +546,7 @@ class PostgresStore<DB = unknown> implements Store {
     readonly queue: Queue;
     readonly limit?: number;
   }): Promise<readonly ReapedLease[]> {
-    const { now, queue, limit = DEFAULT_SWEEP_LIMIT } = args;
+    const { queue, limit = DEFAULT_SWEEP_LIMIT } = args;
     return this.db.transaction().execute(async (trx) => {
       // FOR UPDATE OF l SKIP LOCKED so concurrent reapers split the batch
       // without retry; the LEFT JOIN surfaces the step status that
@@ -562,6 +562,7 @@ class PostgresStore<DB = unknown> implements Store {
         status: StepRunStatus | null;
         child_active: boolean;
         flow_id: string | null;
+        db_now: Date;
       }>`
         SELECT l.run_id, l.step_id, l.attempt, l.expires_at, s.status,
           EXISTS (
@@ -570,14 +571,18 @@ class PostgresStore<DB = unknown> implements Store {
                AND c.parent_step_id = l.step_id
                AND c.status IN ('pending', 'running')
           ) AS child_active,
-          r.flow_id
+          r.flow_id,
+          now() AS db_now
           FROM ${sql.raw(this.t("lease"))} l
           LEFT JOIN ${sql.raw(this.t("step_run"))} s
             ON s.run_id = l.run_id
            AND s.step_id = l.step_id
           LEFT JOIN ${sql.raw(this.t("workflow_run"))} r
             ON r.run_id = l.run_id
-         WHERE l.expires_at < ${now}
+         -- Expiry is judged on the clock that set it: claimStep/extendLease
+         -- set expires_at from SQL now(), so the sweep must compare against
+         -- now() too, not the reaping worker's app clock.
+         WHERE l.expires_at < now()
          FOR UPDATE OF l SKIP LOCKED
          LIMIT ${limit}
       `.execute(trx);
@@ -597,12 +602,14 @@ class PostgresStore<DB = unknown> implements Store {
             ? row.expires_at
             : new Date(row.expires_at);
         const stepStatus: StepRunStatus = row.status ?? "pending";
+        const dbNow =
+          row.db_now instanceof Date ? row.db_now : new Date(row.db_now);
 
         const decision = decideExpiredLeaseAction({
           lease: { runId, stepId, attempt, expiresAt },
           stepStatus,
           childActive: row.child_active,
-          now,
+          now: dbNow,
         });
         if (decision.tag === "skip") continue;
 
