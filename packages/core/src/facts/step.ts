@@ -238,9 +238,17 @@ function inFlight(prev: StepState, attempt: AttemptNumber): boolean {
   );
 }
 
+// A settle needs its attempt to have started in this reset generation. A
+// higher attempt than the one started, or any attempt on a pending step, can
+// only come from an execution that began before a step.reset. Lower attempts
+// still settle: a reaped attempt that outlived its lease wins if it finishes
+// first.
+function settles(prev: StepState, attempt: AttemptNumber): boolean {
+  return !isStepTerminal(prev) && attempt <= attemptOf(prev);
+}
+
 // Every transition is total: a pair that isn't a real transition keeps the
-// prior state, so the fold never throws on a contradictory log. Terminal facts
-// carry authoritative outcomes and settle a step from any non-terminal state.
+// prior state, so the fold never throws on a contradictory log.
 export const stepKinds = {
   "step.started": {
     fold: (draft, fact) =>
@@ -267,9 +275,9 @@ export const stepKinds = {
   "step.completed": {
     fold: (draft, fact) =>
       foldStep(draft, fact.stepId, (prev) =>
-        isStepTerminal(prev)
-          ? prev
-          : { tag: "completed", attempt: fact.attempt, output: fact.output },
+        settles(prev, fact.attempt)
+          ? { tag: "completed", attempt: fact.attempt, output: fact.output }
+          : prev,
       ),
     rows: (fact) => ({
       row: "step",
@@ -291,9 +299,9 @@ export const stepKinds = {
   "step.failed": {
     fold: (draft, fact) =>
       foldStep(draft, fact.stepId, (prev) =>
-        isStepTerminal(prev)
-          ? prev
-          : { tag: "failed", attempt: fact.attempt, error: fact.error },
+        settles(prev, fact.attempt)
+          ? { tag: "failed", attempt: fact.attempt, error: fact.error }
+          : prev,
       ),
     rows: (fact) => ({
       row: "step",
@@ -320,7 +328,7 @@ export const stepKinds = {
   "step.canceled": {
     fold: (draft, fact) =>
       foldStep(draft, fact.stepId, (prev) => {
-        if (isStepTerminal(prev)) return prev;
+        if (!settles(prev, fact.attempt)) return prev;
         const cause: StepCancelCause =
           prev.tag === "aborting"
             ? { kind: "aborted", ...compact({ error: fact.error }) }

@@ -8,7 +8,7 @@ import { Facts } from "./facts";
 import type { FlowRegistry, FlowResolution } from "./flows";
 import { compact } from "./internal";
 import { resetFactsOf } from "./scheduler";
-import { attemptOf, isStepTerminal, isTerminalRun, stepStateOf } from "./state";
+import { isStepTerminal, isTerminalRun, stepStateOf } from "./state";
 import type {
   Clock,
   DriftPolicy,
@@ -130,37 +130,39 @@ export function makeReplay(deps: ReplayDeps): {
     }
   }
 
+  // A lease reap can start a newer attempt while we wait (the one we aborted
+  // was dead), so every attempt that starts is aborted in turn: resetting
+  // under a live attempt would let its pre-reset result settle the step.
   async function abortInFlight(state: RunState, stepId: StepId): Promise<void> {
-    const step = stepStateOf(state, stepId);
-    if (step.tag !== "running") return;
+    if (stepStateOf(state, stepId).tag !== "running") return;
     const { runId } = state;
-    await store.appendFact(
-      runId,
-      Facts.stepAbortRequested({
-        runId,
-        stepId,
-        attempt: step.attempt,
-        at: clock.now(),
-      }),
-    );
+    let aborted = 0;
     const start = Date.now();
-    while (Date.now() - start < ABORT_SETTLE_DEADLINE_MS) {
-      const s = await store.loadRunState(runId);
-      const ss = s.steps[stepId];
-      if (
-        ss === undefined ||
-        isStepTerminal(ss) ||
-        isTerminalRun(s) ||
-        attemptOf(ss) > step.attempt
-      ) {
+    for (let s = state; ; s = await store.loadRunState(runId)) {
+      const step = stepStateOf(s, stepId);
+      if (step.tag === "pending" || isStepTerminal(step) || isTerminalRun(s)) {
         return;
+      }
+      if (step.tag === "running" && step.attempt > aborted) {
+        aborted = step.attempt;
+        await store.appendFact(
+          runId,
+          Facts.stepAbortRequested({
+            runId,
+            stepId,
+            attempt: step.attempt,
+            at: clock.now(),
+          }),
+        );
+      }
+      if (Date.now() - start >= ABORT_SETTLE_DEADLINE_MS) {
+        throw new NagiRuntimeError(
+          `replay({ from }): timed out after ${ABORT_SETTLE_DEADLINE_MS}ms waiting for step "${stepId}" ` +
+            `(attempt ${aborted}) to honor abort signal. Handler may be ignoring ctx.signal.`,
+        );
       }
       await new Promise((r) => setTimeout(r, ABORT_SETTLE_POLL_MS));
     }
-    throw new NagiRuntimeError(
-      `replay({ from }): timed out after ${ABORT_SETTLE_DEADLINE_MS}ms waiting for step "${stepId}" ` +
-        `(attempt ${step.attempt}) to honor abort signal. Handler may be ignoring ctx.signal.`,
-    );
   }
 
   return { replay };

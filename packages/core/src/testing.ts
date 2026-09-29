@@ -1459,6 +1459,83 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "a settle needs its attempt to have started: after a reset, a pre-reset attempt's completion, failure or cancel changes nothing in loadRunState or describe",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const t = (n: number) => new Date(1_700_000_000_000 + n * 1000);
+      const error = { name: "E", message: "stale" };
+      const stale = (at: Date) => [
+        Facts.stepCompleted(runId, "s", A2, { stale: true }, at),
+        Facts.stepFailed(runId, "s", A2, error, at),
+        Facts.stepCanceled(runId, "s", A2, at, error),
+      ];
+      await startRun(s, runId, { at: t(0) });
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A1, "task", t(1)),
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A2, "task", t(2)),
+      );
+      await s.appendFact(
+        runId,
+        Facts.stepReset({ runId, stepId: "s", at: t(3) }),
+      );
+
+      for (const fact of stale(t(4))) await s.appendFact(runId, fact);
+      eq(
+        stepStateOf(await s.loadRunState(runId), "s"),
+        { tag: "pending" },
+        "loadRunState: a reset step ignores a settle before it restarts",
+      );
+      eq(
+        await stepView(s, runId, "s"),
+        undefined,
+        "describe: a reset step ignores a settle before it restarts",
+      );
+
+      await s.appendFact(
+        runId,
+        Facts.stepStarted(runId, "s", A1, "task", t(5)),
+      );
+      for (const fact of stale(t(6))) await s.appendFact(runId, fact);
+      eq(
+        stepStateOf(await s.loadRunState(runId), "s"),
+        { tag: "running", attempt: A1 },
+        "loadRunState: a settle for an attempt that has not started is ignored",
+      );
+      eq(
+        await stepView(s, runId, "s"),
+        { stepId: "s", attempt: A1, status: "running", startedAt: t(5) },
+        "describe: a settle for an attempt that has not started is ignored",
+      );
+
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, { fresh: true }, t(7)),
+      );
+      eq(
+        stepStateOf(await s.loadRunState(runId), "s"),
+        { tag: "completed", attempt: A1, output: { fresh: true } },
+        "loadRunState: the restarted attempt settles",
+      );
+      eq(
+        await stepView(s, runId, "s"),
+        {
+          stepId: "s",
+          attempt: A1,
+          status: "completed",
+          startedAt: t(5),
+          completedAt: t(7),
+          output: { fresh: true },
+        },
+        "describe: the restarted attempt settles",
+      );
+    },
+  },
+  {
     name: "describe: a skipped step settles its view; a settled step changes only by reset",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });

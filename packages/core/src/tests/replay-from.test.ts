@@ -2,8 +2,25 @@ import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { NagiRuntimeError, NagiValidationError } from "../errors";
 import { Facts } from "../facts";
-import type { AttemptNumber, StepResetFact } from "../types";
-import { makeHarness, passthroughSchema } from "./test-helpers";
+import type { AttemptNumber, RunId, StepResetFact } from "../types";
+import { type Harness, makeHarness, passthroughSchema } from "./test-helpers";
+
+// Attempt 1's worker claims the step, starts it, and dies; the reaper then
+// re-enqueues attempt 2, which no worker has picked up yet.
+async function crashAndReap(h: Harness, runId: RunId): Promise<void> {
+  const [msg] = await h.queue.dequeue({ count: 1 });
+  if (msg === undefined) throw new Error("expected a dispatch");
+  await h.store.claimStep(runId, "a", msg.attempt);
+  await h.store.appendFact(
+    runId,
+    Facts.stepStarted(runId, "a", msg.attempt, "task", new Date()),
+  );
+  const reaped = await h.store.sweepLeases({
+    now: new Date(Date.now() + 60 * 60_000),
+    queue: h.queue,
+  });
+  expect(reaped.map((r) => r.nextAttempt)).toEqual([2]);
+}
 
 describe("wf.replay({ from }) — step-scoped replay", () => {
   it("re-runs `from` and downstream on a completed run; preserves upstream", async () => {
@@ -141,6 +158,95 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     const r = await h.result(runId);
     expect(r.factCount("step.abort-requested")).toBe(1);
     expect(r.factCount("step.canceled")).toBe(1);
+    expect(r.status).toBe("completed");
+  });
+
+  it("after a lease reap, aborts the re-dispatched attempt rather than the dead one", async () => {
+    const aborted: number[] = [];
+    const f = flow({
+      id: "from-after-reap",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          run: async ({ ctx }) => {
+            if (ctx.attempt === 1) return { from: "post-reset" };
+            while (!ctx.signal.aborted) {
+              await new Promise((r) => setTimeout(r, 5));
+            }
+            aborted.push(ctx.attempt);
+            throw new Error("aborted");
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    await crashAndReap(h, runId);
+    const worker = h.startWorker({ pollIntervalMs: 5 });
+    try {
+      await h.waitForStep(runId, "a", "running", 2_000);
+      for (let i = 0; i < 400 && stepAttempt(await h.result(runId)) < 2; i++) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const started = Date.now();
+      await h.wf.replay(runId, { mode: "continue", from: "a" });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await h.waitForStep(runId, "a", "completed", 3_000);
+    } finally {
+      await worker.stop();
+    }
+    expect(aborted).toEqual([2]);
+    const r = await h.result(runId);
+    expect(r.factsOf("step.abort-requested").map((x) => x.attempt)).toEqual([
+      2,
+    ]);
+    expect(r.output("a")).toEqual({ from: "post-reset" });
+  });
+
+  it("a replay issued before the reaped step restarts aborts the restart too; its stale result never settles the reset step", async () => {
+    const f = flow({
+      id: "from-in-reap-window",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        a: b.task({
+          run: async ({ ctx }) => {
+            if (ctx.attempt === 1) {
+              await new Promise((r) => setTimeout(r, 600));
+              return { from: "post-reset" };
+            }
+            // Ignores ctx.signal: finishes while the post-reset attempt runs.
+            await new Promise((r) => setTimeout(r, 300));
+            return { from: "pre-reset" };
+          },
+        }),
+      }),
+    });
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    await crashAndReap(h, runId);
+
+    const started = Date.now();
+    const replayed = h.wf.replay(runId, { mode: "continue", from: "a" });
+    while ((await h.result(runId)).factCount("step.abort-requested") === 0) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const worker = h.startWorker({ pollIntervalMs: 5, concurrency: 4 });
+    try {
+      await replayed;
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await h.waitForStep(runId, "a", "completed", 3_000);
+    } finally {
+      await worker.stop();
+    }
+    const r = await h.result(runId);
+    expect(r.factsOf("step.abort-requested").map((x) => x.attempt)).toEqual([
+      1, 2,
+    ]);
+    const kinds = r.raw.facts.map((x) => x.kind);
+    expect(kinds.indexOf("step.canceled")).toBeLessThan(
+      kinds.indexOf("step.reset"),
+    );
+    expect(r.output("a")).toEqual({ from: "post-reset" });
     expect(r.status).toBe("completed");
   });
 
@@ -299,3 +405,8 @@ describe("wf.replay({ from }) — step-scoped replay", () => {
     expect(fires.length).toBe(baseline);
   });
 });
+
+function stepAttempt(r: Awaited<ReturnType<Harness["result"]>>): number {
+  const step = r.raw.steps["a"];
+  return step !== undefined && "attempt" in step ? step.attempt : 0;
+}
