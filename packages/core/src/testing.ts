@@ -1180,6 +1180,36 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "step.retried releases the failed attempt's lease, so the reaper leaves the backoff alone",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });
+      const queue = new InMemoryQueue();
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "s");
+      ok((await s.claimStep(runId, "s", A1)) !== null, "claim");
+      const now = Date.now();
+      await s.appendFact(
+        runId,
+        Facts.stepRetried(
+          runId,
+          "s",
+          A1,
+          new Date(now + HOUR_MS),
+          { name: "Error", message: "boom" },
+          new Date(now),
+        ),
+      );
+      await sleep(PAST_LEASE_MS);
+      eq(
+        await s.sweepLeases({ now: new Date(), queue }),
+        [],
+        "nothing to reap",
+      );
+      await claimableAgain(s, runId, "s", "step.retried");
+    },
+  },
+  {
     name: "sweepLeases: skips live leases and the released lease of a settled step",
     async run(h) {
       const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });

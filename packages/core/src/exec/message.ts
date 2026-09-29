@@ -12,7 +12,12 @@ import {
 } from "../internal";
 import { resolveRetry } from "../retry";
 import { currentChildRunId } from "../run-id";
-import { isAbortRequested, isTerminalRun, stepStateOf } from "../state";
+import {
+  isAbortRequested,
+  isTerminalRun,
+  type StepState,
+  stepStateOf,
+} from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
   classifyFailure,
@@ -85,6 +90,20 @@ function startInput(def: StepDef, input: Json): Json {
       return input;
     case "signal":
       return null;
+  }
+}
+
+function isSupersededAttempt(step: StepState, attempt: number): boolean {
+  switch (step.tag) {
+    case "backoff":
+      return attempt <= step.failedAttempt;
+    case "running":
+    case "awaitingSignal":
+    case "awaitingChild":
+    case "aborting":
+      return attempt < step.attempt;
+    default:
+      return false;
   }
 }
 
@@ -210,6 +229,10 @@ export function makeMessage(
 
     // Aborted on a live run: only replay({ from }) re-drives it.
     if (preStep.tag === "canceled") return { tag: "skip" };
+
+    // A message for an attempt the step has moved past is stale (a redelivery
+    // of a failed or reaped attempt): running it would duplicate the current one.
+    if (isSupersededAttempt(preStep, attempt)) return { tag: "skip" };
 
     const claim = await store.claimStep(runId, stepId, attempt);
     if (claim === null) return { tag: "skip" };

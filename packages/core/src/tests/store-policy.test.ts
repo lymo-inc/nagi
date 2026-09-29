@@ -105,11 +105,18 @@ describe("factConsequences — the release table", () => {
     ).toEqual({ tag: "release-lease", stepId: "s", attempt: A1 });
   });
 
+  it("step.retried releases only the failed attempt's lease", () => {
+    expect(
+      releaseOf(
+        Facts.stepRetried(R, "s", A1, AT, { name: "E", message: "" }, AT),
+      ),
+    ).toEqual({ tag: "release-lease", stepId: "s", attempt: A1 });
+  });
+
   it("everything else releases nothing", () => {
     const none: Fact[] = [
       Facts.flowStarted({ runId: R, flowId: "f", input: null, at: AT }),
       Facts.stepStarted(R, "s", A1, "task", AT),
-      Facts.stepRetried(R, "s", A1, AT, { name: "E", message: "" }, AT),
       Facts.stepSkipped({
         runId: R,
         stepId: "s",
