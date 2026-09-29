@@ -149,14 +149,23 @@ describe("pgmqQueue.dequeue", () => {
     expect(messages[0]?.receipt).toBe("9007199254740993");
   });
 
-  it("throws on a malformed envelope", async () => {
+  it("archives a malformed envelope and returns the valid ones", async () => {
     const fake = createCapturingDb();
-    fake.enqueueRows([{ msg_id: "1", message: { stepId: "x", attempt: 1 } }]);
+    fake.enqueueRows([
+      { msg_id: "1", message: { stepId: "x", attempt: 1 } },
+      { msg_id: "2", message: { runId: "r1", stepId: "s1", attempt: 1 } },
+    ]);
     const q = pgmqQueue({ db: fake.db });
 
-    await expect(q.dequeue({ count: 1 })).rejects.toThrow(
-      /malformed message envelope/,
+    const messages = await q.dequeue({ count: 2 });
+
+    expect(messages).toEqual([
+      { receipt: "2", runId: "r1", stepId: "s1", attempt: 1, payload: null },
+    ]);
+    const archiveQuery = fake.queries.find((query) =>
+      query.sql.includes("pgmq.archive"),
     );
+    expect(archiveQuery?.parameters).toEqual(["nagi", "1"]);
   });
 
   it("floors visibility timeout at 1 second", async () => {

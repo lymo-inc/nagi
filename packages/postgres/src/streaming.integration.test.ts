@@ -270,6 +270,215 @@ d("@nagi-js/postgres — streaming over LISTEN/NOTIFY", () => {
       events.filter((e) => e.kind === "chunk").map((e) => e.chunk),
     ).toEqual(tokens);
   }, 30_000);
+
+  it("a reconnect ends a stream whose close frame was lost", async () => {
+    // Wraps pgListener: onNotify is dropped while "disconnected", and the
+    // onReconnect the store passed for the stream channel is captured so the
+    // test can call it once the (simulated) reconnect is done.
+    let connected = true;
+    let capturedOnReconnect: (() => void) | undefined;
+    const base = pgListener(url as string);
+    const gated: StreamListener = {
+      async listen(channel, onNotify, onReconnect) {
+        if (onReconnect) capturedOnReconnect = onReconnect;
+        return base.listener.listen(
+          channel,
+          (payload) => {
+            if (connected) onNotify(payload);
+          },
+          onReconnect,
+        );
+      },
+    };
+
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const f = flow({
+      id: "pg-stream-reconnect",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        gen: b.streamingTask({
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ ctx }) => {
+            await ctx.emit("a");
+            await gate;
+            return { done: true };
+          },
+        }),
+      }),
+    });
+
+    const store = postgresStore({ db, schema, listener: gated });
+    await store.ready();
+    const wf = await nagi({
+      store,
+      queue: new InMemoryQueue(),
+      clock: new InMemoryClock(),
+      flows: [f],
+    });
+
+    const runId = await wf.start(f, {});
+    const iterator = wf
+      .subscribe<string>(runId, "gen" as StepId)
+      [Symbol.asyncIterator]();
+
+    try {
+      const events = await withWorker(wf, async () => {
+        const first = await iterator.next();
+        const collected = [first.value as StreamEvent<string>];
+
+        // The close frame fires only once the step completes, strictly after
+        // this, so "disconnected" is already in effect when it would arrive.
+        connected = false;
+        release?.();
+        await waitForStatus(db, schema, runId, "completed");
+
+        connected = true;
+        capturedOnReconnect?.();
+
+        const timeout = new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("iterator never ended after reconnect")),
+            2_000,
+          ),
+        );
+        const drain = (async () => {
+          for (;;) {
+            const next = await iterator.next();
+            if (next.done) break;
+            collected.push(next.value as StreamEvent<string>);
+          }
+        })();
+        await Promise.race([drain, timeout]);
+        return collected;
+      });
+
+      expect(events[0]).toEqual({ kind: "chunk", chunk: "a" });
+    } finally {
+      await iterator.return?.();
+      await store.close();
+    }
+  }, 30_000);
+
+  it("a reconnect ends a failed step's stream with error", async () => {
+    // Wraps pgListener: onNotify is dropped while "disconnected", and the
+    // onReconnect the store passed for the stream channel is captured so the
+    // test can call it once the (simulated) reconnect is done.
+    let connected = true;
+    let capturedOnReconnect: (() => void) | undefined;
+    const base = pgListener(url as string);
+    const gated: StreamListener = {
+      async listen(channel, onNotify, onReconnect) {
+        if (onReconnect) capturedOnReconnect = onReconnect;
+        return base.listener.listen(
+          channel,
+          (payload) => {
+            if (connected) onNotify(payload);
+          },
+          onReconnect,
+        );
+      },
+    };
+
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const f = flow({
+      id: "pg-stream-reconnect-failed",
+      input: passthroughSchema<Record<string, never>>(),
+      build: (b) => ({
+        gen: b.streamingTask({
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ ctx }) => {
+            await ctx.emit("a");
+            await gate;
+            throw new Error("boom");
+          },
+        }),
+      }),
+    });
+
+    const store = postgresStore({ db, schema, listener: gated });
+    await store.ready();
+    const wf = await nagi({
+      store,
+      queue: new InMemoryQueue(),
+      clock: new InMemoryClock(),
+      flows: [f],
+    });
+
+    const runId = await wf.start(f, {});
+    const iterator = wf
+      .subscribe<string>(runId, "gen" as StepId)
+      [Symbol.asyncIterator]();
+
+    try {
+      const events = await withWorker(wf, async () => {
+        const first = await iterator.next();
+        const collected = [first.value as StreamEvent<string>];
+
+        // The close frame fires only once the step fails, strictly after
+        // this, so "disconnected" is already in effect when it would arrive.
+        connected = false;
+        release?.();
+        await waitForStatus(db, schema, runId, "failed");
+
+        connected = true;
+        capturedOnReconnect?.();
+
+        const timeout = new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("iterator never ended after reconnect")),
+            2_000,
+          ),
+        );
+        const drain = (async () => {
+          for (;;) {
+            const next = await iterator.next();
+            if (next.done) break;
+            collected.push(next.value as StreamEvent<string>);
+          }
+        })();
+        await Promise.race([drain, timeout]);
+        return collected;
+      });
+
+      expect(events).toEqual([
+        { kind: "chunk", chunk: "a" },
+        { kind: "error" },
+      ]);
+    } finally {
+      await iterator.return?.();
+      await store.close();
+    }
+  }, 30_000);
+
+  it("close() ends the underlying LISTEN clients", async () => {
+    const ended: boolean[] = [];
+    const listener: StreamListener = {
+      async listen(channel, onNotify) {
+        const client = new pg.Client({ connectionString: url });
+        await client.connect();
+        client.on("notification", (msg) => {
+          if (msg.channel === channel && msg.payload) onNotify(msg.payload);
+        });
+        await client.query(`LISTEN "${channel}"`);
+        const idx = ended.push(false) - 1;
+        return async () => {
+          await client.end();
+          ended[idx] = true;
+        };
+      },
+    };
+    const store = postgresStore({ db, schema, listener });
+    await store.ready();
+    await store.close();
+    await store.close();
+    expect(ended).toEqual([true, true]);
+  }, 30_000);
 });
 
 async function loadStatus(

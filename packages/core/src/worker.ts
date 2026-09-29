@@ -182,10 +182,14 @@ class WorkerImpl implements Worker {
   async runUntilEmpty(
     opts?: WorkerRunUntilEmptyOpts,
   ): Promise<WorkerRunResult> {
-    const deadline = opts?.deadline;
+    const timeoutMs = opts?.timeoutMs;
+    const endAt =
+      timeoutMs === undefined
+        ? undefined
+        : this.deps.clock.now().getTime() + timeoutMs;
     return this.pump({
       shouldContinue: () =>
-        deadline === undefined || this.deps.clock.now().getTime() < deadline,
+        endAt === undefined || this.deps.clock.now().getTime() < endAt,
       batchSize: () => this.concurrency,
     });
   }
@@ -247,13 +251,22 @@ class WorkerImpl implements Worker {
     try {
       result = await this.dispatcher.dispatchMessage(msg);
     } catch (err) {
+      // Same curve as a failing dequeue: whatever threw (a database outage,
+      // or a bug that throws on every delivery) must not redeliver at once.
+      const delayMs = this.dequeueBackoffMs(msg.readCount);
       this.deps.emitLog({
         level: "error",
         msg: "worker.dispatch threw uncaught",
-        attrs: { error: String(err) },
+        attrs: {
+          runId: msg.runId,
+          stepId: msg.stepId,
+          readCount: msg.readCount,
+          delayMs,
+          error: String(err),
+        },
       });
       try {
-        await this.deps.queue.nack(msg.receipt);
+        await this.deps.queue.nack(msg.receipt, { delayMs });
       } catch {}
       return;
     }

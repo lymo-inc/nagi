@@ -16,11 +16,14 @@ import type {
 // wires one, the same way it already wires `db`.
 //
 // `listen` MUST deliver every NOTIFY on `channel` to `onNotify` until the
-// returned disposer is called.
+// returned disposer is called. A listener that reconnects after losing its
+// connection MUST re-LISTEN and then call `onReconnect`: NOTIFYs sent in
+// between are lost, and the store re-checks what they could have closed.
 export interface StreamListener {
   listen(
     channel: string,
     onNotify: (payload: string) => void,
+    onReconnect?: () => void,
   ): Promise<() => void | Promise<void>>;
 }
 
@@ -44,6 +47,7 @@ export type StreamFrame =
     }
   | { readonly k: "ok"; readonly r: RunId; readonly s: StepId }
   | { readonly k: "err"; readonly r: RunId; readonly s: StepId }
+  | { readonly k: "reopen"; readonly r: RunId; readonly s: StepId }
   | { readonly k: "run"; readonly r: RunId };
 
 export function encodeFrame(frame: StreamFrame): string {
@@ -77,6 +81,9 @@ export function applyFrame(hub: InMemoryStreamHub, frame: StreamFrame): void {
       return;
     case "err":
       hub.closeError(frame.r, frame.s);
+      return;
+    case "reopen":
+      hub.reopen(frame.r, frame.s);
       return;
     case "run":
       hub.closeRun(frame.r);

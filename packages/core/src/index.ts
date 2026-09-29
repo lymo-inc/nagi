@@ -90,9 +90,10 @@ export {
 } from "./store-policy";
 export {
   InMemoryStreamHub,
-  isStreamOver,
   STREAM_REPLAY_BUFFER_CAP,
   STREAM_SUBSCRIBER_BUFFER_CAP,
+  type StreamEnd,
+  streamEndOf,
 } from "./stream-hub";
 // Explicit public type surface (not `export type *`): a new type in types.ts is
 // internal-by-default, and any change to the public surface shows up as a diff.
@@ -171,6 +172,7 @@ export type {
   SnapshotGoneDisposition,
   SnapshotGonePolicy,
   StandardSchemaV1,
+  StartSeed,
   Step,
   StepAbortRequestedFact,
   StepCanceledFact,

@@ -25,6 +25,7 @@ import type {
   RunView,
   SerializedError,
   SettleSignalResult,
+  StartSeed,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
@@ -48,9 +49,9 @@ import {
   InMemoryRunEventHub,
   InMemoryStreamHub,
   isRunEnd,
-  isStreamOver,
   NagiConcurrencyConflictError,
   projectRunState,
+  streamEndOf,
   supersede,
 } from "@nagi-js/core";
 import type { Kysely } from "kysely";
@@ -67,6 +68,7 @@ import { uuidv7 } from "./uuidv7";
 
 const DEFAULT_LEASE_MS: Millis = 60_000;
 const SCHEMA_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MAX_SCHEMA_LEN = 56; // 63-byte identifier limit minus "_stream"/"_events"
 
 type StartResult = Awaited<ReturnType<Store["tryStartRun"]>>;
 const NOT_STARTED: StartResult = { started: false, canceled: [] };
@@ -75,7 +77,6 @@ export interface PostgresStoreOpts<DB = unknown> {
   readonly db: Kysely<DB>;
   readonly schema?: string;
   readonly leaseMs?: Millis;
-  readonly notifyChannel?: string;
   // One LISTEN connection, powering both `b.streamingTask` chunks and
   // wf.watchRun / wf.watchRuns lifecycle events. Without it the store exposes
   // neither transport: nagi() refuses to register a streaming flow, and the
@@ -88,6 +89,9 @@ export interface PostgresStoreOpts<DB = unknown> {
 // the same breath MUST await ready() first.
 export interface PostgresStoreHandle extends Store {
   ready(): Promise<void>;
+  // Stops both LISTEN channels. Idempotent. Open wf.subscribe() iterators
+  // and watchers stop receiving; nothing is written.
+  close(): Promise<void>;
 }
 
 export function postgresStore<DB = unknown>(
@@ -100,7 +104,6 @@ class PostgresStore<DB = unknown> implements Store {
   private readonly db: Kysely<DB>;
   private readonly schema: string;
   private readonly leaseMs: Millis;
-  private readonly notifyChannel: string | undefined;
   private readonly streamChannel: string;
   private readonly eventChannel: string;
   private readonly eventHub: InMemoryRunEventHub | undefined;
@@ -109,6 +112,12 @@ class PostgresStore<DB = unknown> implements Store {
   // so chunks and events published before then are gone, not delayed. Total
   // rather than optional: with no listener there is simply nothing to wait for.
   private readonly listening: Promise<void>;
+  // Resolved disposers, kept so close() can release both LISTEN channels.
+  // Total rather than optional, same reasoning as `listening`.
+  private readonly disposers: Promise<
+    ReadonlyArray<() => void | Promise<void>>
+  >;
+  private closing: Promise<void> | undefined;
   // Left UNASSIGNED when no listener is supplied: under
   // exactOptionalPropertyTypes an absent property and one set to undefined are
   // different things, and Store declares `stream?`.
@@ -116,20 +125,22 @@ class PostgresStore<DB = unknown> implements Store {
   readonly events?: RunEventTransport;
 
   constructor(opts: PostgresStoreOpts<DB>) {
-    if (!SCHEMA_RE.test(opts.schema ?? "nagi")) {
+    const schema = opts.schema ?? "nagi";
+    if (!SCHEMA_RE.test(schema) || schema.length > MAX_SCHEMA_LEN) {
       throw new Error(
-        `@nagi-js/postgres: invalid schema name "${opts.schema}". Must match /^[A-Za-z_][A-Za-z0-9_]*$/.`,
+        `@nagi-js/postgres: invalid schema name "${opts.schema}". Must match /^[A-Za-z_][A-Za-z0-9_]*$/ and be at most ${MAX_SCHEMA_LEN} characters.`,
       );
     }
     this.db = opts.db;
-    this.schema = opts.schema ?? "nagi";
+    this.schema = schema;
     this.leaseMs = opts.leaseMs ?? DEFAULT_LEASE_MS;
-    this.notifyChannel = opts.notifyChannel;
-    // SCHEMA_RE already bounded this to an identifier, so the channel name is
-    // safe and stays inside PostgreSQL's 63-byte limit.
+    // SCHEMA_RE and MAX_SCHEMA_LEN already bounded this to an identifier of
+    // at most 56 characters, so the channel name stays inside PostgreSQL's
+    // 63-byte limit.
     this.streamChannel = `${this.schema}_stream`;
     this.eventChannel = `${this.schema}_events`;
-    let listening: Promise<void> = Promise.resolve();
+    let disposers: Promise<ReadonlyArray<() => void | Promise<void>>> =
+      Promise.resolve([]);
     if (opts.listener !== undefined) {
       const eventHub = new InMemoryRunEventHub();
       this.eventHub = eventHub;
@@ -152,14 +163,17 @@ class PostgresStore<DB = unknown> implements Store {
           const frame = decodeFrame(payload);
           if (frame !== null) applyFrame(hub, frame);
         },
+        () => void this.resyncStreams(hub),
       );
       this.stream = this.makeStreamTransport(hub);
 
-      listening = Promise.all([eventsListening, streamListening]).then(
-        () => undefined,
-      );
+      disposers = Promise.all([eventsListening, streamListening]);
     }
-    this.listening = listening;
+    this.disposers = disposers;
+    // A LISTEN that never succeeded has nothing to dispose; close() does not
+    // need the rejection, only ready() does.
+    void this.disposers.catch(() => undefined);
+    this.listening = this.disposers.then(() => undefined);
     // ready() reports a failed LISTEN by rejecting, but nothing forces a caller
     // to ask. This keeps an unobserved failure from surfacing as an unhandled
     // rejection while leaving this.listening itself rejected for those who do.
@@ -169,6 +183,28 @@ class PostgresStore<DB = unknown> implements Store {
   // Resolves once this process is actually receiving NOTIFY on both channels.
   ready(): Promise<void> {
     return this.listening;
+  }
+
+  close(): Promise<void> {
+    this.closing ??= (async () => {
+      const disposers = await this.disposers.catch(() => []);
+      await Promise.all(disposers.map(async (d) => d()));
+    })();
+    return this.closing;
+  }
+
+  // A reconnect loses the close frames sent during the gap; durable state
+  // still knows which of the open streams are over.
+  private async resyncStreams(hub: InMemoryStreamHub): Promise<void> {
+    for (const { runId, stepId } of hub.openStreams()) {
+      try {
+        const end = streamEndOf(await this.loadRunState(runId), stepId);
+        if (end === "error") hub.closeError(runId, stepId);
+        else if (end === "ok") hub.closeOk(runId, stepId);
+      } catch {
+        /* one unreadable run must not stop the rest */
+      }
+    }
   }
 
   private makeStreamTransport(hub: InMemoryStreamHub): StreamTransport {
@@ -191,7 +227,10 @@ class PostgresStore<DB = unknown> implements Store {
         void (async () => {
           try {
             await this.listening;
-            if (isStreamOver(await this.loadRunState(runId), stepId)) {
+            // A late subscriber gets an empty stream, even for a failed step (D7).
+            if (
+              streamEndOf(await this.loadRunState(runId), stepId) !== "open"
+            ) {
               hub.closeOk(runId, stepId);
             }
           } catch {
@@ -293,6 +332,7 @@ class PostgresStore<DB = unknown> implements Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
+    seed?: StartSeed,
   ): Promise<StartResult> {
     return this.db.transaction().execute(async (trx) => {
       if (concurrency !== undefined) {
@@ -301,7 +341,15 @@ class PostgresStore<DB = unknown> implements Store {
           trx,
         );
       }
-      return this.startRetrying(trx, runId, fact, concurrency);
+      const started = await this.startRetrying(trx, runId, fact, concurrency);
+      // Outside the savepoint loop: a rolled-back attempt must never enqueue.
+      if (started.started && seed !== undefined) {
+        const txQueue = seed.queue.withTx?.(trx as unknown as Tx) ?? seed.queue;
+        for (const stepId of seed.steps) {
+          await txQueue.enqueue(runId, stepId, { flowId: seed.flowId });
+        }
+      }
+      return started;
     });
   }
 
@@ -438,8 +486,11 @@ class PostgresStore<DB = unknown> implements Store {
     return insert.rows.length > 0;
   }
 
-  async loadRunState(runId: RunId): Promise<RunState> {
-    return this.loadRunStateWith(this.db, runId);
+  async loadRunState(runId: RunId, tx?: Tx): Promise<RunState> {
+    return this.loadRunStateWith(
+      tx === undefined ? this.db : (tx as unknown as Kysely<DB>),
+      runId,
+    );
   }
 
   private async loadRunStateWith(
@@ -454,7 +505,7 @@ class PostgresStore<DB = unknown> implements Store {
       SELECT kind, at, payload
         FROM ${sql.raw(this.t("fact"))}
        WHERE run_id = ${runId}
-       ORDER BY fact_id ASC
+       ORDER BY seq ASC NULLS FIRST, fact_id ASC
     `.execute(executor);
 
     const facts: Fact[] = rows.rows.map((r) =>
@@ -546,7 +597,7 @@ class PostgresStore<DB = unknown> implements Store {
     readonly queue: Queue;
     readonly limit?: number;
   }): Promise<readonly ReapedLease[]> {
-    const { now, queue, limit = DEFAULT_SWEEP_LIMIT } = args;
+    const { queue, limit = DEFAULT_SWEEP_LIMIT } = args;
     return this.db.transaction().execute(async (trx) => {
       // FOR UPDATE OF l SKIP LOCKED so concurrent reapers split the batch
       // without retry; the LEFT JOIN surfaces the step status that
@@ -562,6 +613,7 @@ class PostgresStore<DB = unknown> implements Store {
         status: StepRunStatus | null;
         child_active: boolean;
         flow_id: string | null;
+        db_now: Date;
       }>`
         SELECT l.run_id, l.step_id, l.attempt, l.expires_at, s.status,
           EXISTS (
@@ -570,14 +622,18 @@ class PostgresStore<DB = unknown> implements Store {
                AND c.parent_step_id = l.step_id
                AND c.status IN ('pending', 'running')
           ) AS child_active,
-          r.flow_id
+          r.flow_id,
+          now() AS db_now
           FROM ${sql.raw(this.t("lease"))} l
           LEFT JOIN ${sql.raw(this.t("step_run"))} s
             ON s.run_id = l.run_id
            AND s.step_id = l.step_id
           LEFT JOIN ${sql.raw(this.t("workflow_run"))} r
             ON r.run_id = l.run_id
-         WHERE l.expires_at < ${now}
+         -- Expiry is judged on the clock that set it: claimStep/extendLease
+         -- set expires_at from SQL now(), so the sweep must compare against
+         -- now() too, not the reaping worker's app clock.
+         WHERE l.expires_at < now()
          FOR UPDATE OF l SKIP LOCKED
          LIMIT ${limit}
       `.execute(trx);
@@ -597,12 +653,14 @@ class PostgresStore<DB = unknown> implements Store {
             ? row.expires_at
             : new Date(row.expires_at);
         const stepStatus: StepRunStatus = row.status ?? "pending";
+        const dbNow =
+          row.db_now instanceof Date ? row.db_now : new Date(row.db_now);
 
         const decision = decideExpiredLeaseAction({
           lease: { runId, stepId, attempt, expiresAt },
           stepStatus,
           childActive: row.child_active,
-          now,
+          now: dbNow,
         });
         if (decision.tag === "skip") continue;
 
@@ -773,10 +831,6 @@ class PostgresStore<DB = unknown> implements Store {
       await sql`SELECT pg_notify(${this.eventChannel}, ${payload})`.execute(
         trx,
       );
-    }
-    // Identical payloads within one tx collapse into a single notification.
-    if (this.notifyChannel !== undefined) {
-      await sql`SELECT pg_notify(${this.notifyChannel}, ${runId})`.execute(trx);
     }
     return true;
   }
@@ -1061,23 +1115,27 @@ class PostgresStore<DB = unknown> implements Store {
   }
 
   async describe(runId: RunId): Promise<RunDescription> {
-    // Single tx for read consistency across the three SELECTs.
-    return this.db.transaction().execute(async (trx) => {
-      const runRows = await sql<{
-        run_id: string;
-        flow_id: string;
-        flow_hash: string | null;
-        status: RunStatus;
-        input: Json;
-        output: Json | null;
-        error: Json | null;
-        started_at: Date;
-        completed_at: Date | null;
-        concurrency_key: string | null;
-        canceled_by_run_id: string | null;
-        parent_run_id: string | null;
-        parent_step_id: string | null;
-      }>`
+    // One snapshot across the SELECTs; READ COMMITTED would re-snapshot each.
+    return this.db
+      .transaction()
+      .setIsolationLevel("repeatable read")
+      .setAccessMode("read only")
+      .execute(async (trx) => {
+        const runRows = await sql<{
+          run_id: string;
+          flow_id: string;
+          flow_hash: string | null;
+          status: RunStatus;
+          input: Json;
+          output: Json | null;
+          error: Json | null;
+          started_at: Date;
+          completed_at: Date | null;
+          concurrency_key: string | null;
+          canceled_by_run_id: string | null;
+          parent_run_id: string | null;
+          parent_step_id: string | null;
+        }>`
         SELECT run_id, flow_id, flow_hash, status, input, output, error,
                started_at, completed_at, concurrency_key, canceled_by_run_id,
                parent_run_id, parent_step_id
@@ -1086,19 +1144,19 @@ class PostgresStore<DB = unknown> implements Store {
          LIMIT 1
       `.execute(trx);
 
-      const r = runRows.rows[0];
-      if (r === undefined) return null;
+        const r = runRows.rows[0];
+        if (r === undefined) return null;
 
-      const stepRows = await sql<{
-        step_id: string;
-        attempt: number;
-        status: StepRunStatus;
-        output: Json | null;
-        error: Json | null;
-        started_at: Date | null;
-        completed_at: Date | null;
-        lease_expires_at: Date | null;
-      }>`
+        const stepRows = await sql<{
+          step_id: string;
+          attempt: number;
+          status: StepRunStatus;
+          output: Json | null;
+          error: Json | null;
+          started_at: Date | null;
+          completed_at: Date | null;
+          lease_expires_at: Date | null;
+        }>`
         SELECT s.step_id, s.attempt, s.status, s.output, s.error,
                s.started_at, s.completed_at, l.expires_at AS lease_expires_at
           FROM ${sql.raw(this.t("step_run"))} s
@@ -1111,81 +1169,85 @@ class PostgresStore<DB = unknown> implements Store {
          ORDER BY s.started_at ASC NULLS LAST, s.step_id ASC
       `.execute(trx);
 
-      const childRows = await sql<{ run_id: string }>`
+        const childRows = await sql<{ run_id: string }>`
         SELECT run_id
           FROM ${sql.raw(this.t("workflow_run"))}
          WHERE parent_run_id = ${runId}
          ORDER BY started_at ASC
       `.execute(trx);
 
-      const startedAt =
-        r.started_at instanceof Date ? r.started_at : new Date(r.started_at);
-      const completedAt =
-        r.completed_at === null
-          ? undefined
-          : r.completed_at instanceof Date
-            ? r.completed_at
-            : new Date(r.completed_at);
-      const parent =
-        r.parent_run_id !== null && r.parent_step_id !== null
-          ? {
-              runId: r.parent_run_id as RunId,
-              stepId: r.parent_step_id,
-            }
-          : undefined;
-      const run: RunView = {
-        runId: r.run_id as RunId,
-        flowId: r.flow_id,
-        flowHash: r.flow_hash ?? "",
-        status: r.status,
-        startedAt,
-        input: r.input,
-        children: childRows.rows.map((c) => c.run_id as RunId),
-        ...(completedAt !== undefined ? { completedAt } : {}),
-        ...(r.output !== null ? { output: r.output } : {}),
-        ...(r.error !== null ? { error: r.error } : {}),
-        ...(r.canceled_by_run_id !== null
-          ? { canceledByRunId: r.canceled_by_run_id as RunId }
-          : {}),
-        ...(r.concurrency_key !== null
-          ? { concurrencyKey: r.concurrency_key }
-          : {}),
-        ...(parent !== undefined ? { parent } : {}),
-      };
-
-      const steps: StepView[] = stepRows.rows.map((sr) => {
-        const sStartedAt =
-          sr.started_at === null
+        const startedAt =
+          r.started_at instanceof Date ? r.started_at : new Date(r.started_at);
+        const completedAt =
+          r.completed_at === null
             ? undefined
-            : sr.started_at instanceof Date
-              ? sr.started_at
-              : new Date(sr.started_at);
-        const sCompletedAt =
-          sr.completed_at === null
-            ? undefined
-            : sr.completed_at instanceof Date
-              ? sr.completed_at
-              : new Date(sr.completed_at);
-        const sLeaseAt =
-          sr.lease_expires_at === null
-            ? undefined
-            : sr.lease_expires_at instanceof Date
-              ? sr.lease_expires_at
-              : new Date(sr.lease_expires_at);
-        return {
-          stepId: sr.step_id,
-          attempt: sr.attempt as AttemptNumber,
-          status: sr.status,
-          ...(sStartedAt !== undefined ? { startedAt: sStartedAt } : {}),
-          ...(sCompletedAt !== undefined ? { completedAt: sCompletedAt } : {}),
-          ...(sr.output !== null ? { output: sr.output } : {}),
-          ...(sr.error !== null ? { error: sr.error } : {}),
-          ...(sLeaseAt !== undefined ? { lease: { expiresAt: sLeaseAt } } : {}),
+            : r.completed_at instanceof Date
+              ? r.completed_at
+              : new Date(r.completed_at);
+        const parent =
+          r.parent_run_id !== null && r.parent_step_id !== null
+            ? {
+                runId: r.parent_run_id as RunId,
+                stepId: r.parent_step_id,
+              }
+            : undefined;
+        const run: RunView = {
+          runId: r.run_id as RunId,
+          flowId: r.flow_id,
+          flowHash: r.flow_hash ?? "",
+          status: r.status,
+          startedAt,
+          input: r.input,
+          children: childRows.rows.map((c) => c.run_id as RunId),
+          ...(completedAt !== undefined ? { completedAt } : {}),
+          ...(r.output !== null ? { output: r.output } : {}),
+          ...(r.error !== null ? { error: r.error } : {}),
+          ...(r.canceled_by_run_id !== null
+            ? { canceledByRunId: r.canceled_by_run_id as RunId }
+            : {}),
+          ...(r.concurrency_key !== null
+            ? { concurrencyKey: r.concurrency_key }
+            : {}),
+          ...(parent !== undefined ? { parent } : {}),
         };
-      });
 
-      return { run, steps };
-    });
+        const steps: StepView[] = stepRows.rows.map((sr) => {
+          const sStartedAt =
+            sr.started_at === null
+              ? undefined
+              : sr.started_at instanceof Date
+                ? sr.started_at
+                : new Date(sr.started_at);
+          const sCompletedAt =
+            sr.completed_at === null
+              ? undefined
+              : sr.completed_at instanceof Date
+                ? sr.completed_at
+                : new Date(sr.completed_at);
+          const sLeaseAt =
+            sr.lease_expires_at === null
+              ? undefined
+              : sr.lease_expires_at instanceof Date
+                ? sr.lease_expires_at
+                : new Date(sr.lease_expires_at);
+          return {
+            stepId: sr.step_id,
+            attempt: sr.attempt as AttemptNumber,
+            status: sr.status,
+            ...(sStartedAt !== undefined ? { startedAt: sStartedAt } : {}),
+            ...(sCompletedAt !== undefined
+              ? { completedAt: sCompletedAt }
+              : {}),
+            ...(sr.output !== null ? { output: sr.output } : {}),
+            ...(sr.error !== null ? { error: sr.error } : {}),
+            ...(sLeaseAt !== undefined
+              ? { lease: { expiresAt: sLeaseAt } }
+              : {}),
+          };
+        });
+
+        return { run, steps };
+      });
   }
 
   async listChildren(parentRunId: RunId): Promise<ReadonlyArray<RunId>> {
@@ -1321,6 +1383,8 @@ function frameOf(runId: RunId, effect: StreamEffect): StreamFrame {
       return { k: "err", r: runId, s: effect.stepId };
     case "retry":
       return { k: "retry", r: runId, s: effect.stepId, a: effect.nextAttempt };
+    case "reopen":
+      return { k: "reopen", r: runId, s: effect.stepId };
     case "close-run":
       return { k: "run", r: runId };
   }

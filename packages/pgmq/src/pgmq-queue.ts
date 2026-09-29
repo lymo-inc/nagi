@@ -136,9 +136,20 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
       }>`SELECT msg_id::text AS msg_id, read_ct, message FROM pgmq.read(${queueName}, ${vtSeconds}::int, ${count}::int)`.execute(
         executor,
       );
-      return rows.map((row) =>
-        projectMessage(row.msg_id, row.message, row.read_ct),
-      );
+      const messages: QueueMessage[] = [];
+      for (const row of rows) {
+        if (isEnvelope(row.message)) {
+          messages.push(projectMessage(row.msg_id, row.message, row.read_ct));
+          continue;
+        }
+        // A malformed envelope must not block the rest of the batch behind
+        // pgmq's visibility timeout forever — archive it out of the way
+        // (not delete: it stays inspectable in pgmq's archive table).
+        await sql`SELECT pgmq.archive(${queueName}, ${row.msg_id}::bigint)`.execute(
+          executor,
+        );
+      }
+      return messages;
     },
 
     async ack(receipt: string): Promise<void> {
@@ -198,23 +209,27 @@ function buildQueue(executor: Kysely<unknown>, config: QueueConfig): Queue {
   };
 }
 
+function isEnvelope(raw: unknown): raw is MessageEnvelope {
+  return (
+    raw !== null &&
+    typeof raw === "object" &&
+    typeof (raw as { runId?: unknown }).runId === "string" &&
+    typeof (raw as { stepId?: unknown }).stepId === "string" &&
+    typeof (raw as { attempt?: unknown }).attempt === "number"
+  );
+}
+
 function projectMessage(
   msgId: string,
   raw: unknown,
   readCount: number,
 ): QueueMessage {
-  if (
-    raw === null ||
-    typeof raw !== "object" ||
-    typeof (raw as { runId?: unknown }).runId !== "string" ||
-    typeof (raw as { stepId?: unknown }).stepId !== "string" ||
-    typeof (raw as { attempt?: unknown }).attempt !== "number"
-  ) {
+  if (!isEnvelope(raw)) {
     throw new Error(
       `pgmq: malformed message envelope ${JSON.stringify(raw)} — expected { runId, stepId, attempt }`,
     );
   }
-  const envelope = raw as MessageEnvelope;
+  const envelope = raw;
   return {
     receipt: msgId,
     runId: envelope.runId as RunId,

@@ -30,4 +30,16 @@ describe("postgresStore — config validation", () => {
       /invalid schema name/i,
     );
   });
+
+  it("accepts a schema name at the 56-character cap", () => {
+    const schema = "a".repeat(56);
+    expect(() => postgresStore({ db: fakeDb, schema })).not.toThrow();
+  });
+
+  it("rejects a schema name over the 56-character cap", () => {
+    const schema = "a".repeat(57);
+    expect(() => postgresStore({ db: fakeDb, schema })).toThrow(
+      /invalid schema name/i,
+    );
+  });
 });

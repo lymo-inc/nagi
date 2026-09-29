@@ -63,8 +63,9 @@ export class NagiAbortError extends Error {
 }
 
 // Computed inside the runStep tx so the fact commits atomically with the step's
-// writes. A replay abort reports abortedHere so the caller skips advancing —
-// the abort re-enqueues the step elsewhere.
+// writes. outcome says how the step ended: completed, canceled because its run
+// was canceled, or aborted by replay({ from }). Neither canceled outcome
+// advances the run.
 export function resolveExecutionFact(args: {
   readonly postState: RunState;
   readonly runId: RunId;
@@ -74,24 +75,24 @@ export function resolveExecutionFact(args: {
   readonly at: Date;
 }): {
   readonly fact: StepCompletedFact | StepCanceledFact;
-  readonly abortedHere: boolean;
+  readonly outcome: "completed" | "run-canceled" | "aborted";
 } {
   const { postState, runId, stepId, attempt, output, at } = args;
   if (postState.phase.tag === "canceled") {
     return {
       fact: Facts.stepCanceled(runId, stepId, attempt, at),
-      abortedHere: false,
+      outcome: "run-canceled",
     };
   }
   if (isAbortRequested(stepStateOf(postState, stepId), attempt)) {
     return {
       fact: Facts.stepCanceled(runId, stepId, attempt, at),
-      abortedHere: true,
+      outcome: "aborted",
     };
   }
   return {
     fact: Facts.stepCompleted(runId, stepId, attempt, output, at),
-    abortedHere: false,
+    outcome: "completed",
   };
 }
 

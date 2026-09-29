@@ -103,13 +103,20 @@ const desc = await wf.describe(runId); // run + steps + lease state
 const q = await wf.inspectQueue(runId); // in-queue messages for the run
 ```
 
+A start's first steps are enqueued in the same transaction as the run row and
+`flow.started` fact (`Store.tryStartRun`'s `seed`), so a fresh run already has
+its root steps queued the instant `describe()` can see it — there is no window
+where the run row exists but nothing is queued.
+
 | describe() says                   | inspectQueue() says            | Diagnosis                                                        |
 | --------------------------------- | ------------------------------ | ---------------------------------------------------------------- |
-| running, 0 started steps          | entry with `readCount: 0`      | Never scheduled — workers starved or not consuming               |
+| running, 0 started steps          | entry with `readCount: 0`      | Not yet consumed — workers starved or not polling                |
+| running, 0 started steps          | no entries at all              | Never scheduled — either every root step is `when`-false (it still seeds after commit, via the store-driven advance; self-heals) or the seed write itself failed (custom Store not honouring the `seed` contract, or a corrupted commit) |
 | running, step has live `lease`    | entry with future `visibleAt`  | Actively executing (slow handler — watch for watchdog warns)     |
 | running, signal step `running`    | no entries                     | Parked on a signal/child — check the signal source, not the pool |
 | running, no lease, no entries     | —                              | Advance was lost — self-heals on next redelivery; `replay(runId, { mode: "continue", from: stepId })` re-drives immediately |
 | any status                        | entry with high `readCount`    | Redelivery loop — see poison messages below                      |
+| running, a step `canceled`        | —                              | Stalled on an abort whose replay did not finish (logged as `run stalled on canceled step(s)`) — `wf.replay(runId, { mode: "continue", from: stepId })` |
 
 ## Nothing is being consumed (fleet-wide stall)
 
@@ -193,6 +200,19 @@ If you override `pgmqQueue({ visibilityTimeoutMs })` or
 otherwise every step longer than the visibility timeout is redelivered before
 its first lease extension (defaults: 40s interval, 120s visibility).
 
+## Connection pool sizing
+
+- A task step holds one connection for its whole body (its transaction).
+- A streaming step does the same for the whole stream, and that transaction
+  sits idle between chunks. Keep `idle_in_transaction_session_timeout` (if
+  set) above your longest stream. This is deliberate: streaming bodies keep
+  `ctx.tx` (backlog A-14, decided 2026-09-29).
+- `ctx.once` inside the body takes a second one.
+- Heartbeats, the cancel watcher and the sweeps take connections briefly.
+- Keep `pool.max` ≥ (sum of worker `concurrency` sharing the pool) + 2.
+- Set `connectionTimeoutMillis` so a starved pool surfaces as an error, not a
+  hang.
+
 ## Reading runs with SQL
 
 For one run, use `wf.describe(runId)`. To list or filter runs, or to join them
@@ -248,7 +268,9 @@ sees a status the fact log does not back. `pruneFacts` deletes `step_run`,
 
 `wf.watchRun(runId, handler)` and `wf.watchRuns(handler)` push lifecycle events
 as their facts commit. Both return a disposer; `watchRun` also stops on its own
-once the run is terminal.
+at the run's next terminal event. A run that is already terminal stays watched
+until the disposer is called or a replay finishes it again, so `watchRun` then
+`replay` works.
 
 ```ts
 const off = wf.watchRun(runId, (e) => {
@@ -281,6 +303,9 @@ What it is not:
 - **Not a payload channel.** Events carry identity and status only; read
   outputs and errors with `describe()`. (A NOTIFY is capped at 8000 bytes,
   and any role that can connect to the database can LISTEN.)
+- A `step.reset` event on a completed or failed run means `replay({ from })`
+  reopened it. A per-run watcher that already saw the terminal event is gone;
+  `watchRuns` sees the reopen.
 
 Concurrency supersession IS observable (`flow.canceled`, `cause:
 "concurrency"`), which matters when a run vanishes from under a client: the
@@ -302,7 +327,7 @@ await client.connect();
 const store = postgresStore({
   db,
   listener: {
-    async listen(channel, onNotify) {
+    async listen(channel, onNotify, onReconnect) {
       client.on("notification", (m) => {
         if (m.channel === channel && m.payload) onNotify(m.payload);
       });
@@ -318,17 +343,21 @@ await store.ready(); // both channels live; safe to start runs
 This client never reconnects. When its connection drops, a bare `pg.Client`
 with no `error` listener crashes the process on the unhandled `error` event;
 with one, it silently stops delivering. In production, on `error`/`end` open a
-new client, re-`LISTEN` every channel `listen()` was called with, and route its
-notifications to the same `onNotify` callbacks. What was published during the
-gap stays lost:
+new client, re-`LISTEN` every channel `listen()` was called with, route its
+notifications to the same `onNotify` callbacks, and — for the channel whose
+`listen()` call received one — call `onReconnect()` once re-`LISTEN` has
+succeeded. What was published during the gap stays lost:
 
-- Streaming: chunks in the gap are gone, and if the step's close frame falls
-  in it, an open `wf.subscribe()` iterator never ends. Subscribe again after
-  reconnecting — a new subscription checks durable state and closes at once
-  if the step has settled — and take the output from `describe()`.
+- Streaming: calling `onReconnect` after re-LISTEN makes the store re-check
+  every open stream and end the ones whose step has settled. A listener that
+  does not call it leaves them hanging; subscribing again also works — a new
+  subscription checks durable state and closes at once if the step has
+  settled. Either way, take the output from `describe()`.
 - Watching: events in the gap are gone, and a `watchRun` whose terminal event
   was missed never stops on its own; call its disposer. Catch up with
   `describe()`.
+
+Shut down with `await store.close()`.
 
 Operational limits:
 
@@ -373,6 +402,10 @@ and `ADD CONSTRAINT ... NOT VALID` yourself, `VALIDATE CONSTRAINT` separately
 `0008_canceled_by_run_id_fk` into `<schema>.schema_migrations` so `migrate()`
 skips it.
 
+**`0011_fact_seq`** adds a nullable column with a default. On PostgreSQL 11+
+that is a catalog-only change, with no table rewrite. It still takes a brief
+`ACCESS EXCLUSIVE` lock on `fact`.
+
 **`global_fact`.** Each boot that registers a flow with a changed hash
 appends one `flow_ref.updated` row to `<schema>.global_fact`. nagi only
 writes it, as an audit trail of which flow versions went live when.
@@ -382,9 +415,10 @@ deploy.
 ## Recovery actions
 
 - `wf.replay(runId, { mode: "continue", from: stepId })` — reset the step
-  **and its descendants** and re-dispatch. A `running` step is aborted first
-  (its handler sees `ctx.signal` abort, and replay waits up to 30s for it to
-  settle). Works on a live run — including a `canceled` step holding it open —
+  **and its descendants** and re-dispatch. Every `running` step it resets is
+  aborted first (its handler sees `ctx.signal` abort, and replay waits up to
+  30s in total for them to settle), and a reset subflow step's old child run is
+  canceled. Works on a live run — including a `canceled` step holding it open —
   and on a completed/failed run, which the reset reopens.
 - `wf.replay(runId, { mode: "continue", from: stepId, scope: "step" })` — rerun
   that step, plus any descendant that holds no value (`failed`, `canceled` or

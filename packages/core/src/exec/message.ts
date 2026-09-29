@@ -11,13 +11,19 @@ import {
   type SubflowDef,
 } from "../internal";
 import { resolveRetry } from "../retry";
-import { deriveChildRunId } from "../run-id";
-import { isAbortRequested, isTerminalRun, stepStateOf } from "../state";
+import { currentChildRunId } from "../run-id";
+import {
+  isAbortRequested,
+  isTerminalRun,
+  type StepState,
+  stepStateOf,
+} from "../state";
 import {
   CANCEL_POLL_INTERVAL_MS,
   classifyFailure,
   makeActivityCtx,
   makeStepCtx,
+  NagiAbortError,
   resolveExecutionFact,
   startCancelWatcher,
   startDeadline,
@@ -30,8 +36,11 @@ import type {
   QueueMessage,
   RunId,
   RunState,
+  SerializedError,
   StepCtx,
+  StepEvent,
   StreamingStepCtx,
+  Tx,
 } from "../types";
 import type { Hooks } from "./hooks";
 import type { Progression } from "./progression";
@@ -39,7 +48,24 @@ import type { Progression } from "./progression";
 type Dispatched =
   | { readonly tag: "completed"; readonly output: Json }
   | { readonly tag: "advance" }
-  | { readonly tag: "parked" };
+  | { readonly tag: "parked" }
+  | { readonly tag: "canceled"; readonly cause: "run" | "step" };
+
+type ExecOutcome = ReturnType<typeof resolveExecutionFact>["outcome"];
+
+// A standalone exhaustive switch, so reading `outcome` here isn't subject to
+// the control-flow narrowing loss that a closure-mutated `let` suffers at the
+// call site (see executeHandler's `settle`).
+function dispatchedOf(outcome: ExecOutcome, output: Json): Dispatched {
+  switch (outcome) {
+    case "completed":
+      return { tag: "completed", output };
+    case "run-canceled":
+      return { tag: "canceled", cause: "run" };
+    case "aborted":
+      return { tag: "canceled", cause: "step" };
+  }
+}
 
 type Admission =
   | { readonly tag: "skip" }
@@ -67,6 +93,20 @@ function startInput(def: StepDef, input: Json): Json {
   }
 }
 
+function isSupersededAttempt(step: StepState, attempt: number): boolean {
+  switch (step.tag) {
+    case "backoff":
+      return attempt <= step.failedAttempt;
+    case "running":
+    case "awaitingSignal":
+    case "awaitingChild":
+    case "aborting":
+      return attempt < step.attempt;
+    default:
+      return false;
+  }
+}
+
 export function makeMessage(
   deps: DispatchDeps,
   hooks: Hooks,
@@ -74,6 +114,20 @@ export function makeMessage(
 ): MessageHandler {
   const { fireHook, fireStepLifecycle } = hooks;
   const { advance } = progression;
+
+  // A canceled step fires the global onStepError (not the step-level onError,
+  // which is business logic) so a tracing consumer sees every step end exactly
+  // once.
+  async function fireStepCanceled(
+    base: Omit<StepEvent, "at">,
+    error: SerializedError,
+  ): Promise<void> {
+    await fireHook(
+      deps.hooks?.onStepError,
+      { ...base, error, at: deps.clock.now() },
+      "onStepError",
+    );
+  }
 
   async function dispatchMessage(
     message: QueueMessage,
@@ -172,6 +226,13 @@ export function makeMessage(
       // replay({ from }) resets steps on such runs and re-dispatches them.
       return isTerminalRun(preState) ? { tag: "skip" } : { tag: "recover" };
     }
+
+    // Aborted on a live run: only replay({ from }) re-drives it.
+    if (preStep.tag === "canceled") return { tag: "skip" };
+
+    // A message for an attempt the step has moved past is stale (a redelivery
+    // of a failed or reaped attempt): running it would duplicate the current one.
+    if (isSupersededAttempt(preStep, attempt)) return { tag: "skip" };
 
     const claim = await store.claimStep(runId, stepId, attempt);
     if (claim === null) return { tag: "skip" };
@@ -290,6 +351,14 @@ export function makeMessage(
     switch (outcome.tag) {
       case "parked":
         return;
+      case "canceled":
+        // No advance: a run-canceled advance was already a no-op, and an
+        // aborted step is re-driven by replay({ from }), as before.
+        await fireStepCanceled(
+          { runId, flowId: flow.id, stepId, attempt, kind: def.kind },
+          serializeError(new NagiAbortError(runId, outcome.cause)),
+        );
+        return;
       case "advance":
         await advance(runId);
         return;
@@ -380,26 +449,26 @@ export function makeMessage(
       emitLog: deps.emitLog,
     };
 
-    let abortedHere = false;
-    const settle = async (output: Json) => {
+    let outcome: ExecOutcome = "completed";
+    const settle = async (output: Json, tx: Tx) => {
       // A body that honored the deadline by returning still timed out.
       if (ac.signal.reason instanceof NagiStepTimeoutError)
         throw ac.signal.reason;
       const resolved = resolveExecutionFact({
-        postState: await store.loadRunState(runId),
+        postState: await store.loadRunState(runId, tx),
         runId,
         stepId,
         attempt,
         output,
         at: clock.now(),
       });
-      abortedHere = resolved.abortedHere;
+      outcome = resolved.outcome;
       return { output, fact: resolved.fact };
     };
 
     const inTx = (body: (ctx: StepCtx<unknown>) => Promise<Json>) =>
       store.runStep<Json>(runId, stepId, attempt, async (tx) =>
-        settle(await body(makeStepCtx({ ...ctxArgs, tx }))),
+        settle(await body(makeStepCtx({ ...ctxArgs, tx })), tx),
       );
 
     // A handler aborted by its deadline rarely rethrows our error — unwrap at
@@ -434,13 +503,13 @@ export function makeMessage(
         case "activity": {
           const ctx = makeActivityCtx(ctxArgs);
           const out = await runBody(() => def.run({ input, needs, ctx }));
-          output = await store.runStep<Json>(runId, stepId, attempt, () =>
-            settle(out),
+          output = await store.runStep<Json>(runId, stepId, attempt, (tx) =>
+            settle(out, tx),
           );
           break;
         }
       }
-      return abortedHere ? { tag: "parked" } : { tag: "completed", output };
+      return dispatchedOf(outcome, output);
     } finally {
       await watcher.stop();
       deadline?.stop();
@@ -465,7 +534,7 @@ export function makeMessage(
     // logical spawn re-derives the SAME child id (idempotent re-attach); a
     // replay (nagi#6) bumps it and gets a fresh child. See deriveChildRunId.
     const generation = state.resetCounts[stepId] ?? 0;
-    const childRunId = await deriveChildRunId({ runId, stepId, generation });
+    const childRunId = await currentChildRunId(state, stepId);
 
     // Re-entrant: a re-dispatch (lease-reap, or recovery after a lost wake) of a
     // parked subflow step whose child has ALREADY finished settles the parent
@@ -527,6 +596,13 @@ export function makeMessage(
             outcome.includeError ? error : undefined,
           ),
         );
+        const cause = postState.phase.tag === "canceled" ? "run" : "step";
+        await fireStepCanceled(
+          base,
+          outcome.includeError
+            ? error
+            : serializeError(new NagiAbortError(runId, cause)),
+        );
         return outcome.advanceAfter ? { tag: "advance" } : { tag: "parked" };
       }
       case "retry": {
@@ -568,6 +644,7 @@ export function makeMessage(
           runId,
           Facts.stepCanceled(runId, stepId, attempt, clock.now(), error),
         );
+        await fireStepCanceled(base, error);
         await progression.terminate(
           { kind: "resolved", runId, flow },
           {

@@ -25,7 +25,7 @@ import {
   selectPruneBatch,
   supersede,
 } from "./store-policy";
-import { InMemoryStreamHub, isStreamOver } from "./stream-hub";
+import { InMemoryStreamHub, streamEndOf } from "./stream-hub";
 import type {
   AttemptNumber,
   ClaimToken,
@@ -49,6 +49,7 @@ import type {
   RunId,
   RunState,
   SettleSignalResult,
+  StartSeed,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
@@ -213,6 +214,7 @@ export class InMemoryStore implements Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
+    seed?: StartSeed,
   ): Promise<{
     readonly started: boolean;
     readonly canceled: ReadonlyArray<Superseded>;
@@ -239,6 +241,11 @@ export class InMemoryStore implements Store {
     }
 
     this.writeFact(runId, fact);
+    if (seed !== undefined) {
+      for (const stepId of seed.steps) {
+        await seed.queue.enqueue(runId, stepId, { flowId: seed.flowId });
+      }
+    }
     return { started: true, canceled };
   }
 
@@ -281,7 +288,7 @@ export class InMemoryStore implements Store {
     );
   }
 
-  async loadRunState(runId: RunId): Promise<RunState> {
+  async loadRunState(runId: RunId, _tx?: Tx): Promise<RunState> {
     return foldRun(runId, this.facts.get(runId) ?? []);
   }
 
@@ -612,7 +619,10 @@ export class InMemoryStore implements Store {
       opts?: { readonly replayBuffered?: boolean },
     ): AsyncIterable<StreamEvent<Json>> => {
       // Delegating to a finished step would open a channel that hangs.
-      if (isStreamOver(foldRun(runId, this.facts.get(runId) ?? []), stepId)) {
+      if (
+        streamEndOf(foldRun(runId, this.facts.get(runId) ?? []), stepId) !==
+        "open"
+      ) {
         return EMPTY_CLOSED_STREAM;
       }
       return this.streamHub.subscribeStream(runId, stepId, opts);

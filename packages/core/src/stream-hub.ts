@@ -9,10 +9,15 @@ import type {
   StreamEvent,
 } from "./types";
 
-// Durable facts decide whether a step's stream is over, not the hub, which may
-// never have held a channel for it (the close fired before anyone listened).
-export function isStreamOver(state: RunState, stepId: StepId): boolean {
-  return isTerminalRun(state) || isStepTerminal(stepStateOf(state, stepId));
+export type StreamEnd = "open" | "ok" | "error";
+
+// Durable facts decide how a step's stream ends, not the hub, which may never
+// have held a channel for it (the close fired before anyone listened). A
+// failed step ends with `error`, as its live close frame does (RFC 0019 O4).
+export function streamEndOf(state: RunState, stepId: StepId): StreamEnd {
+  const step = stepStateOf(state, stepId);
+  if (step.tag === "failed") return "error";
+  return isTerminalRun(state) || isStepTerminal(step) ? "ok" : "open";
 }
 
 export const STREAM_SUBSCRIBER_BUFFER_CAP = 256;
@@ -98,6 +103,8 @@ class Subscriber {
 export const STREAM_CLOSED_KEYS_CAP = 1024;
 
 interface Channel {
+  readonly runId: RunId;
+  readonly stepId: StepId;
   readonly subscribers: Set<Subscriber>;
   readonly replay: StreamEvent<Json>[];
 }
@@ -117,11 +124,12 @@ export class InMemoryStreamHub {
     return `${runId}::${stepId}`;
   }
 
-  private openChannel(key: string): Channel | undefined {
+  private openChannel(runId: RunId, stepId: StepId): Channel | undefined {
+    const key = InMemoryStreamHub.key(runId, stepId);
     if (this.closedKeys.has(key)) return undefined;
     let channel = this.channels.get(key);
     if (channel === undefined) {
-      channel = { subscribers: new Set(), replay: [] };
+      channel = { runId, stepId, subscribers: new Set(), replay: [] };
       this.channels.set(key, channel);
     }
     return channel;
@@ -146,7 +154,7 @@ export class InMemoryStreamHub {
   }
 
   publishChunk(runId: RunId, stepId: StepId, chunk: Json): void {
-    const channel = this.openChannel(InMemoryStreamHub.key(runId, stepId));
+    const channel = this.openChannel(runId, stepId);
     if (channel === undefined) return;
     const event: StreamEvent<Json> = { kind: "chunk", chunk };
     channel.replay.push(event);
@@ -181,6 +189,15 @@ export class InMemoryStreamHub {
     }
   }
 
+  // A reset step runs again: forget that it closed, and drop the superseded
+  // run's buffered chunks from any channel still open.
+  reopen(runId: RunId, stepId: StepId): void {
+    const key = InMemoryStreamHub.key(runId, stepId);
+    this.closedKeys.delete(key);
+    const channel = this.channels.get(key);
+    if (channel !== undefined) channel.replay.length = 0;
+  }
+
   apply(runId: RunId, effect: StreamEffect): void {
     switch (effect.tag) {
       case "close-ok":
@@ -192,6 +209,9 @@ export class InMemoryStreamHub {
       case "retry":
         this.signalRetry(runId, effect.stepId, effect.nextAttempt);
         return;
+      case "reopen":
+        this.reopen(runId, effect.stepId);
+        return;
       case "close-run":
         this.closeRun(runId);
         return;
@@ -199,11 +219,23 @@ export class InMemoryStreamHub {
   }
 
   closeRun(runId: RunId): void {
-    const prefix = `${runId}::`;
-    for (const key of this.channels.keys()) {
-      if (!key.startsWith(prefix)) continue;
+    const keys = [...this.channels.entries()]
+      .filter(([, channel]) => channel.runId === runId)
+      .map(([key]) => key);
+    for (const key of keys) {
       for (const sub of this.closeChannel(key) ?? []) sub.close();
     }
+  }
+
+  // Open channels only — the ones a lost close frame could leave hanging.
+  openStreams(): ReadonlyArray<{
+    readonly runId: RunId;
+    readonly stepId: StepId;
+  }> {
+    return [...this.channels.values()].map(({ runId, stepId }) => ({
+      runId,
+      stepId,
+    }));
   }
 
   subscribeStream(
@@ -211,7 +243,7 @@ export class InMemoryStreamHub {
     stepId: StepId,
     opts?: { readonly replayBuffered?: boolean },
   ): AsyncIterable<StreamEvent<Json>> {
-    const channel = this.openChannel(InMemoryStreamHub.key(runId, stepId));
+    const channel = this.openChannel(runId, stepId);
     if (channel === undefined) return EMPTY_CLOSED_STREAM;
 
     const sub = new Subscriber();
