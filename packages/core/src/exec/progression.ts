@@ -132,7 +132,12 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
           );
           return;
         case "dispatch":
-          await recordSkips(runId, t.skip);
+          // A skip can unblock an optional() dependent: settle skips, then re-scan,
+          // and enqueue only from a pass with nothing left to skip.
+          if (t.skip.length > 0) {
+            await recordSkips(runId, t.skip);
+            continue;
+          }
           for (const stepId of t.runnable)
             await queue.enqueue(runId, stepId, { flowId: flow.id });
           return;
