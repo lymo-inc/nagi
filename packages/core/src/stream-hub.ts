@@ -9,10 +9,15 @@ import type {
   StreamEvent,
 } from "./types";
 
-// Durable facts decide whether a step's stream is over, not the hub, which may
-// never have held a channel for it (the close fired before anyone listened).
-export function isStreamOver(state: RunState, stepId: StepId): boolean {
-  return isTerminalRun(state) || isStepTerminal(stepStateOf(state, stepId));
+export type StreamEnd = "open" | "ok" | "error";
+
+// Durable facts decide how a step's stream ends, not the hub, which may never
+// have held a channel for it (the close fired before anyone listened). A
+// failed step ends with `error`, as its live close frame does (RFC 0019 O4).
+export function streamEndOf(state: RunState, stepId: StepId): StreamEnd {
+  const step = stepStateOf(state, stepId);
+  if (step.tag === "failed") return "error";
+  return isTerminalRun(state) || isStepTerminal(step) ? "ok" : "open";
 }
 
 export const STREAM_SUBSCRIBER_BUFFER_CAP = 256;

@@ -49,9 +49,9 @@ import {
   InMemoryRunEventHub,
   InMemoryStreamHub,
   isRunEnd,
-  isStreamOver,
   NagiConcurrencyConflictError,
   projectRunState,
+  streamEndOf,
   supersede,
 } from "@nagi-js/core";
 import type { Kysely } from "kysely";
@@ -198,9 +198,9 @@ class PostgresStore<DB = unknown> implements Store {
   private async resyncStreams(hub: InMemoryStreamHub): Promise<void> {
     for (const { runId, stepId } of hub.openStreams()) {
       try {
-        if (isStreamOver(await this.loadRunState(runId), stepId)) {
-          hub.closeOk(runId, stepId);
-        }
+        const end = streamEndOf(await this.loadRunState(runId), stepId);
+        if (end === "error") hub.closeError(runId, stepId);
+        else if (end === "ok") hub.closeOk(runId, stepId);
       } catch {
         /* one unreadable run must not stop the rest */
       }
@@ -227,7 +227,10 @@ class PostgresStore<DB = unknown> implements Store {
         void (async () => {
           try {
             await this.listening;
-            if (isStreamOver(await this.loadRunState(runId), stepId)) {
+            // A late subscriber gets an empty stream, even for a failed step (D7).
+            if (
+              streamEndOf(await this.loadRunState(runId), stepId) !== "open"
+            ) {
               hub.closeOk(runId, stepId);
             }
           } catch {

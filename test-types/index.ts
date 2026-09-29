@@ -27,6 +27,7 @@ export type RemovedSurface = [
   Removed<typeof postgres, "postgresTrigger">,
   Removed<postgres.PostgresStoreOpts, "notifyChannel">,
   Removed<core.WorkerRunUntilEmptyOpts, "deadline">,
+  Removed<typeof core, "isStreamOver">,
 ];
 export const removedSurfaceOk: RemovedSurface extends true[] ? true : never =
   true;
