@@ -897,10 +897,11 @@ export type ReplayMode = "inspect" | "continue";
 
 // How far a step reset reaches. "cascade" (the default) resets the step and
 // everything downstream of it, so the run recomputes consistently. "step"
-// resets ONLY the named step and leaves completed descendants alone — the
-// regenerate-one-output shape. Under "step" those descendants keep outputs
-// derived from the step's PREVIOUS output, which is a deliberate contract:
-// callers who need consistency want "cascade".
+// resets the named step plus any descendant that holds no value (failed,
+// canceled or skipped), so the run can still settle with every step accounted
+// for. A completed descendant keeps outputs derived from the step's PREVIOUS
+// output, which is a deliberate contract: callers who need consistency want
+// "cascade".
 export type ResetScope = "cascade" | "step";
 
 export interface ReplayOpts {
@@ -911,7 +912,8 @@ export interface ReplayOpts {
   readonly fireHooks?: boolean;
   // Resets `from` (and, by scope, its descendants), reopening a settled run.
   // A `running` `from` step is aborted via step.abort-requested and MUST settle
-  // before the reset is written.
+  // before the reset is written; the descendants to reset are chosen after it
+  // settles.
   readonly from?: StepId;
   // Only meaningful with `from`. Defaults to "cascade".
   readonly scope?: ResetScope;

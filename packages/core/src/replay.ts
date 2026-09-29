@@ -102,7 +102,10 @@ export function makeReplay(deps: ReplayDeps): {
         );
       }
       await abortInFlight(runState, opts.from);
-      const resets = resetFactsOf(flow, {
+      // Descendants can settle during the abort wait; the reset set is chosen
+      // from their state.
+      const current = await store.loadRunState(runId);
+      const resets = resetFactsOf(flow, current, {
         runId,
         stepId: opts.from,
         at: clock.now(),

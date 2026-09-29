@@ -10,6 +10,7 @@ import {
   isStepTerminal,
   isTerminalRun,
   type SkipReason,
+  type StepState,
   stepStateOf,
 } from "./state";
 import type {
@@ -171,19 +172,31 @@ export function computeFlowOutput(flow: Flow, runState: RunState): Json {
   return flow.output(stepOutputs as never) as Json;
 }
 
-// The facts one reset writes. "step" is the regenerate-one shape: only the
-// origin. Otherwise every descendant records where the cascade came from.
+// The facts one reset writes; every non-origin step records where the cascade
+// came from. "step" keeps completed descendants and resets the rest, or the
+// run would settle without them.
 export function resetFactsOf(
   flow: Flow,
+  runState: RunState,
   origin: Omit<Parameters<typeof Facts.stepReset>[0], "cascadedFrom">,
 ): readonly StepResetFact[] {
   const { runId, stepId, at } = origin;
-  const set = origin.scope === "step" ? [stepId] : descendantsOf(flow, stepId);
+  const all = descendantsOf(flow, stepId);
+  const set =
+    origin.scope === "step"
+      ? all.filter(
+          (id) => id === stepId || holdsNoValue(stepStateOf(runState, id)),
+        )
+      : all;
   return set.map((id) =>
     id === stepId
       ? Facts.stepReset(origin)
       : Facts.stepReset({ runId, stepId: id, at, cascadedFrom: stepId }),
   );
+}
+
+function holdsNoValue(s: StepState): boolean {
+  return s.tag === "failed" || s.tag === "canceled" || s.tag === "skipped";
 }
 
 export function descendantsOf(flow: Flow, stepId: StepId): readonly StepId[] {

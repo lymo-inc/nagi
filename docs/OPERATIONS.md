@@ -381,7 +381,8 @@ skips it.
   settle). Works on a live run — including a `canceled` step holding it open —
   and on a completed/failed run, which the reset reopens.
 - `wf.replay(runId, { mode: "continue", from: stepId, scope: "step" })` — rerun
-  **only** that step. Completed descendants are left alone, so they keep
+  that step, plus any descendant that holds no value (`failed`, `canceled` or
+  `skipped`). Completed descendants are left alone, so they keep
   outputs derived from the step's PREVIOUS output; the run is deliberately
   inconsistent until you rerun them too. Use it to regenerate one artifact when
   downstream consumers read from their own storage. On a settled run the reset
