@@ -60,6 +60,7 @@ describe("foldRun on persisted logs", () => {
 
   it("keeps the prior step state on a contradictory fact", () => {
     const state = foldRun(runId, [
+      Facts.stepStarted(runId, "s", 1, "task", at),
       Facts.stepCompleted(runId, "s", 1, 1, at),
       Facts.stepFailed(runId, "s", 1, { name: "E", message: "late" }, at),
     ]);

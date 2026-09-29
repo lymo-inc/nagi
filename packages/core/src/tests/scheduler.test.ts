@@ -32,26 +32,32 @@ function startedFact(flowId: string, input: unknown): Fact {
   };
 }
 
-function completedStepFact(stepId: string, output: unknown): Fact {
-  return {
-    kind: "step.completed",
-    runId: RUN,
-    stepId,
-    attempt: 1,
-    output: output as never,
-    at: new Date(),
-  };
+function completedStepFact(stepId: string, output: unknown): Fact[] {
+  return [
+    startedStepFact(stepId),
+    {
+      kind: "step.completed",
+      runId: RUN,
+      stepId,
+      attempt: 1,
+      output: output as never,
+      at: new Date(),
+    },
+  ];
 }
 
-function failedStepFact(stepId: string): Fact {
-  return {
-    kind: "step.failed",
-    runId: RUN,
-    stepId,
-    attempt: 1,
-    error: { name: "Error", message: "boom" },
-    at: new Date(),
-  };
+function failedStepFact(stepId: string): Fact[] {
+  return [
+    startedStepFact(stepId),
+    {
+      kind: "step.failed",
+      runId: RUN,
+      stepId,
+      attempt: 1,
+      error: { name: "Error", message: "boom" },
+      at: new Date(),
+    },
+  ];
 }
 
 function skippedStepFact(
@@ -112,7 +118,7 @@ describe("nextRunnable", () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      completedStepFact("a", { doubled: 2 }),
+      ...completedStepFact("a", { doubled: 2 }),
     ]);
     expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual(
       {
@@ -137,7 +143,7 @@ describe("nextRunnable", () => {
     const f = gatedFlow();
     const state = await projectFacts([
       startedFact(f.id, { enable: false }),
-      completedStepFact("gate", { enabled: false }),
+      ...completedStepFact("gate", { enabled: false }),
     ]);
     expect(
       nextRunnable({ flow: f, runState: state, input: { enable: false } }),
@@ -165,7 +171,7 @@ describe("nextRunnable", () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      failedStepFact("a"),
+      ...failedStepFact("a"),
     ]);
     expect(nextRunnable({ flow: f, runState: state, input: { n: 1 } })).toEqual(
       {
@@ -208,8 +214,8 @@ describe("flowTermination", () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      completedStepFact("a", {}),
-      completedStepFact("c", {}),
+      ...completedStepFact("a", {}),
+      ...completedStepFact("c", {}),
     ]);
     expect(flowTermination(f, state)).toEqual({ kind: "succeeded" });
   });
@@ -218,7 +224,7 @@ describe("flowTermination", () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      failedStepFact("a"),
+      ...failedStepFact("a"),
       skippedStepFact("c", "transitive"),
     ]);
     expect(flowTermination(f, state)).toEqual({
@@ -231,7 +237,7 @@ describe("flowTermination", () => {
     const f = gatedFlow();
     const state = await projectFacts([
       startedFact(f.id, { enable: false }),
-      completedStepFact("gate", { enabled: false }),
+      ...completedStepFact("gate", { enabled: false }),
       skippedStepFact("branch", "when-false"),
     ]);
     expect(flowTermination(f, state)).toEqual({ kind: "succeeded" });
@@ -315,7 +321,7 @@ describe("nextTransition", () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      completedStepFact("a", { doubled: 2 }),
+      ...completedStepFact("a", { doubled: 2 }),
     ]);
     expect(nextTransition(f, state)).toEqual({
       kind: "dispatch",
@@ -338,7 +344,7 @@ describe("nextTransition", () => {
     });
     const state = await projectFacts([
       startedFact(f.id, { n: 2 }),
-      completedStepFact("a", { doubled: 4 }),
+      ...completedStepFact("a", { doubled: 4 }),
     ]);
     expect(nextTransition(f, state)).toEqual({
       kind: "complete",
@@ -350,7 +356,7 @@ describe("nextTransition", () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      failedStepFact("a"),
+      ...failedStepFact("a"),
       skippedStepFact("c", "transitive"),
     ]);
     const t = nextTransition(f, state);
@@ -362,8 +368,8 @@ describe("nextTransition", () => {
     const f = linearFlow();
     const state = await projectFacts([
       startedFact(f.id, { n: 1 }),
-      completedStepFact("a", {}),
-      completedStepFact("c", {}),
+      ...completedStepFact("a", {}),
+      ...completedStepFact("c", {}),
       { kind: "flow.completed", runId: RUN, output: null, at: new Date() },
     ]);
     expect(nextTransition(f, state)).toEqual({ kind: "settled" });
@@ -382,7 +388,7 @@ describe("nextTransition", () => {
     const f = gatedFlow();
     const state = await projectFacts([
       startedFact(f.id, { enable: false }),
-      completedStepFact("gate", { enabled: false }),
+      ...completedStepFact("gate", { enabled: false }),
     ]);
     expect(nextTransition(f, state)).toEqual({
       kind: "skip",

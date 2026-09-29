@@ -29,6 +29,10 @@ describe("durable advance after settle", () => {
     // next step: the fact commits, but nothing ever runs advance.
     await h.store.appendFact(
       runId,
+      Facts.stepStarted(runId, "a", 1 as AttemptNumber, "task", new Date()),
+    );
+    await h.store.appendFact(
+      runId,
       Facts.stepCompleted(runId, "a", 1 as AttemptNumber, { v: 1 }, new Date()),
     );
 

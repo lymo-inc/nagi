@@ -871,7 +871,8 @@ class PostgresStore<DB = unknown> implements Store {
 
   // Mirrors nextStepRow (@nagi-js/core read-model): one row per step, a
   // settled row changes only by reset, a start applies only for a newer
-  // attempt, and a retry only to the attempt in flight.
+  // attempt, a retry only to the attempt in flight, and a settle only for an
+  // attempt the row has started.
   private async applyStepDelta(
     trx: Kysely<DB>,
     runId: RunId,
@@ -898,34 +899,21 @@ class PostgresStore<DB = unknown> implements Store {
         `.execute(trx);
         return;
       case "completed":
-        return this.settleStepRow(
-          trx,
-          runId,
-          delta,
-          delta.attempt,
-          delta.output,
-          null,
-        );
+        return this.settleStepRow(trx, runId, delta, delta.output, null);
       case "failed":
-        return this.settleStepRow(
-          trx,
-          runId,
-          delta,
-          delta.attempt,
-          null,
-          delta.error,
-        );
       case "canceled":
-        return this.settleStepRow(
-          trx,
-          runId,
-          delta,
-          delta.attempt,
-          null,
-          delta.error,
-        );
+        return this.settleStepRow(trx, runId, delta, null, delta.error);
       case "skipped":
-        return this.settleStepRow(trx, runId, delta, null, null, null);
+        await sql`
+          INSERT INTO ${sql.raw(this.t("step_run"))} AS s
+            (run_id, step_id, attempt, status, completed_at)
+          VALUES (${runId}, ${delta.stepId}, 0, 'skipped', ${delta.completedAt})
+          ON CONFLICT (run_id, step_id) DO UPDATE
+            SET status = 'skipped', output = NULL, error = NULL,
+                completed_at = EXCLUDED.completed_at
+            WHERE s.status NOT IN ${SETTLED_STEP}
+        `.execute(trx);
+        return;
       case "reset": {
         // Reopen a completed/failed run (replay({ from })). Read the
         // identity first: after a unique violation the tx is aborted and no
@@ -961,31 +949,26 @@ class PostgresStore<DB = unknown> implements Store {
     }
   }
 
-  // `attempt` null keeps the row's attempt (0 when there is none): a skip
-  // records no attempt of its own.
   private async settleStepRow(
     trx: Kysely<DB>,
     runId: RunId,
     delta: {
       readonly stepId: StepId;
-      readonly status: "completed" | "failed" | "canceled" | "skipped";
+      readonly status: "completed" | "failed" | "canceled";
+      readonly attempt: AttemptNumber;
       readonly completedAt: Date;
     },
-    attempt: AttemptNumber | null,
     output: Json | null,
     error: SerializedError | null,
   ): Promise<void> {
     const outputJson = output === null ? null : jsonb(output);
     const errorJson = error === null ? null : jsonb(error as unknown as Json);
     await sql`
-      INSERT INTO ${sql.raw(this.t("step_run"))} AS s
-        (run_id, step_id, attempt, status, output, error, completed_at)
-      VALUES
-        (${runId}, ${delta.stepId}, COALESCE(${attempt}::int, 0), ${delta.status}, ${outputJson}, ${errorJson}, ${delta.completedAt})
-      ON CONFLICT (run_id, step_id) DO UPDATE
-        SET attempt = COALESCE(${attempt}::int, s.attempt), status = EXCLUDED.status,
-            output = EXCLUDED.output, error = EXCLUDED.error, completed_at = EXCLUDED.completed_at
-        WHERE s.status NOT IN ${SETTLED_STEP}
+      UPDATE ${sql.raw(this.t("step_run"))}
+         SET attempt = ${delta.attempt}, status = ${delta.status},
+             output = ${outputJson}, error = ${errorJson}, completed_at = ${delta.completedAt}
+       WHERE run_id = ${runId} AND step_id = ${delta.stepId}
+         AND status NOT IN ${SETTLED_STEP} AND attempt >= ${delta.attempt}
     `.execute(trx);
   }
 
