@@ -1,5 +1,55 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.23
+
+### Patch Changes
+
+- d424f0a: `wf.queryRuns` and `Store.queryRuns` are removed, along with `RunSummary`, `QueryRunsOpts` / `QueryRunsResult` / `QueryRunsWhere` and the cursor helpers (`encodeRunCursor`, `decodeRunCursor`, `clampQueryLimit`, `compareRunOrder`, `isPastCursor`, `jsonContains`, `QUERY_RUNS_DEFAULT_LIMIT`, `QUERY_RUNS_MAX_LIMIT`, `RunCursor`). Use `describe(runId)` for one run, and list or join runs with SQL against `workflow_run` and `step_run`, whose columns are now a documented read contract (docs/OPERATIONS.md, "Reading runs with SQL").
+- 2fc52df: What a fact implies (read-model rows, lease/timer release, stream close, run event) is now one core table, `factConsequences`, and each store applies all of it through a single write path; `supersede` decides concurrency cancellation and the lease reaper's decision carries its `lease.reaped` fact. Fixes `watchRuns` on Postgres never seeing `flow.started` for runs started with `startStaged`. `Store.settleStep` (use `appendFact`), the unused `once.recorded` fact kind, and the `factEffects` / `rowDeltaOf` / `runEventOf` exports are removed.
+- 6a29534: `migrate()` serializes concurrent calls on a per-schema advisory lock, so every replica can run it at startup.
+- ecb5ac6: Fix: `ctx.once()` now memoizes a callback that returns `null`, so its side effect no longer re-runs on every redelivery or replay of the step.
+
+  `Store.getOnce` returned `Json | null` and used `null` to mean "nothing recorded". `Json` includes `null`, so a recorded `null` was indistinguishable from a miss and `once()` called the callback again — exactly the duplicate side effect it exists to prevent.
+
+  `Store.getOnce` now returns `GetOnceResult` (`{ tag: "hit", value }` or `{ tag: "miss" }`), and a recorded `null` reads back as a hit. The Postgres `dedupe` table is unchanged; no migration is needed.
+
+  Custom `Store` implementations must update `getOnce` to return the new shape. The shared conformance suite in `@nagi-js/core/testing` checks it.
+
+- 2fc52df: **`@nagi-js/postgres` ships migration `0009_step_run_per_step`: run migrations before deploying.** It deletes duplicate per-attempt `step_run` rows, keeping one row per step, and changes the table's primary key to `(run_id, step_id)`.
+
+  `describe`, `queryRuns` and `pruneFacts` now answer from one read model in both stores: the in-memory store materializes the same fact row deltas Postgres does. `describe` returns one view per step (its latest attempt, updated in place on retry), and step timestamps come from the facts' `at` rather than the database clock.
+
+- a87b71c: `wf.operator()` is removed. Rerun a step with `wf.replay(runId, { mode: "continue", from, scope })`, which now also works on a live run and aborts an in-flight `from` step before resetting it; stop a run with `wf.cancel`. `skip` is gone, along with the `"manual"` skip reason, the `"operator"` cancel cause and the `actor`/`note` audit fields on step facts.
+- 2fc52df: A run now ends exactly once. Run-end facts (`flow.completed`, `flow.failed`, `flow.canceled`) go through the new `Store.endRun(runId, fact): Promise<boolean>`, which refuses the fact when the run's row is already terminal and writes nothing. The check runs under the store's lock: Postgres locks the `workflow_run` row, and the core policy lives in `admitsRunEnd`. Only the winning writer fires the flow hooks and wakes the parent, so racing cancels, a cancel against completion, or two snapshot-gone messages for one run no longer fire `onFlowError` twice. `appendFact` no longer accepts run-end facts.
+
+  Postgres: `tryStartRunOnTx` now runs each concurrency start attempt under a savepoint. Its retry after a unique violation used to fail with "current transaction is aborted", and it now completes, leaving the caller's transaction usable. `tryStartRun` uses the same retry, so it no longer surfaces a raw unique violation when it races a start on a caller's transaction.
+
+  In-memory store: `sweepLeases` now reads step status and flowId from the read-model rows, matching Postgres, instead of from the fact fold.
+
+- b9a0c46: Fix: a step's projected state (`loadRunState`) and its `describe()` view now apply the same attempt rules, so they can no longer disagree.
+
+  After a lease reap, the re-dispatched attempt's `step.started` was ignored by the projection: the step kept reading as the dead attempt, so `operator.retry` wrote its abort request for that attempt and the live handler never saw it: the retry waited for the handler to finish on its own, or timed out. A start now supersedes the step whenever its attempt is newer than the one in flight, in both the projection and the read model.
+
+  A duplicate `step.started` no longer moves the view's `startedAt`, and a `step.retried` or `step.abort-requested` for an attempt that is not in flight no longer changes the step in either. A test now explores every single-step fact history against both and fails on any disagreement.
+
+- Updated dependencies [674bea6]
+- Updated dependencies [d424f0a]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [ecb5ac6]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [2fc52df]
+- Updated dependencies [a87b71c]
+- Updated dependencies [9b8b6fa]
+- Updated dependencies [2fc52df]
+- Updated dependencies [b9a0c46]
+- Updated dependencies [4cc20fd]
+- Updated dependencies [58458fa]
+- Updated dependencies [2fc52df]
+  - @nagi-js/core@0.1.1-rc.22
+
 ## 0.1.1-rc.22
 
 ### Patch Changes
@@ -41,7 +91,7 @@
 
 - ad47244: Fix: `uuidv7()` is now monotonic within a millisecond, so the fact log cannot come back out of order.
 
-  `fact_id` is a uuidv7 and `loadRunState` reads facts with `ORDER BY fact_id ASC`, which makes fact_id order _the_ append order that `foldRun` replays a run from. The previous implementation filled all 74 non-timestamp bits with fresh randomness, so two facts written in the same millisecond sorted at random — a run could fold with `step.started` ahead of its own `flow.started`. This surfaced as an intermittent store-conformance failure against real Postgres.
+  `fact_id` is a uuidv7 and `loadRunState` reads facts with `ORDER BY fact_id ASC`, which makes fact*id order \_the* append order that `foldRun` replays a run from. The previous implementation filled all 74 non-timestamp bits with fresh randomness, so two facts written in the same millisecond sorted at random — a run could fold with `step.started` ahead of its own `flow.started`. This surfaced as an intermittent store-conformance failure against real Postgres.
 
   RFC 9562's 12-bit `rand_a` now carries a per-millisecond counter, seeded in its low half so at least 2048 ids per millisecond are guaranteed ordered, and saturating rather than wrapping past that (wrapping would sort an id before the one it follows). `rand_b` stays fully random, so uniqueness never depends on the counter having headroom.
 
