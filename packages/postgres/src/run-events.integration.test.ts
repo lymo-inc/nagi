@@ -151,13 +151,19 @@ d("@nagi-js/postgres — run events over LISTEN/NOTIFY", () => {
     expect(types).toContain("flow.completed");
   }, 30_000);
 
-  it("carries step output and error payloads intact", async () => {
+  it("carries no output/error; describe() has the payloads", async () => {
     const okId = await wf.start(okFlow, {});
     await withWorker(() => settle(okId, "completed"));
     const done = (await eventsFor(okId)).find(
       (e) => e.type === "step.completed",
     );
-    expect(done).toMatchObject({ stepId: "only", output: { ok: true } });
+    expect(done).toMatchObject({ stepId: "only" });
+    expect(done).not.toHaveProperty("output");
+    const okDescribed = await wf.describe(okId);
+    expect(okDescribed?.steps.find((s) => s.stepId === "only")?.output).toEqual(
+      { ok: true },
+    );
+    expect(okDescribed?.run.output).toEqual({ ok: true });
 
     const failId = await wf.start(failFlow, {});
     await withWorker(() => settle(failId, "failed"));
@@ -165,9 +171,14 @@ d("@nagi-js/postgres — run events over LISTEN/NOTIFY", () => {
       (e) => e.type === "step.failed",
     );
     expect(failed).toMatchObject({ stepId: "boom", attempt: 1 });
+    expect(failed).not.toHaveProperty("error");
     expect((await eventsFor(failId)).map((e) => e.type)).toContain(
       "flow.failed",
     );
+    const failDescribed = await wf.describe(failId);
+    expect(
+      failDescribed?.steps.find((s) => s.stepId === "boom")?.error,
+    ).toMatchObject({ message: "nope" });
   }, 30_000);
 
   it("observes concurrency supersession, minted inside the store's tx", async () => {

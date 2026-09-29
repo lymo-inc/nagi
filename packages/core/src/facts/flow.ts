@@ -202,7 +202,7 @@ export const flowKinds = {
     // Closes every still-open channel of the run, so a subscriber to a skipped
     // or never-emitting step never hangs.
     stream: () => CLOSE_RUN,
-    event: (fact) => ({ type: "flow.completed", output: fact.output }),
+    event: () => ({ type: "flow.completed" }),
   },
   "flow.failed": {
     fold: (draft, fact) => {
@@ -216,7 +216,7 @@ export const flowKinds = {
     }),
     release: () => RELEASE_RUN,
     stream: () => CLOSE_RUN,
-    event: (fact) => ({ type: "flow.failed", error: fact.error }),
+    event: () => ({ type: "flow.failed" }),
   },
   "flow.canceled": {
     fold: (draft, fact) => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { flow } from "../builder";
+import { flow, optional } from "../builder";
 import { NagiFlowSnapshotGoneError, NagiRuntimeError } from "../errors";
 import { Facts, foldRun } from "../facts";
 import {
@@ -41,6 +41,101 @@ function unrelated() {
     id: "unrelated",
     input: passthroughSchema<Record<string, never>>(),
     build: (b) => ({ s: b.task({ run: async () => ({}) }) }),
+  });
+}
+
+// a -> b (needs up), c -> b (needs maybe, optional). Same shape across
+// versions; canonicalize() never hashes a handler's `run` body (only
+// when/retry/timeoutMs/schema are hashed — see canonicalize.ts), so a bare
+// body-only edit would leave the pinned hash unchanged and the run "current"
+// rather than "gone". V2 gives `c` a timeoutMs to force a distinct hash while
+// keeping the DAG shape (steps, needs, optionality) identical.
+function edgeV1() {
+  return flow({
+    id: "e",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({ v: 1 }) });
+      const c = b.task({ when: () => false, run: async () => ({ v: 1 }) });
+      return {
+        a,
+        c,
+        b: b.task({
+          needs: { up: a, maybe: optional(c) },
+          run: async () => ({ v: 1 }),
+        }),
+      };
+    },
+  });
+}
+
+function edgeV2() {
+  return flow({
+    id: "e",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({ v: 2 }) });
+      const c = b.task({
+        when: () => false,
+        timeoutMs: 5_000,
+        run: async () => ({ v: 2 }),
+      });
+      return {
+        a,
+        c,
+        b: b.task({
+          needs: { up: a, maybe: optional(c) },
+          run: async () => ({ v: 2 }),
+        }),
+      };
+    },
+  });
+}
+
+// V1 b needs a; V2 b needs c instead — the edge moved.
+function edgeMovedV1() {
+  return flow({
+    id: "e",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({}) });
+      const c = b.task({ when: () => false, run: async () => ({}) });
+      return { a, c, b: b.task({ needs: { up: a }, run: async () => ({}) }) };
+    },
+  });
+}
+
+function edgeMovedV2() {
+  return flow({
+    id: "e",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({}) });
+      const c = b.task({ when: () => false, run: async () => ({}) });
+      return { a, c, b: b.task({ needs: { up: c }, run: async () => ({}) }) };
+    },
+  });
+}
+
+// V1 s is a task; V2 s is a signal — the step's kind changed.
+function kindChangedV1() {
+  return flow({
+    id: "k",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => ({ s: b.task({ run: async () => ({}) }) }),
+  });
+}
+
+function kindChangedV2() {
+  return flow({
+    id: "k",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => ({
+      s: b.signal({
+        timeoutMs: "unbounded" as const,
+        schema: passthroughSchema<{ ok: boolean }>(),
+      }),
+    }),
   });
 }
 
@@ -274,5 +369,44 @@ describe("registry.synthesize — drift-allowed replay flow", () => {
     await expect(registry.synthesize(g)).rejects.toThrow(
       /no snapshot with that hash was found/,
     );
+  });
+
+  it("rebuilds needs under the live handler's aliases with optionality kept", async () => {
+    const store = new InMemoryStore();
+    const { registry: old } = await register([edgeV1()], store);
+    const pinned = old.hashOf("e");
+    const { registry } = await register([edgeV2()], store);
+    const g = gone(registry.resolve(foldRun(RUN, [started("e", pinned)])));
+
+    const synth = await registry.synthesize(g);
+    const synthSteps = asStepMapWithDefs(synth.steps);
+    const bDef = getDef(synthSteps["b"]!);
+    const needs = bDef.needs;
+    expect(Object.keys(needs)).toEqual(["up", "maybe"]);
+    expect(needs["up"]!.step.id).toBe("a");
+    expect(needs["up"]!.optional).toBe(false);
+    expect(needs["maybe"]!.step.id).toBe("c");
+    expect(needs["maybe"]!.optional).toBe(true);
+  });
+
+  it("throws NagiRuntimeError when live needs disagree with the snapshot", async () => {
+    const store = new InMemoryStore();
+    const { registry: old } = await register([edgeMovedV1()], store);
+    const pinned = old.hashOf("e");
+    const { registry } = await register([edgeMovedV2()], store);
+    const g = gone(registry.resolve(foldRun(RUN, [started("e", pinned)])));
+
+    await expect(registry.synthesize(g)).rejects.toThrow(NagiRuntimeError);
+    await expect(registry.synthesize(g)).rejects.toThrow(/needs/);
+  });
+
+  it("throws NagiRuntimeError when a step's kind changed", async () => {
+    const store = new InMemoryStore();
+    const { registry: old } = await register([kindChangedV1()], store);
+    const pinned = old.hashOf("k");
+    const { registry } = await register([kindChangedV2()], store);
+    const g = gone(registry.resolve(foldRun(RUN, [started("k", pinned)])));
+
+    await expect(registry.synthesize(g)).rejects.toThrow(NagiRuntimeError);
   });
 });

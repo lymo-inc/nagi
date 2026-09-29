@@ -401,6 +401,9 @@ export class InMemoryStore implements Store {
         this.writeFact(runId, decision.received);
         this.writeFact(runId, decision.completed);
         return decision.result;
+      case "park":
+        this.release(runId, decision.release);
+        return decision.result;
     }
   }
 

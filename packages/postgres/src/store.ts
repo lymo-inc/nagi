@@ -496,6 +496,9 @@ class PostgresStore<DB = unknown> implements Store {
             await this.writeFact(trx, runId, decision.received);
             await this.writeFact(trx, runId, decision.completed);
             return decision.result;
+          case "park":
+            await this.applyRelease(trx, runId, decision.release);
+            return decision.result;
         }
       });
   }
@@ -1315,7 +1318,7 @@ function frameOf(runId: RunId, effect: StreamEffect): StreamFrame {
     case "close-ok":
       return { k: "ok", r: runId, s: effect.stepId };
     case "close-error":
-      return { k: "err", r: runId, s: effect.stepId, e: effect.error };
+      return { k: "err", r: runId, s: effect.stepId };
     case "retry":
       return { k: "retry", r: runId, s: effect.stepId, a: effect.nextAttempt };
     case "close-run":

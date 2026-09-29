@@ -235,6 +235,8 @@ export function makeRunLifecycle(deps: RunLifecycleDeps): RunLifecycle {
         return;
       case "enqueued":
         await recordSkips(started.runId, dispatch.skip);
+        // The roots already rode the caller's tx; the skips may unblock more.
+        if (dispatch.skip.length > 0) await dispatcher.advance(started.runId);
         return;
       case "advance":
         await dispatcher.advance(started.runId);

@@ -27,6 +27,45 @@ function makeFlowB() {
   });
 }
 
+// a -> b, b reads needs.up. B adds an unused `extra` step — canonicalize()
+// never hashes a handler's `run` body, so body edits alone wouldn't move the
+// pinned hash; the extra step is what makes B's flow "gone" relative to A's
+// pinned snapshot.
+function makeChainA() {
+  return flow({
+    id: "fChain",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({ v: "fromA" }) });
+      return {
+        a,
+        b: b.task({
+          needs: { up: a },
+          run: async ({ needs }) => ({ got: needs.up }),
+        }),
+      };
+    },
+  });
+}
+
+function makeChainB() {
+  return flow({
+    id: "fChain",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({ v: "fromB" }) });
+      return {
+        a,
+        b: b.task({
+          needs: { up: a },
+          run: async ({ needs }) => ({ got: needs.up }),
+        }),
+        extra: b.task({ run: async () => ({}) }),
+      };
+    },
+  });
+}
+
 describe("NagiFlowSnapshotGoneError", () => {
   it("dispatching a run whose flow_hash is not in the current registry is snapshot-gone: nacked for a frozen-version worker, step never runs", async () => {
     const store = new InMemoryStore();
@@ -512,5 +551,42 @@ describe("driftPolicy: synthesize", () => {
     const state = await store.loadRunState(runId);
     expect(state.phase.tag).toBe("completed");
     expect(state.steps["s"]).toMatchObject({ output: { different: true } });
+  });
+
+  it("a drifted two-step chain resolves needs.<alias> under the live handler and completes", async () => {
+    const store = new InMemoryStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const fA = makeChainA();
+    const wfA = await nagi({ flows: [fA], store, queue, clock });
+    const runId = await wfA.start(fA, {});
+
+    const wfB = await nagi({
+      flows: [makeChainB()],
+      store,
+      queue,
+      clock,
+      driftPolicy: "synthesize",
+    });
+    // Bounded, not runUntilEmpty(): pre-fix, the wrong needs shape makes
+    // checkUpstream throw a raw TypeError on every redelivery — an infinite
+    // nack/redeliver loop (see "Why this matters") that would hang
+    // runUntilEmpty() forever instead of failing the test.
+    const { processed } = await wfB
+      .worker({ timerSweepIntervalMs: 0 })
+      .runOnce({ maxSteps: 10 });
+    expect(processed).toBeGreaterThan(0);
+
+    const state = await store.loadRunState(runId);
+    expect(state.phase.tag).toBe("completed");
+    expect(state.steps["a"]).toMatchObject({
+      tag: "completed",
+      output: { v: "fromB" },
+    });
+    expect(state.steps["b"]).toMatchObject({
+      tag: "completed",
+      output: { got: { v: "fromB" } },
+    });
   });
 });

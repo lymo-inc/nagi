@@ -144,7 +144,7 @@ export type StreamEvent<C = Json> =
   | { readonly kind: "chunk"; readonly chunk: C }
   | { readonly kind: "dropped"; readonly count: number }
   | { readonly kind: "retry"; readonly attempt: AttemptNumber }
-  | { readonly kind: "error"; readonly error: SerializedError };
+  | { readonly kind: "error" };
 
 export interface StreamingStepCtx<Input = unknown, Chunk = Json>
   extends StepCtx<Input> {
@@ -692,6 +692,10 @@ export interface Store {
     flowHash: string,
   ): Promise<{ readonly flowId: string; readonly dag: Json } | null>;
 
+  // Write-only audit trail of flow-hash changes: one flow_ref.updated per flow
+  // whose hash changed at registration (so, per deploy that changed it). nagi
+  // never reads it back and pruneFacts does not touch it; a read or retention
+  // arrives with the first consumer that needs one.
   appendGlobalFact(fact: GlobalFact): Promise<void>;
 
   // describe and pruneFacts MUST answer from the rows the facts' `rows`
@@ -727,10 +731,11 @@ export interface Store {
 // A lifecycle projection of the fact log, for observers. Deliberately smaller
 // than Fact: leases and timers are execution bookkeeping, not
 // things a UI or an operator subscribes to.
+// References, not payloads: a NOTIFY-backed transport caps at 8000 bytes; describe() has the rest.
 export type RunEvent =
   | { readonly type: "flow.started"; readonly flowId: string }
-  | { readonly type: "flow.completed"; readonly output: Json }
-  | { readonly type: "flow.failed"; readonly error: SerializedError }
+  | { readonly type: "flow.completed" }
+  | { readonly type: "flow.failed" }
   | {
       readonly type: "flow.canceled";
       readonly cause: "concurrency";
@@ -749,13 +754,11 @@ export type RunEvent =
       readonly type: "step.completed";
       readonly stepId: StepId;
       readonly attempt: AttemptNumber;
-      readonly output: Json;
     }
   | {
       readonly type: "step.failed";
       readonly stepId: StepId;
       readonly attempt: AttemptNumber;
-      readonly error: SerializedError;
     }
   | {
       readonly type: "step.retried";
@@ -898,10 +901,11 @@ export type ReplayMode = "inspect" | "continue";
 
 // How far a step reset reaches. "cascade" (the default) resets the step and
 // everything downstream of it, so the run recomputes consistently. "step"
-// resets ONLY the named step and leaves completed descendants alone — the
-// regenerate-one-output shape. Under "step" those descendants keep outputs
-// derived from the step's PREVIOUS output, which is a deliberate contract:
-// callers who need consistency want "cascade".
+// resets the named step plus any descendant that holds no value (failed,
+// canceled or skipped), so the run can still settle with every step accounted
+// for. A completed descendant keeps outputs derived from the step's PREVIOUS
+// output, which is a deliberate contract: callers who need consistency want
+// "cascade".
 export type ResetScope = "cascade" | "step";
 
 export interface ReplayOpts {
@@ -912,7 +916,8 @@ export interface ReplayOpts {
   readonly fireHooks?: boolean;
   // Resets `from` (and, by scope, its descendants), reopening a settled run.
   // A `running` `from` step is aborted via step.abort-requested and MUST settle
-  // before the reset is written.
+  // before the reset is written; the descendants to reset are chosen after it
+  // settles.
   readonly from?: StepId;
   // Only meaningful with `from`. Defaults to "cascade".
   readonly scope?: ResetScope;

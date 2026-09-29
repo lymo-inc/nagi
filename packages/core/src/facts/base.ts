@@ -141,11 +141,7 @@ export type Release =
 // a channel is a no-op, and closed-ness is authoritative in the facts.
 export type StreamEffect =
   | { readonly tag: "close-ok"; readonly stepId: StepId }
-  | {
-      readonly tag: "close-error";
-      readonly stepId: StepId;
-      readonly error: SerializedError;
-    }
+  | { readonly tag: "close-error"; readonly stepId: StepId }
   | {
       readonly tag: "retry";
       readonly stepId: StepId;

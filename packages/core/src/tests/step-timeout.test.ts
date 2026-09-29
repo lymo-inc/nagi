@@ -1,8 +1,27 @@
 import { describe, expect, it } from "vitest";
 import { flow } from "../builder";
 import { canonicalize, sha256Canonical } from "../canonicalize";
-import type { StepId, StreamEvent } from "../types";
-import { emptySchema, makeHarness, runFlow } from "./test-helpers";
+import { NagiValidationError } from "../errors";
+import { InMemoryClock, InMemoryQueue, InMemoryStore } from "../memory";
+import { nagi } from "../runtime";
+import { errorOf } from "../state";
+import type {
+  AttemptNumber,
+  Json,
+  RunId,
+  StepCanceledFact,
+  StepCompletedFact,
+  StepFailedFact,
+  StepId,
+  StreamEvent,
+  Tx,
+} from "../types";
+import {
+  emptySchema,
+  makeHarness,
+  passthroughSchema,
+  runFlow,
+} from "./test-helpers";
 
 // Deadlines run on the real clock (setTimeout), not the InMemoryClock, so these
 // use short real durations. SLOW must stay comfortably above DEADLINE or a
@@ -197,10 +216,7 @@ describe("handler-step timeoutMs", () => {
     expect(r.status).toBe("failed");
     expect(r.error("slow").name).toBe("NagiStepTimeoutError");
     expect(events.at(0)).toEqual({ kind: "chunk", chunk: "first" });
-    expect(events.at(-1)).toMatchObject({
-      kind: "error",
-      error: { name: "NagiStepTimeoutError" },
-    });
+    expect(events.at(-1)).toEqual({ kind: "error" });
   });
 
   it("omitting timeoutMs arms no deadline — a slow step still completes", async () => {
@@ -261,5 +277,145 @@ describe("handler-step timeoutMs", () => {
     ]);
     expect(short).not.toBe(none);
     expect(long).not.toBe(short);
+  });
+
+  it("a body that swallows the abort and returns still fails the step", async () => {
+    const f = flow({
+      id: "swallowed-abort-task",
+      input: emptySchema(),
+      build: (b) => ({
+        slow: b.task({
+          timeoutMs: DEADLINE,
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ ctx }) => {
+            try {
+              await sleep(SLOW, ctx.signal);
+            } catch {
+              return { partial: true };
+            }
+            return { full: true };
+          },
+        }),
+      }),
+    });
+
+    const r = await runFlow(f, {});
+    expect(r.status).toBe("failed");
+    expect(r.error("slow").name).toBe("NagiStepTimeoutError");
+  });
+
+  it("a body that swallows the abort and returns still fails the step (activity)", async () => {
+    const f = flow({
+      id: "swallowed-abort-activity",
+      input: emptySchema(),
+      build: (b) => ({
+        slow: b.activity({
+          timeoutMs: DEADLINE,
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async ({ ctx }) => {
+            try {
+              await sleep(SLOW, ctx.signal);
+            } catch {
+              return { partial: true };
+            }
+            return { full: true };
+          },
+        }),
+      }),
+    });
+
+    const r = await runFlow(f, {});
+    expect(r.status).toBe("failed");
+    expect(r.error("slow").name).toBe("NagiStepTimeoutError");
+  });
+
+  it("rejects a timeoutMs Node cannot represent", () => {
+    const build = (timeoutMs: number) =>
+      flow({
+        id: "invalid-handler-timeout",
+        input: emptySchema(),
+        build: (b) => ({
+          s: b.task({ timeoutMs, run: async () => ({}) }),
+        }),
+      });
+
+    for (const v of [
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      2 ** 31,
+    ]) {
+      expect(() => build(v)).toThrow(NagiValidationError);
+    }
+    expect(() => build(2 ** 31 - 1)).not.toThrow();
+    expect(() => build(1)).not.toThrow();
+  });
+
+  it("rejects a non-finite signal timeoutMs", () => {
+    const build = (timeoutMs: number | "unbounded") =>
+      flow({
+        id: "invalid-signal-timeout",
+        input: emptySchema(),
+        build: (b) => ({
+          wait: b.signal({
+            timeoutMs,
+            schema: passthroughSchema<{ ok: true }>(),
+          }),
+        }),
+      });
+
+    expect(() => build(Number.NaN)).toThrow(NagiValidationError);
+    expect(() => build(Number.POSITIVE_INFINITY)).toThrow(NagiValidationError);
+    expect(() => build("unbounded")).not.toThrow();
+    expect(() => build(7 * 24 * 3_600_000)).not.toThrow();
+  });
+
+  it("a commit error after the deadline is not relabelled as a timeout", async () => {
+    // The handler body returns immediately; the COMMIT overruns the deadline
+    // and fails with a real error. That error must survive, not be relabelled
+    // NagiStepTimeoutError.
+    class SlowCommitStore extends InMemoryStore {
+      override async runStep<T extends Json>(
+        _runId: RunId,
+        _stepId: StepId,
+        _attempt: AttemptNumber,
+        _body: (tx: Tx) => Promise<{
+          readonly output: T;
+          readonly fact: StepCompletedFact | StepFailedFact | StepCanceledFact;
+        }>,
+      ): Promise<T> {
+        await new Promise((resolve) => setTimeout(resolve, SLOW));
+        throw new Error("commit failed");
+      }
+    }
+
+    const store = new SlowCommitStore();
+    const queue = new InMemoryQueue();
+    const clock = new InMemoryClock();
+
+    const f = flow({
+      id: "commit-error-after-deadline",
+      input: emptySchema(),
+      build: (b) => ({
+        fast: b.task({
+          timeoutMs: DEADLINE,
+          retry: { maxAttempts: 1, backoff: "fixed" },
+          run: async () => ({ ok: true }),
+        }),
+      }),
+    });
+
+    const wf = await nagi({ flows: [f], store, queue, clock });
+    const runId = await wf.start(f, {});
+    await wf.worker({ pollIntervalMs: 1 }).runOnce({ maxSteps: 10 });
+
+    const state = await store.loadRunState(runId);
+    const step = state.steps["fast"];
+    if (!step) throw new Error("step 'fast' missing from run state");
+    const err = errorOf(step);
+    expect(err?.name).toBe("Error");
+    expect(err?.message).toBe("commit failed");
   });
 });

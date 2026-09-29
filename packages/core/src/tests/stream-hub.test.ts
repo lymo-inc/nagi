@@ -144,12 +144,11 @@ describe("InMemoryStreamHub — termination & control events (D3/O4/O5)", () => 
     const hub = new InMemoryStreamHub();
     const got = collect(hub.subscribeStream(RUN, STEP));
     hub.publishChunk(RUN, STEP, "x");
-    const error = { name: "Boom", message: "exhausted" };
-    hub.closeError(RUN, STEP, error);
+    hub.closeError(RUN, STEP);
 
     expect(await got).toEqual([
       { kind: "chunk", chunk: "x" },
-      { kind: "error", error },
+      { kind: "error" },
     ]);
   });
 
@@ -184,7 +183,7 @@ describe("InMemoryStreamHub — subscribe after close (D3)", () => {
   it("after closeError → empty, immediately-closed stream (no replayed error)", async () => {
     const hub = new InMemoryStreamHub();
     hub.publishChunk(RUN, STEP, "gone");
-    hub.closeError(RUN, STEP, { name: "E", message: "m" });
+    hub.closeError(RUN, STEP);
 
     expect(await collect(hub.subscribeStream(RUN, STEP))).toEqual([]);
   });
@@ -226,9 +225,7 @@ describe("InMemoryStreamHub — close*/closeRun never create a channel (leak-fre
 
   it("closeError / closeRun on a never-published channel are safe no-ops", () => {
     const hub = new InMemoryStreamHub();
-    expect(() =>
-      hub.closeError(RUN, STEP, { name: "E", message: "m" }),
-    ).not.toThrow();
+    expect(() => hub.closeError(RUN, STEP)).not.toThrow();
     expect(() => hub.closeRun(RUN)).not.toThrow();
   });
 
@@ -276,7 +273,7 @@ describe("InMemoryStreamHub — closed channels are freed", () => {
 
   const closers: Record<string, (hub: InMemoryStreamHub) => void> = {
     closeOk: (hub) => hub.closeOk(RUN, STEP),
-    closeError: (hub) => hub.closeError(RUN, STEP, { name: "E", message: "m" }),
+    closeError: (hub) => hub.closeError(RUN, STEP),
     closeRun: (hub) => hub.closeRun(RUN),
   };
 

@@ -5,7 +5,6 @@ import type {
   Builder,
   Json,
   RunId,
-  SerializedError,
   Step,
   StepId,
   StepKind,
@@ -143,7 +142,7 @@ describe("StreamEvent<C> discriminated union", () => {
         expectTypeOf(streamEvent.attempt).toEqualTypeOf<AttemptNumber>();
         break;
       case "error":
-        expectTypeOf(streamEvent.error).toEqualTypeOf<SerializedError>();
+        expectTypeOf(streamEvent).toEqualTypeOf<{ readonly kind: "error" }>();
         break;
     }
   });

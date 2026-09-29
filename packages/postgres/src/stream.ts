@@ -3,7 +3,6 @@ import type {
   InMemoryStreamHub,
   Json,
   RunId,
-  SerializedError,
   StepId,
 } from "@nagi-js/core";
 
@@ -44,12 +43,7 @@ export type StreamFrame =
       readonly a: number;
     }
   | { readonly k: "ok"; readonly r: RunId; readonly s: StepId }
-  | {
-      readonly k: "err";
-      readonly r: RunId;
-      readonly s: StepId;
-      readonly e: SerializedError;
-    }
+  | { readonly k: "err"; readonly r: RunId; readonly s: StepId }
   | { readonly k: "run"; readonly r: RunId };
 
 export function encodeFrame(frame: StreamFrame): string {
@@ -82,7 +76,7 @@ export function applyFrame(hub: InMemoryStreamHub, frame: StreamFrame): void {
       hub.closeOk(frame.r, frame.s);
       return;
     case "err":
-      hub.closeError(frame.r, frame.s, frame.e);
+      hub.closeError(frame.r, frame.s);
       return;
     case "run":
       hub.closeRun(frame.r);

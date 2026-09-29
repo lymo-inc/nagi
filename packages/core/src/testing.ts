@@ -692,6 +692,34 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "settleSignal(consume): parking an awaiting step releases its lease and keeps its timer",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });
+      const queue = new InMemoryQueue();
+      const runId = rid();
+      await startRun(s, runId);
+      await startStep(s, runId, "gate", { kind: "signal" });
+      ok((await s.claimStep(runId, "gate", A1)) !== null, "claim");
+      const fireAt = new Date(Date.now() + HOUR_MS);
+      await s.upsertTimer(runId, "gate", fireAt);
+      eq(
+        await s.settleSignal({ runId, stepId: "gate", at: new Date() }),
+        { tag: "noop" },
+        "parks",
+      );
+      await sleep(PAST_LEASE_MS);
+      eq(
+        await s.sweepLeases({ now: new Date(), queue }),
+        [],
+        "nothing to reap",
+      );
+      const timedOut = await s.sweepSignalTimeouts({
+        now: new Date(fireAt.getTime() + 1),
+      });
+      eq(timedOut.length, 1, "timer survived the park");
+    },
+  },
+  {
     name: "sweepSignalTimeouts: fails an awaiting step past its deadline with NagiSignalTimeoutError, releases its lease, consumes the timer",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
@@ -1892,6 +1920,33 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "events: a run whose outputs exceed 8 KB still commits, and its events carry no payload",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.events === undefined) return;
+      const runId = rid();
+      const seen: RunEventEnvelope[] = [];
+      s.events.watchRun(runId, (e) => seen.push(e));
+      await startRun(s, runId);
+      await startStep(s, runId, "s");
+      const big = { text: "x".repeat(20_000) };
+      await s.appendFact(
+        runId,
+        Facts.stepCompleted(runId, "s", A1, big, new Date()),
+      );
+      await s.endRun(runId, Facts.flowCompleted(runId, big, new Date()));
+      await eventually(
+        () => seen.some((e) => e.type === "flow.completed"),
+        "flow.completed",
+      );
+      ok(
+        seen.every((e) => !("output" in e) && !("error" in e)),
+        "events carry no payload",
+      );
+      eq((await s.loadRunState(runId)).phase.tag, "completed", "run committed");
+    },
+  },
+  {
     name: "stream: a subscriber receives published chunks, then closes on step.completed",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
@@ -1917,7 +1972,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
-    name: "stream: step.failed closes with the error; a run end closes a step that never emitted",
+    name: "stream: step.failed ends the stream with an error event; a run end closes a step that never emitted",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       if (s.stream === undefined) return;
@@ -1932,7 +1987,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         runId,
         Facts.stepFailed(runId, "bad", A1, error, new Date()),
       );
-      eq(await bad, [{ kind: "error", error }], "error event, then closed");
+      eq(await bad, [{ kind: "error" }], "error event, then closed");
       await endRun(s, runId, "canceled");
       eq(await quiet, [], "closed by the run end");
     },

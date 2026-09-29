@@ -213,12 +213,10 @@ describe("streamingTask — termination signaling (D3/O4)", () => {
     const events = await collected;
     expect(chunks(events)).toEqual(["partial"]);
     const last = events[events.length - 1];
-    expect(last?.kind).toBe("error");
-    if (last?.kind === "error") {
-      expect(last.error.message).toBe("boom");
-    }
+    expect(last).toEqual({ kind: "error" });
     const result = await h.waitForEnd(runId);
     expect(result.status).toBe("failed");
+    expect(result.error("gen").message).toBe("boom");
   });
 });
 

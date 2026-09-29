@@ -15,6 +15,42 @@ function newRuns(): Runs {
   return { a: 0, b: 0, c: 0 };
 }
 
+// a → b → c where a throws on its first attempt only. Rerunning a with scope
+// "step" must rerun b and c — they hold no value, only a transitive skip —
+// or the run would settle "completed" without ever producing their output.
+function failOnceChain(id: string, runs: Runs) {
+  return flow({
+    id,
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({
+        retry: { maxAttempts: 1, backoff: "fixed" },
+        run: async () => {
+          runs.a += 1;
+          if (runs.a === 1) throw new Error("boom");
+          return { v: "a" };
+        },
+      });
+      const bStep = b.task({
+        needs: { a },
+        run: async () => {
+          runs.b += 1;
+          return { v: "b" };
+        },
+      });
+      const c = b.task({
+        needs: { b: bStep },
+        run: async () => {
+          runs.c += 1;
+          return { v: "c" };
+        },
+      });
+      return { a, b: bStep, c };
+    },
+    output: (s) => s.c,
+  });
+}
+
 function chainFlow(id: string, runs: Runs) {
   return flow({
     id,
@@ -151,6 +187,27 @@ describe('replay({ from, scope: "step" })', () => {
     expect(r.status).toBe("completed");
     expect(runs.c).toBe(2);
     expect(r.factCount("flow.completed")).toBe(2);
+  });
+  it("replaying a failed step with scope step reruns its transitively-skipped descendants", async () => {
+    const runs = newRuns();
+    const f = failOnceChain("replay-isolated-unsettled", runs);
+    const h = await makeHarness(f);
+    const runId = await h.wf.start(f, {});
+    await h.drain();
+
+    const before = await h.result(runId);
+    expect(before.status).toBe("failed");
+    expect(before.stepStatus("b")).toBe("skipped");
+    expect(before.stepStatus("c")).toBe("skipped");
+
+    await h.wf.replay(runId, { mode: "continue", from: "a", scope: "step" });
+    await h.drain();
+
+    const after = await h.result(runId);
+    expect(after.status).toBe("completed");
+    expect(after.stepStatus("b")).toBe("completed");
+    expect(after.stepStatus("c")).toBe("completed");
+    expect(runs).toEqual({ a: 2, b: 1, c: 1 });
   });
 });
 

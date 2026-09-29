@@ -322,7 +322,11 @@ describe("run lifecycle — start scenarios", () => {
         );
       }
       expect(fx.advance).toHaveBeenCalledTimes(
-        effects.dispatch.kind === "advance" ? 1 : 0,
+        effects.dispatch.kind === "advance" ||
+          (effects.dispatch.kind === "enqueued" &&
+            effects.dispatch.skip.length > 0)
+          ? 1
+          : 0,
       );
       const queuedAfterApply = await fx.queue.dequeue({ count: 10 });
       expect(queuedAfterApply.map((m) => m.stepId)).toEqual(

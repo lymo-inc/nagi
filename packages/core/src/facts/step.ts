@@ -293,7 +293,6 @@ export const stepKinds = {
       type: "step.completed",
       stepId: fact.stepId,
       attempt: fact.attempt,
-      output: fact.output,
     }),
   },
   "step.failed": {
@@ -313,16 +312,11 @@ export const stepKinds = {
     }),
     release: (fact) => releaseStep(fact.stepId, false),
     // Only written on terminal failure (retries use step.retried).
-    stream: (fact) => ({
-      tag: "close-error",
-      stepId: fact.stepId,
-      error: fact.error,
-    }),
+    stream: (fact) => ({ tag: "close-error", stepId: fact.stepId }),
     event: (fact) => ({
       type: "step.failed",
       stepId: fact.stepId,
       attempt: fact.attempt,
-      error: fact.error,
     }),
   },
   "step.canceled": {
