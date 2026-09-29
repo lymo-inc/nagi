@@ -197,10 +197,7 @@ describe("handler-step timeoutMs", () => {
     expect(r.status).toBe("failed");
     expect(r.error("slow").name).toBe("NagiStepTimeoutError");
     expect(events.at(0)).toEqual({ kind: "chunk", chunk: "first" });
-    expect(events.at(-1)).toMatchObject({
-      kind: "error",
-      error: { name: "NagiStepTimeoutError" },
-    });
+    expect(events.at(-1)).toEqual({ kind: "error" });
   });
 
   it("omitting timeoutMs arms no deadline — a slow step still completes", async () => {

@@ -36,7 +36,7 @@ describe("wf.watchRun", () => {
     expect(seen.every((e) => e.runId === runId)).toBe(true);
   });
 
-  it("carries step output and the terminating flow output", async () => {
+  it("carries no output; describe() has the step and flow output", async () => {
     const f = flow({
       id: "watch-payload",
       input: emptySchema(),
@@ -50,14 +50,19 @@ describe("wf.watchRun", () => {
     await h.drain();
 
     const completed = seen.find((e) => e.type === "step.completed");
-    expect(completed).toMatchObject({ stepId: "only", output: { ok: true } });
-    expect(seen.at(-1)).toMatchObject({
-      type: "flow.completed",
-      output: { ok: true },
+    expect(completed).toMatchObject({ stepId: "only" });
+    expect(completed).not.toHaveProperty("output");
+    expect(seen.at(-1)).toMatchObject({ type: "flow.completed" });
+    expect(seen.at(-1)).not.toHaveProperty("output");
+
+    const d = await h.wf.describe(runId);
+    expect(d?.run.output).toEqual({ ok: true });
+    expect(d?.steps.find((s) => s.stepId === "only")?.output).toEqual({
+      ok: true,
     });
   });
 
-  it("reports a terminal step failure with its error and attempt", async () => {
+  it("reports a terminal step failure's stepId and attempt, no error; describe() has the error", async () => {
     const f = flow({
       id: "watch-failure",
       input: emptySchema(),
@@ -78,7 +83,16 @@ describe("wf.watchRun", () => {
 
     const failed = seen.find((e) => e.type === "step.failed");
     expect(failed).toMatchObject({ stepId: "boom", attempt: 1 });
+    expect(failed).not.toHaveProperty("error");
     expect(types(seen)).toContain("flow.failed");
+    const flowFailed = seen.find((e) => e.type === "flow.failed");
+    expect(flowFailed).not.toHaveProperty("error");
+
+    const d = await h.wf.describe(runId);
+    expect(d?.steps.find((s) => s.stepId === "boom")?.error).toMatchObject({
+      message: "nope",
+    });
+    expect(d?.run.error).toBeDefined();
   });
 
   it("stops delivering after the disposer is called", async () => {

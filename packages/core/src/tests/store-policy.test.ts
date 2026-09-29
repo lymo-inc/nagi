@@ -141,7 +141,6 @@ describe("factConsequences — stream effects", () => {
     expect(streamOf(Facts.stepFailed(R, "s", A1, error, AT))).toEqual({
       tag: "close-error",
       stepId: "s",
-      error,
     });
     expect(streamOf(Facts.stepRetried(R, "s", A1, AT, error, AT))).toEqual({
       tag: "retry",

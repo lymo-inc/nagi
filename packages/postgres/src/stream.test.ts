@@ -28,7 +28,7 @@ describe("stream frame codec", () => {
       { k: "chunk", r: R, s: S, c: { token: "hi" } },
       { k: "retry", r: R, s: S, a: 2 },
       { k: "ok", r: R, s: S },
-      { k: "err", r: R, s: S, e: { name: "E", message: "m" } },
+      { k: "err", r: R, s: S },
       { k: "run", r: R },
     ];
     for (const f of frames) {
@@ -68,9 +68,8 @@ describe("applyFrame drives the hub", () => {
   it("emits an error event then closes on an err frame", async () => {
     const hub = new InMemoryStreamHub();
     const sub = hub.subscribeStream(R, S);
-    const error = { name: "Boom", message: "upstream died" };
-    applyFrame(hub, { k: "err", r: R, s: S, e: error });
-    expect(await drain(sub, 5)).toEqual([{ kind: "error", error }]);
+    applyFrame(hub, { k: "err", r: R, s: S });
+    expect(await drain(sub, 5)).toEqual([{ kind: "error" }]);
   });
 
   it("closes every channel of a run on a run frame", async () => {

@@ -252,7 +252,11 @@ once the run is terminal.
 
 ```ts
 const off = wf.watchRun(runId, (e) => {
-  if (e.type === "step.completed") console.log(e.stepId, e.output);
+  if (e.type !== "step.completed") return;
+  // Events are references: read the output with describe().
+  wf.describe(runId)
+    .then((d) => console.log(e.stepId, d?.steps.find((s) => s.stepId === e.stepId)?.output))
+    .catch(console.error);
 });
 ```
 
@@ -274,6 +278,9 @@ What it is not:
   change — and filtering on `input` would cost a state load per event.
 - **Not a delivery guarantee.** Events are observation, not execution. A
   handler that throws is swallowed, so watching a run can never break it.
+- **Not a payload channel.** Events carry identity and status only; read
+  outputs and errors with `describe()`. (A NOTIFY is capped at 8000 bytes,
+  and any role that can connect to the database can LISTEN.)
 
 Concurrency supersession IS observable (`flow.canceled`, `cause:
 "concurrency"`), which matters when a run vanishes from under a client: the
@@ -340,6 +347,8 @@ Operational limits:
   response rather than a race.
 - Chunks never enter the fact log, so they are not replayed. A replayed step
   re-runs and re-emits.
+- A failed streaming step ends its iterator with `{ kind: "error" }` — no
+  error payload on the frame. Read the error with `describe()`.
 
 ## Retention and superseded runs
 

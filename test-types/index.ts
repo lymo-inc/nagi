@@ -28,3 +28,16 @@ export type RemovedSurface = [
 ];
 export const removedSurfaceOk: RemovedSurface extends true[] ? true : never =
   true;
+
+// Reference-only run events (issue: >8KB output/error aborted a NOTIFY-backed
+// fact write): tsc fails here if `output`/`error` come back on a RunEvent or
+// StreamEvent member.
+type NoPayload<T> = T extends { output: unknown } | { error: unknown }
+  ? ["carries payload", T]
+  : true;
+export type RunEventsAreReferences =
+  | NoPayload<core.RunEvent>
+  | NoPayload<core.StreamEvent>;
+export const runEventsAreReferencesOk: RunEventsAreReferences extends true
+  ? true
+  : never = true;

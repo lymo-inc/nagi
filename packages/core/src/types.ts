@@ -144,7 +144,7 @@ export type StreamEvent<C = Json> =
   | { readonly kind: "chunk"; readonly chunk: C }
   | { readonly kind: "dropped"; readonly count: number }
   | { readonly kind: "retry"; readonly attempt: AttemptNumber }
-  | { readonly kind: "error"; readonly error: SerializedError };
+  | { readonly kind: "error" };
 
 export interface StreamingStepCtx<Input = unknown, Chunk = Json>
   extends StepCtx<Input> {
@@ -727,10 +727,11 @@ export interface Store {
 // A lifecycle projection of the fact log, for observers. Deliberately smaller
 // than Fact: leases and timers are execution bookkeeping, not
 // things a UI or an operator subscribes to.
+// References, not payloads: a NOTIFY-backed transport caps at 8000 bytes; describe() has the rest.
 export type RunEvent =
   | { readonly type: "flow.started"; readonly flowId: string }
-  | { readonly type: "flow.completed"; readonly output: Json }
-  | { readonly type: "flow.failed"; readonly error: SerializedError }
+  | { readonly type: "flow.completed" }
+  | { readonly type: "flow.failed" }
   | {
       readonly type: "flow.canceled";
       readonly cause: "concurrency";
@@ -749,13 +750,11 @@ export type RunEvent =
       readonly type: "step.completed";
       readonly stepId: StepId;
       readonly attempt: AttemptNumber;
-      readonly output: Json;
     }
   | {
       readonly type: "step.failed";
       readonly stepId: StepId;
       readonly attempt: AttemptNumber;
-      readonly error: SerializedError;
     }
   | {
       readonly type: "step.retried";

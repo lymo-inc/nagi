@@ -1315,7 +1315,7 @@ function frameOf(runId: RunId, effect: StreamEffect): StreamFrame {
     case "close-ok":
       return { k: "ok", r: runId, s: effect.stepId };
     case "close-error":
-      return { k: "err", r: runId, s: effect.stepId, e: effect.error };
+      return { k: "err", r: runId, s: effect.stepId };
     case "retry":
       return { k: "retry", r: runId, s: effect.stepId, a: effect.nextAttempt };
     case "close-run":

@@ -5,7 +5,6 @@ import type {
   Json,
   RunId,
   RunState,
-  SerializedError,
   StepId,
   StreamEvent,
 } from "./types";
@@ -173,9 +172,9 @@ export class InMemoryStreamHub {
     for (const sub of subs ?? []) sub.close();
   }
 
-  closeError(runId: RunId, stepId: StepId, error: SerializedError): void {
+  closeError(runId: RunId, stepId: StepId): void {
     const subs = this.closeChannel(InMemoryStreamHub.key(runId, stepId));
-    const event: StreamEvent<Json> = { kind: "error", error };
+    const event: StreamEvent<Json> = { kind: "error" };
     for (const sub of subs ?? []) {
       sub.push(event);
       sub.close();
@@ -188,7 +187,7 @@ export class InMemoryStreamHub {
         this.closeOk(runId, effect.stepId);
         return;
       case "close-error":
-        this.closeError(runId, effect.stepId, effect.error);
+        this.closeError(runId, effect.stepId);
         return;
       case "retry":
         this.signalRetry(runId, effect.stepId, effect.nextAttempt);
