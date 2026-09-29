@@ -215,7 +215,7 @@ What it is not:
 - **Not durable.** A handler sees events from the moment it subscribes; a
   restart starts over, and a dropped LISTEN connection loses the gap (see
   [Streaming steps on Postgres](#streaming-steps-on-postgres)). Catch up with
-  `describe()` / `queryRuns()`, then watch.
+  `describe()`, then watch.
   Events ride the same LISTEN connection as streaming chunks, so the same
   `await store.ready()` applies before starting a run you mean to watch.
 - **Not filtered.** `watchRuns` delivers every run this process observes.
@@ -270,7 +270,7 @@ gap stays lost:
   if the step has settled — and take the output from `describe()`.
 - Watching: events in the gap are gone, and a `watchRun` whose terminal event
   was missed never stops on its own; call its disposer. Catch up with
-  `describe()` / `queryRuns()`.
+  `describe()`.
 
 Operational limits:
 

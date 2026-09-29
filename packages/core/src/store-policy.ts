@@ -3,7 +3,6 @@ import type {
   ConcurrencyMode,
   FlowCanceledByConcurrencyFact,
   FlowStartedFact,
-  Json,
   PrunableStatus,
   RunId,
   RunStatus,
@@ -14,90 +13,6 @@ import type {
 // shared, so two stores can only disagree by not calling it. Companions:
 // factConsequences (facts/), decideSignal / decideTimeout (signals.ts),
 // decideExpiredLeaseAction (lease-reaper.ts). `storeContract` (./testing) asserts each one per adapter.
-
-export const QUERY_RUNS_DEFAULT_LIMIT = 50;
-export const QUERY_RUNS_MAX_LIMIT = 500;
-
-export function clampQueryLimit(limit: number | undefined): number {
-  if (limit === undefined) return QUERY_RUNS_DEFAULT_LIMIT;
-  if (!Number.isInteger(limit) || limit < 1) return QUERY_RUNS_DEFAULT_LIMIT;
-  return Math.min(limit, QUERY_RUNS_MAX_LIMIT);
-}
-
-export interface RunCursor {
-  readonly startedAt: Date;
-  readonly runId: RunId;
-}
-
-// queryRuns pages by (startedAt DESC, runId DESC); the cursor is the last row
-// of the previous page and the next page is every row that sorts after it.
-export function compareRunOrder(a: RunCursor, b: RunCursor): number {
-  const t = b.startedAt.getTime() - a.startedAt.getTime();
-  if (t !== 0) return t;
-  return a.runId < b.runId ? 1 : a.runId > b.runId ? -1 : 0;
-}
-
-export function isPastCursor(row: RunCursor, cursor: RunCursor): boolean {
-  return compareRunOrder(row, cursor) > 0;
-}
-
-// Wire format `{t, r}` (base64url JSON) is a Store.queryRuns contract: a cursor
-// minted by one adapter must decode in another.
-export function encodeRunCursor(c: RunCursor): string {
-  const bytes = new TextEncoder().encode(
-    JSON.stringify({ t: c.startedAt.getTime(), r: c.runId }),
-  );
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-export function decodeRunCursor(s: string): RunCursor {
-  try {
-    const binary = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
-    const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      typeof (parsed as { t?: unknown }).t === "number" &&
-      typeof (parsed as { r?: unknown }).r === "string"
-    ) {
-      const { t, r } = parsed as { t: number; r: string };
-      return { startedAt: new Date(t), runId: r as RunId };
-    }
-    throw new Error("malformed cursor body");
-  } catch (err) {
-    throw new Error(
-      `queryRuns: invalid cursor — ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-// Reference semantics for QueryRunsWhere.input: Postgres jsonb `@>`. Objects
-// match when every needle key is contained; arrays when every needle element
-// is contained in some haystack element; scalars by equality.
-export function jsonContains(haystack: Json, needle: Json): boolean {
-  if (Array.isArray(needle)) {
-    if (!Array.isArray(haystack)) return false;
-    return needle.every((n) => haystack.some((h) => jsonContains(h, n)));
-  }
-  if (needle !== null && typeof needle === "object") {
-    if (
-      haystack === null ||
-      Array.isArray(haystack) ||
-      typeof haystack !== "object"
-    )
-      return false;
-    return Object.entries(needle).every(
-      ([k, v]) => k in haystack && jsonContains(haystack[k] as Json, v as Json),
-    );
-  }
-  return haystack === needle;
-}
 
 export const DEFAULT_SWEEP_LIMIT = 100;
 

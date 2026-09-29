@@ -13,7 +13,6 @@ import type {
   Queue,
   ResolvedNeeds,
   RunId,
-  RunSummary,
   Step,
   StepCtx,
   StepMap,
@@ -323,42 +322,14 @@ describe("Wf parameterized over registered flows (RFC 0018)", () => {
     build: (bld) => ({ s: bld.task({ run: async () => null }) }),
   });
 
-  it("nagi({ flows: [a, b] }) — no `as const` — narrows flowId to the union", async () => {
-    const wf = await nagi({ flows: [a, b], store, queue });
-    type Runs = Awaited<ReturnType<typeof wf.queryRuns>>["runs"];
-    expectTypeOf<Runs[number]["flowId"]>().toEqualTypeOf<"a" | "b">();
-  });
-
-  it("single-flow tuple [a] narrows to the lone literal (not widened)", async () => {
+  it("single-flow tuple [a] narrows to the lone flow (not widened)", async () => {
     const wf = await nagi({ flows: [a], store, queue });
-    type Runs = Awaited<ReturnType<typeof wf.queryRuns>>["runs"];
-    expectTypeOf<Runs[number]["flowId"]>().toEqualTypeOf<"a">();
-  });
-
-  it("bare Wf (no type arg) keeps flowId as string", () => {
-    type Runs = Awaited<ReturnType<typeof wfEx.queryRuns>>["runs"];
-    expectTypeOf<Runs[number]["flowId"]>().toBeString();
-  });
-
-  it("bare RunSummary (no type arg) keeps flowId as string", () => {
-    expectTypeOf<RunSummary["flowId"]>().toBeString();
+    expectTypeOf(wf.start).parameter(0).toEqualTypeOf<typeof a>();
   });
 
   it("FlowIdOf<typeof flows> resolves to the literal union", () => {
     const flows = [a, b] as const;
     expectTypeOf<FlowIdOf<typeof flows>>().toEqualTypeOf<"a" | "b">();
-  });
-
-  it("where.flowId accepts a registered id", async () => {
-    const wf = await nagi({ flows: [a, b], store, queue });
-    const r = wf.queryRuns({ where: { flowId: "a" } });
-    expectTypeOf(r).toEqualTypeOf<ReturnType<typeof wf.queryRuns>>();
-  });
-
-  it("where.flowId rejects a non-registered id (strict union, no escape hatch)", async () => {
-    const wf = await nagi({ flows: [a, b], store, queue });
-    // @ts-expect-error "notAFlow" is not a registered flow id
-    void wf.queryRuns({ where: { flowId: "notAFlow" } });
   });
 
   it("start still infers FlowInput for a registered flow", async () => {
@@ -377,11 +348,6 @@ describe("Wf parameterized over registered flows (RFC 0018)", () => {
     });
     // @ts-expect-error `unregistered` was not passed to nagi({ flows })
     void wf.start(unregistered, { z: true });
-  });
-
-  it("RunSummary.input is still Json", () => {
-    expectTypeOf<RunSummary["input"]>().toEqualTypeOf<Json>();
-    expectTypeOf<RunSummary<"a" | "b">["input"]>().toEqualTypeOf<Json>();
   });
 });
 

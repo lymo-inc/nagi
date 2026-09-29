@@ -19,7 +19,6 @@ import type {
   DriftPolicy,
   Flow,
   FlowHooks,
-  FlowIdOf,
   FlowInput,
   Json,
   LogEntry,
@@ -27,8 +26,6 @@ import type {
   PrunableStatus,
   PruneOpts,
   PruneResult,
-  QueryRunsOpts,
-  QueryRunsResult,
   Queue,
   QueueInspectEntry,
   ReplayOpts,
@@ -135,10 +132,6 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
 
   replay(runId: RunId, opts?: ReplayOpts): Promise<void>;
 
-  queryRuns(
-    opts?: QueryRunsOpts<FlowIdOf<TFlows>>,
-  ): Promise<QueryRunsResult<FlowIdOf<TFlows>>>;
-
   // Returns the canonical projection of a single run + its steps. Returns null
   // for an unknown runId (never throws). Parent/children are nested on the
   // returned RunView; the outer envelope is `{run, steps}` only.
@@ -161,7 +154,7 @@ export interface Wf<TFlows extends ReadonlyArray<Flow> = ReadonlyArray<Flow>> {
   // the subscription also ends on its own once the run reaches a terminal
   // event, so a caller that watches many runs does not leak a handler each.
   // NOT durable: a handler sees events observed from now on, and a restart
-  // starts over. Pair with describe() / queryRuns() to catch up.
+  // starts over. Pair with describe() to catch up.
   watchRun(runId: RunId, handler: (e: RunEventEnvelope) => void): () => void;
 
   // Lifecycle events for every run this process observes.
@@ -393,18 +386,6 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         );
       }
       return config.queue.inspect(runId);
-    },
-
-    async queryRuns(opts: QueryRunsOpts = {}): Promise<QueryRunsResult> {
-      if (opts.latest === true) {
-        if (opts.limit !== undefined || opts.cursor !== undefined) {
-          throw validationError(
-            "queryRuns: `latest: true` is incompatible with `limit` / `cursor` — `latest` returns at most one row.",
-            ["latest"],
-          );
-        }
-      }
-      return config.store.queryRuns(opts);
     },
 
     subscribe<C = Json>(

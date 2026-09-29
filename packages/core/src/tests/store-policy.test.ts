@@ -1,102 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { Facts, factConsequences } from "../facts";
-import {
-  clampQueryLimit,
-  compareRunOrder,
-  decodeRunCursor,
-  encodeRunCursor,
-  isPastCursor,
-  jsonContains,
-  QUERY_RUNS_DEFAULT_LIMIT,
-  QUERY_RUNS_MAX_LIMIT,
-  selectExpired,
-  selectPruneBatch,
-  supersede,
-} from "../store-policy";
+import { selectExpired, selectPruneBatch, supersede } from "../store-policy";
 import type { AttemptNumber, Fact, RunId } from "../types";
 
 const R = "run-1" as RunId;
 const A1 = 1 as AttemptNumber;
 const AT = new Date(1_700_000_000_000);
-
-describe("queryRuns policy — limit, order, cursor", () => {
-  it("clampQueryLimit: default for undefined / non-positive / non-integer, capped at max", () => {
-    expect(clampQueryLimit(undefined)).toBe(QUERY_RUNS_DEFAULT_LIMIT);
-    expect(clampQueryLimit(0)).toBe(QUERY_RUNS_DEFAULT_LIMIT);
-    expect(clampQueryLimit(-5)).toBe(QUERY_RUNS_DEFAULT_LIMIT);
-    expect(clampQueryLimit(1.5)).toBe(QUERY_RUNS_DEFAULT_LIMIT);
-    expect(clampQueryLimit(7)).toBe(7);
-    expect(clampQueryLimit(10_000)).toBe(QUERY_RUNS_MAX_LIMIT);
-  });
-
-  it("compareRunOrder: startedAt DESC, then runId DESC", () => {
-    const rows = [
-      { startedAt: new Date(1000), runId: "b" as RunId },
-      { startedAt: new Date(2000), runId: "a" as RunId },
-      { startedAt: new Date(1000), runId: "c" as RunId },
-    ];
-    expect([...rows].sort(compareRunOrder).map((r) => r.runId)).toEqual([
-      "a",
-      "c",
-      "b",
-    ]);
-  });
-
-  it("isPastCursor: only rows that sort strictly after the cursor", () => {
-    const cursor = { startedAt: new Date(1000), runId: "m" as RunId };
-    expect(
-      isPastCursor({ startedAt: new Date(1000), runId: "l" as RunId }, cursor),
-    ).toBe(true);
-    expect(
-      isPastCursor({ startedAt: new Date(500), runId: "z" as RunId }, cursor),
-    ).toBe(true);
-    expect(isPastCursor(cursor, cursor)).toBe(false);
-    expect(
-      isPastCursor({ startedAt: new Date(1000), runId: "n" as RunId }, cursor),
-    ).toBe(false);
-    expect(
-      isPastCursor({ startedAt: new Date(2000), runId: "a" as RunId }, cursor),
-    ).toBe(false);
-  });
-
-  it("cursor codec round-trips and stays base64url", () => {
-    const c = { startedAt: AT, runId: "run-x/y+z" as RunId };
-    const encoded = encodeRunCursor(c);
-    expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(decodeRunCursor(encoded)).toEqual(c);
-  });
-
-  it("decodeRunCursor rejects garbage and well-formed-but-wrong bodies", () => {
-    expect(() => decodeRunCursor("not-a-cursor")).toThrow(/invalid cursor/);
-    expect(() =>
-      decodeRunCursor(btoa(JSON.stringify({ t: "1", r: 2 }))),
-    ).toThrow(/invalid cursor/);
-  });
-});
-
-describe("jsonContains — reference @> semantics", () => {
-  it("objects: needle keys must all be contained", () => {
-    expect(jsonContains({ a: 1, b: 2 }, { a: 1 })).toBe(true);
-    expect(jsonContains({ a: 1 }, { a: 1, b: 2 })).toBe(false);
-    expect(jsonContains({ a: 1 }, {})).toBe(true);
-    expect(
-      jsonContains({ a: { b: { c: 1, d: 2 } } }, { a: { b: { c: 1 } } }),
-    ).toBe(true);
-  });
-
-  it("arrays: every needle element contained in some haystack element", () => {
-    expect(jsonContains(["a", "b", "c"], ["c", "a"])).toBe(true);
-    expect(jsonContains(["a"], ["a", "z"])).toBe(false);
-    expect(jsonContains([{ k: 1, x: 2 }], [{ k: 1 }])).toBe(true);
-  });
-
-  it("scalars: equality with no coercion", () => {
-    expect(jsonContains({ x: "1" }, { x: 1 })).toBe(false);
-    expect(jsonContains({ x: null }, { x: null })).toBe(true);
-    expect(jsonContains({ x: [1] }, { x: 1 })).toBe(false);
-    expect(jsonContains({ x: 1 }, { x: [1] })).toBe(false);
-  });
-});
 
 describe("selectExpired — expiry filter before limit", () => {
   const now = new Date(1000);

@@ -9,8 +9,8 @@ import type {
   StepStatus,
 } from "./types";
 
-// The materialized read model behind describe / queryRuns / pruneFacts: one
-// row per run and one per (run, step). The functions below are the reference
+// The materialized read model behind describe / pruneFacts: one row per run
+// and one per (run, step). The functions below are the reference
 // interpretation of RowDelta; a SQL adapter mirrors them statement for
 // statement, so two stores can only disagree by not applying a delta.
 
