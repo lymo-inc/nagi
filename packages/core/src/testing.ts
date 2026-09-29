@@ -361,6 +361,72 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "tryStartRun: a seed is enqueued with the start, once",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const flowId = fid();
+      const queue = new InMemoryQueue();
+      const fact = Facts.flowStarted({
+        runId,
+        flowId,
+        input: {},
+        at: new Date(),
+      });
+      const steps = ["a" as StepId, "b" as StepId];
+
+      const res = await s.tryStartRun(runId, fact, undefined, {
+        queue,
+        flowId,
+        steps,
+      });
+      ok(res.started, "start reports started");
+      const queued = await queue.dequeue({ count: 10 });
+      eq(
+        queued
+          .map((m) => ({ runId: m.runId, stepId: m.stepId, flowId: m.flowId }))
+          .sort((x, y) => (x.stepId < y.stepId ? -1 : 1)),
+        [
+          { runId, stepId: "a", flowId },
+          { runId, stepId: "b", flowId },
+        ],
+        "both seed steps are queued once, for this run and flowId",
+      );
+
+      const again = await s.tryStartRun(runId, fact, undefined, {
+        queue,
+        flowId,
+        steps,
+      });
+      eq(again.started, false, "second identical call is refused");
+      eq(await queue.dequeue({ count: 10 }), [], "nothing more is queued");
+    },
+  },
+  {
+    name: "tryStartRun: a refused start enqueues nothing",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      const flowId = fid();
+      await startRun(s, runId, { flowId });
+
+      const queue = new InMemoryQueue();
+      const fact = Facts.flowStarted({
+        runId,
+        flowId,
+        input: {},
+        at: new Date(),
+      });
+      const res = await s.tryStartRun(runId, fact, undefined, {
+        queue,
+        flowId,
+        steps: ["a" as StepId],
+      });
+      eq(res.started, false, "refused: runId already exists");
+      eq(await queue.dequeue({ count: 10 }), [], "the queue is empty");
+    },
+  },
+  {
     // The third face of nagi#29, and the one the issue's hypothesis list
     // misses: tryStartRun is atomic, but nothing keeps the superseder ALIVE.
     // Retention that prunes "completed" while keeping "canceled" for audit

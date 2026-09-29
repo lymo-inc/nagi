@@ -49,6 +49,7 @@ import type {
   RunId,
   RunState,
   SettleSignalResult,
+  StartSeed,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
@@ -213,6 +214,7 @@ export class InMemoryStore implements Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
+    seed?: StartSeed,
   ): Promise<{
     readonly started: boolean;
     readonly canceled: ReadonlyArray<Superseded>;
@@ -239,6 +241,11 @@ export class InMemoryStore implements Store {
     }
 
     this.writeFact(runId, fact);
+    if (seed !== undefined) {
+      for (const stepId of seed.steps) {
+        await seed.queue.enqueue(runId, stepId, { flowId: seed.flowId });
+      }
+    }
     return { started: true, canceled };
   }
 

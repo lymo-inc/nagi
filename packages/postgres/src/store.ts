@@ -25,6 +25,7 @@ import type {
   RunView,
   SerializedError,
   SettleSignalResult,
+  StartSeed,
   StepCanceledFact,
   StepCompletedFact,
   StepFailedFact,
@@ -293,6 +294,7 @@ class PostgresStore<DB = unknown> implements Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
+    seed?: StartSeed,
   ): Promise<StartResult> {
     return this.db.transaction().execute(async (trx) => {
       if (concurrency !== undefined) {
@@ -301,7 +303,15 @@ class PostgresStore<DB = unknown> implements Store {
           trx,
         );
       }
-      return this.startRetrying(trx, runId, fact, concurrency);
+      const started = await this.startRetrying(trx, runId, fact, concurrency);
+      // Outside the savepoint loop: a rolled-back attempt must never enqueue.
+      if (started.started && seed !== undefined) {
+        const txQueue = seed.queue.withTx?.(trx as unknown as Tx) ?? seed.queue;
+        for (const stepId of seed.steps) {
+          await txQueue.enqueue(runId, stepId, { flowId: seed.flowId });
+        }
+      }
+      return started;
     });
   }
 

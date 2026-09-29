@@ -526,6 +526,16 @@ export interface TimedOutSignal {
   readonly fireAt: Date;
 }
 
+// The runnable roots of a fresh run. MUST be enqueued in the same
+// transaction as the start (Queue.withTx when the queue has it), and only
+// when started is true: a crash after commit must not leave a running run
+// with nothing queued.
+export interface StartSeed {
+  readonly queue: Queue;
+  readonly flowId: string;
+  readonly steps: readonly StepId[];
+}
+
 // Every MUST below is a case in `storeContract` (@nagi-js/core/testing); run it
 // against any new adapter. Decisions an adapter must not re-make are core pure
 // functions: factConsequences, admitsRunEnd, supersede, decideSignal /
@@ -568,6 +578,8 @@ export interface Store {
   // MUST be atomic: concurrent calls with the same runId produce exactly one
   // flow.started fact. When concurrency is supplied, MUST atomically cancel
   // prior active runs sharing (flowId, key) and serialize concurrent starts.
+  // With `seed`, MUST enqueue its steps in the same transaction as the start,
+  // and only when started is true.
   tryStartRun(
     runId: RunId,
     fact: FlowStartedFact,
@@ -575,6 +587,7 @@ export interface Store {
       readonly key: string;
       readonly mode: ConcurrencyMode;
     },
+    seed?: StartSeed,
   ): Promise<{
     readonly started: boolean;
     readonly canceled: ReadonlyArray<{

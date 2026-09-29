@@ -103,9 +103,15 @@ const desc = await wf.describe(runId); // run + steps + lease state
 const q = await wf.inspectQueue(runId); // in-queue messages for the run
 ```
 
+A start's first steps are enqueued in the same transaction as the run row and
+`flow.started` fact (`Store.tryStartRun`'s `seed`), so a fresh run already has
+its root steps queued the instant `describe()` can see it — there is no window
+where the run row exists but nothing is queued.
+
 | describe() says                   | inspectQueue() says            | Diagnosis                                                        |
 | --------------------------------- | ------------------------------ | ---------------------------------------------------------------- |
-| running, 0 started steps          | entry with `readCount: 0`      | Never scheduled — workers starved or not consuming               |
+| running, 0 started steps          | entry with `readCount: 0`      | Not yet consumed — workers starved or not polling                |
+| running, 0 started steps          | no entries at all              | Never scheduled — either every root step is `when`-false (it still seeds after commit, via the store-driven advance; self-heals) or the seed write itself failed (custom Store not honouring the `seed` contract, or a corrupted commit) |
 | running, step has live `lease`    | entry with future `visibleAt`  | Actively executing (slow handler — watch for watchdog warns)     |
 | running, signal step `running`    | no entries                     | Parked on a signal/child — check the signal source, not the pool |
 | running, no lease, no entries     | —                              | Advance was lost — self-heals on next redelivery; `replay(runId, { mode: "continue", from: stepId })` re-drives immediately |
