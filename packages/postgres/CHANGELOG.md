@@ -1,5 +1,168 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.25
+
+### Patch Changes
+
+- a564da3: `sweepLeases` now judges lease expiry on the database clock instead of the
+  reaping worker's app clock, matching `claimStep`/`extendLease`. A worker
+  clock running ahead of the database could previously reap a still-live
+  lease before its first heartbeat and double-run the step.
+
+  `pgmq` `dequeue` now archives a malformed message envelope instead of
+  throwing. Previously one bad envelope in a batch left the good messages in
+  that batch hidden for the visibility timeout, and kept failing every
+  subsequent batch that read it back — forever.
+
+- 9c73f9e: `@nagi-js/core` is now a peer dependency of every adapter, pinned to the exact core version it was released with, instead of a private dependency.
+
+  Install core alongside the adapter (`pnpm add @nagi-js/core @nagi-js/postgres`). Most apps already do, since they import `nagi` from it.
+
+  Before this, upgrading `@nagi-js/core` alone installed a second copy of core inside the adapter. Errors thrown by the store were then not `instanceof` the engine's classes, and the store applied the older core's fact rules. A mismatched pair now fails at install time (npm `ERESOLVE`, pnpm unmet-peer warning). Upgrade core and adapters together.
+
+- a564da3: Fix: facts now fold in insert order across processes, and id generation no longer goes backwards when the clock does.
+
+  `loadRunState` read facts by `fact_id`, a uuidv7 minted by the writing process's clock, so a worker with a lagging clock could write a causally later fact that sorted earlier. Facts now carry a `seq` from a database sequence and are read `ORDER BY seq ASC NULLS FIRST, fact_id ASC`; pre-existing rows (NULL `seq`) keep `fact_id` order and precede every new fact. Run `migrate()` to apply the new migration `0011_fact_seq`. `uuidv7()` also holds its last timestamp when the clock steps back instead of re-seeding at a smaller one.
+
+- eded7cd: A `b.signal` step now releases its store lease when it parks. Previously the
+  lease expired while the step waited, and the lease reaper re-dispatched the
+  step every lease period (60 s by default) for the whole wait. Each re-dispatch
+  wrote a `lease.reaped` and a `step.started` fact and fired `onStepStart`.
+  `decideSignal` returns a new `park` decision; custom stores must apply its
+  `release`.
+- a564da3: `postgresStore()` now returns a `close()` that stops both LISTEN channels
+  (idempotent, tolerant of a LISTEN that never succeeded).
+
+  `StreamListener.listen` gains an optional third parameter, `onReconnect`: a
+  listener that re-`LISTEN`s after losing its connection should call it once
+  re-`LISTEN` succeeds. The store then re-checks every stream still open
+  against durable state and ends the ones whose step has settled — healing an
+  iterator that would otherwise hang forever because its close frame fell in
+  the reconnect gap.
+
+  `@nagi-js/core`'s `InMemoryStreamHub` gains `openStreams()`, listing open
+  channels by `(runId, stepId)`. `closeRun` now matches channels by their
+  stored run id instead of a `` `${runId}::` `` key prefix, fixing a latent bug
+  where `closeRun("a")` also closed channels belonging to a run literally named
+  `"a::b"`.
+
+- a564da3: Postgres schema and read-hygiene fixes. Run `migrate()`.
+
+  - Migration `0010_canceled_by_fk_deferrable` makes `workflow_run_canceled_by_fk` `DEFERRABLE INITIALLY DEFERRED`. Code older than `c50101f` writes a victim's `canceled_by_run_id` before it inserts the superseder, in the same transaction; the immediate FK added by `0008` rejected that write during a rolling upgrade. Deferred, the check runs at commit, when the superseder row exists. `ON DELETE SET NULL` stays immediate — PostgreSQL never defers referential actions — so a dangling reference is still refused and still nulled on delete.
+  - `describe()` now runs its three SELECTs in a `REPEATABLE READ`, `READ ONLY` transaction instead of a default-isolation one, so the run, step and child rows come from one snapshot instead of three.
+  - Schema names are capped at 56 characters (63-byte PostgreSQL identifier limit minus the 7-byte `_stream`/`_events` channel suffixes). Past the cap, `pg_notify` rejected every NOTIFY-issuing write with "channel name too long" while `LISTEN` silently truncated.
+
+- 8207d4c: Fix: run events and the stream `error` event no longer carry payloads.
+
+  With `postgresStore({ listener })` configured (required for `b.streamingTask`
+  and `wf.watchRun` / `wf.watchRuns`), every fact write called `pg_notify`
+  **inside the fact's transaction** with a JSON payload embedding the step's or
+  flow's full `output`, or the full `error` (stack and cause). PostgreSQL
+  rejects a NOTIFY payload of 8000 bytes or more ("payload string too long"),
+  which aborted the transaction. A step returning more than ~8 KB — ordinary
+  for LLM text — could therefore never be recorded as completed; it retried
+  until it failed. A flow output over ~8 KB could never commit
+  `flow.completed`, and a terminal `step.failed` with a large serialized error
+  had the same problem via the stream `err` frame. This happened even when
+  nobody was watching: the NOTIFY fires whenever a listener is configured.
+
+  **Breaking change**: `RunEvent`'s `flow.completed`, `flow.failed`,
+  `step.completed` and `step.failed` members no longer carry `output` /
+  `error`; the stream `StreamEvent` `error` member is now `{ kind: "error" }`
+  with no `error` field. Run events and the stream error event are now
+  reference-only on every store — identity and status (run, step, attempt,
+  type), never payloads.
+
+  **Migration**: a consumer that needs an output or error calls
+  `wf.describe(runId)`, which still returns the full payload via
+  `RunView.output` / `RunView.error` / `StepView.output` / `StepView.error`.
+
+- a564da3: Remove `postgresStore({ notifyChannel })`. It was the write side of `postgresTrigger`, which was removed in #55, and nothing in nagi listened to it. To react to run changes from another process, pass `listener` and use `wf.watchRun` / `wf.watchRuns`. Setting `notifyChannel` is now a type error; at runtime it is ignored.
+- a564da3: After a `listener` reconnect, the Postgres store ends each stream whose close frame was lost the way the frame would have: with a final `{ kind: "error" }` event when the step failed, not a plain end. Late subscribers are unchanged and still get an empty stream.
+
+  For adapter authors: `isStreamOver(state, stepId)` is replaced by `streamEndOf(state, stepId)`, which returns `"open" | "ok" | "error"`. `isStreamOver(...)` is `streamEndOf(...) !== "open"`.
+
+- a564da3: `wf.watchRun` / `wf.watchRuns` now emit `step.canceled` (an aborted or
+  run-canceled step) and `step.reset` (a step reset by `replay({ from })`; on
+  a finished run, the reopen). Exhaustive `switch`
+  statements over `RunEvent` need the two new cases.
+- a564da3: Fix a pool deadlock: a task/streaming step body runs inside `store.runStep`'s
+  transaction, which holds one pool connection. After the body returns, core's
+  `settle` used to call `store.loadRunState(runId)` on the **pool**, so each
+  in-flight step needed a **second** connection while holding the first. With
+  worker concurrency ≥ pool max (or several workers sharing one pool), every
+  connection could end up held by a step's transaction whose `settle` was
+  waiting on another connection that would never free — a permanent deadlock,
+  since `pg.Pool`'s default `connectionTimeoutMillis` is 0 (wait forever).
+
+  `settle` now reads run state on the step's own transaction instead, which
+  sees the same committed facts (READ COMMITTED) without needing a second
+  connection.
+
+  `Store.loadRunState` gains an optional second parameter:
+  `loadRunState(runId: RunId, tx?: Tx): Promise<RunState>`. Custom stores
+  should honour `tx` when supplied — read on that transaction rather than the
+  pool — to get the same fix.
+
+- a564da3: A start's first steps are now enqueued inside the start's own transaction,
+  alongside the run row and `flow.started` fact, instead of after it commits.
+  Previously a crash, deploy or queue error between that commit and the
+  post-commit enqueue left a `running` run with nothing queued, no lease and no
+  timer — never picked up by any worker.
+
+  `Store.tryStartRun` takes an optional `seed` (`{ queue, flowId, steps }`) as
+  its last parameter; a custom `Store` implementation should enqueue `seed`'s
+  steps in the same transaction as the start, only when `started` is true.
+
+  Because the seed is visible to workers as soon as the start commits, a worker
+  can dequeue and start a root step before the starting process fires
+  `onFlowStart`. A custom `onStepStart` hook can therefore fire before the
+  run's `onFlowStart`; hooks that correlate the two must not assume the flow
+  event comes first.
+
+  A subflow re-attach (a redelivered `sub` step meeting an already-started
+  child) now re-seeds the child via `dispatcher.advance`, so a child whose first
+  message was lost before this fix is recovered instead of staying stranded.
+
+- a564da3: A streaming step's channel now reopens for its rerun. Previously, once a
+  streaming step's channel closed (`step.completed`/`step.failed`), the hub
+  remembered the key as closed forever: a later reset by `replay({ from })`
+  (either scope) dropped the rerun's chunks and
+  handed a new `subscribeStream` an already-closed empty stream, even though
+  the step ran and completed again.
+
+  `step.reset` now declares a `reopen` stream effect, carried over Postgres
+  NOTIFY like the other stream effects, that clears the closed-key marker (and
+  any stale replay buffer) so the rerun streams normally to whoever is
+  currently subscribed.
+
+  Also: a lease reap (`lease.reaped`, written when the reaper re-enqueues a
+  step whose worker died mid-stream) now declares the same `retry` stream
+  effect a normal `step.retried` does, so subscribers see a `retry` marker
+  between the superseded attempt's partial chunks and the next attempt's
+  output, instead of the two attempts running together with no marker.
+
+- Updated dependencies [f4fda8d]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [3740cc6]
+- Updated dependencies [a564da3]
+- Updated dependencies [158e8ac]
+- Updated dependencies [eded7cd]
+- Updated dependencies [a564da3]
+- Updated dependencies [8207d4c]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [623c89e]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+- Updated dependencies [a564da3]
+  - @nagi-js/core@0.1.1-rc.24
+
 ## 0.1.1-rc.24
 
 ### Patch Changes

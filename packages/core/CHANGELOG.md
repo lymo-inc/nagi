@@ -1,5 +1,185 @@
 # @nagi-js/core
 
+## 0.1.1-rc.24
+
+### Patch Changes
+
+- f4fda8d: A step whose `optional()` upstream is skipped now runs as soon as the skip is
+  recorded. Previously, when the same scheduling pass also dispatched other
+  steps, it waited for an unrelated step to settle, and on `wf.startStaged` it
+  could wait until then as well.
+- a564da3: A canceled step now closes its stream. Before, a step aborted by `replay({ from })` whose abort wait timed out stayed `canceled` on a live run, and a live `wf.subscribe` iterator on it stayed open until the step was replayed or the run ended. It now ends as soon as the step is canceled, as it does on completion. A later `replay({ from })` streams the rerun to new subscribers.
+- a564da3: A canceled step (a `replay({ from })` abort, run cancel, or concurrency
+  supersession) now fires the global `onStepError` hook with an
+  `AbortError`/cancellation error, so every consumer sees each step end exactly
+  once. A body that returns normally after its run was canceled no longer fires
+  `onStepComplete` — it is recorded as `step.canceled` and fires `onStepError`
+  instead. The step-level `onError` handler is unaffected; it still only runs
+  for real failures, not cancellations.
+- a564da3: A canceled step on a live run no longer counts as success: `flowTermination`
+  treats it as not-yet-done, so the run stays `running` and waits for
+  `replay({ from })` instead of completing with the step unresolved. A
+  redelivered message for a canceled step is no longer re-run by `admit` — it
+  is acked and skipped. When nothing else is in flight and a canceled step
+  blocks the run, `advance` now logs a `warn` (`run stalled on canceled
+step(s)`) naming the stalled steps.
+- 3740cc6: Hardens handler-step (`b.task`, `b.activity`, `b.streamingTask`) deadline
+  enforcement:
+
+  - A body that honors the abort by returning a value (instead of rethrowing)
+    now still fails the step as `NagiStepTimeoutError`, retryable under
+    `retry`. Previously the step was recorded as completed, and for a task its
+    `ctx.tx` writes committed too.
+  - A commit error (`store.runStep`) that happens after the handler already
+    returned is no longer relabelled as `NagiStepTimeoutError`; only what the
+    handler itself throws is unwrapped, so `retryOn` predicates and operators
+    see the real error.
+  - `timeoutMs` outside the range Node's `setTimeout` can represent (below 1,
+    non-integer, `NaN`, or above 2,147,483,647ms) now throws
+    `NagiValidationError` at `flow()` build time instead of firing the
+    deadline on every attempt at runtime. `b.signal`'s `timeoutMs` similarly
+    rejects non-finite/negative values (no upper cap — signal deadlines are
+    timer rows, not `setTimeout`).
+
+- a564da3: A message whose dispatch throws an unexpected error is now redelivered with backoff instead of at once. The delay starts at one `pollIntervalMs` and doubles per delivery up to 30 s, the same curve as a failing dequeue. Before, a dispatch that threw on every delivery redelivered in a tight loop: 100% CPU in memory, and a `set_vt(0)` loop on the database with pgmq. The `worker.dispatch threw uncaught` log entry now carries `runId`, `stepId`, `readCount` and `delayMs`.
+- 158e8ac: Fix drift synthesis (`driftPolicy: "synthesize"` / `replay({ allowDrift })`) rebuilding a step's `needs` in the wrong shape — bare step objects keyed by upstream id, instead of `{ step, optional }` records keyed by the handler's local alias. Every consumer read `ref.step.id`, which was `undefined` on the bare shape, so the first `advance` of any drifted run whose flow had at least one edge threw a raw `TypeError` outside `NagiRuntimeError`, skipping the snapshot-gone fallback and nack-looping forever. `needs` is now rebuilt from the live handler's `needs` map, validated against the pinned snapshot's edges and step kind; a live flow whose edges or step kinds changed for a pinned step now falls back to snapshot-gone handling instead of crash-looping.
+- eded7cd: A `b.signal` step now releases its store lease when it parks. Previously the
+  lease expired while the step waited, and the lease reaper re-dispatched the
+  step every lease period (60 s by default) for the whole wait. Each re-dispatch
+  wrote a `lease.reaped` and a `step.started` fact and fired `onStepStart`.
+  `decideSignal` returns a new `park` decision; custom stores must apply its
+  `release`.
+- a564da3: `postgresStore()` now returns a `close()` that stops both LISTEN channels
+  (idempotent, tolerant of a LISTEN that never succeeded).
+
+  `StreamListener.listen` gains an optional third parameter, `onReconnect`: a
+  listener that re-`LISTEN`s after losing its connection should call it once
+  re-`LISTEN` succeeds. The store then re-checks every stream still open
+  against durable state and ends the ones whose step has settled — healing an
+  iterator that would otherwise hang forever because its close frame fell in
+  the reconnect gap.
+
+  `@nagi-js/core`'s `InMemoryStreamHub` gains `openStreams()`, listing open
+  channels by `(runId, stepId)`. `closeRun` now matches channels by their
+  stored run id instead of a `` `${runId}::` `` key prefix, fixing a latent bug
+  where `closeRun("a")` also closed channels belonging to a run literally named
+  `"a::b"`.
+
+- 8207d4c: Fix: run events and the stream `error` event no longer carry payloads.
+
+  With `postgresStore({ listener })` configured (required for `b.streamingTask`
+  and `wf.watchRun` / `wf.watchRuns`), every fact write called `pg_notify`
+  **inside the fact's transaction** with a JSON payload embedding the step's or
+  flow's full `output`, or the full `error` (stack and cause). PostgreSQL
+  rejects a NOTIFY payload of 8000 bytes or more ("payload string too long"),
+  which aborted the transaction. A step returning more than ~8 KB — ordinary
+  for LLM text — could therefore never be recorded as completed; it retried
+  until it failed. A flow output over ~8 KB could never commit
+  `flow.completed`, and a terminal `step.failed` with a large serialized error
+  had the same problem via the stream `err` frame. This happened even when
+  nobody was watching: the NOTIFY fires whenever a listener is configured.
+
+  **Breaking change**: `RunEvent`'s `flow.completed`, `flow.failed`,
+  `step.completed` and `step.failed` members no longer carry `output` /
+  `error`; the stream `StreamEvent` `error` member is now `{ kind: "error" }`
+  with no `error` field. Run events and the stream error event are now
+  reference-only on every store — identity and status (run, step, attempt,
+  type), never payloads.
+
+  **Migration**: a consumer that needs an output or error calls
+  `wf.describe(runId)`, which still returns the full payload via
+  `RunView.output` / `RunView.error` / `StepView.output` / `StepView.error`.
+
+- a564da3: After a `listener` reconnect, the Postgres store ends each stream whose close frame was lost the way the frame would have: with a final `{ kind: "error" }` event when the step failed, not a plain end. Late subscribers are unchanged and still get an empty stream.
+
+  For adapter authors: `isStreamOver(state, stepId)` is replaced by `streamEndOf(state, stepId)`, which returns `"open" | "ok" | "error"`. `isStreamOver(...)` is `streamEndOf(...) !== "open"`.
+
+- a564da3: Fix `replay({ from })` on a live run: it previously only aborted `from`
+  itself if it was running, leaving other running descendants in the reset set
+  free to keep executing and settle with stale inputs once they returned, and
+  leaving a parked subflow step's old child free to keep running and — via its
+  terminal fact — settle the _new_ generation's parent step with its stale
+  output.
+
+  `replay({ from })` now aborts every member of the reset set that is `running`
+  (under one shared 30s deadline for the whole batch, not one per step) and
+  cancels the child of every reset step that was `awaitingChild`, after writing
+  the resets and before re-dispatching. `propagateToParent` also now checks
+  that the waking child is the parent step's _current_ generation before
+  settling it, guarding against any stale child wake, not only ones `replay`
+  leaves behind.
+
+- a564da3: A retried attempt now releases its lease, so a retry backoff longer than the
+  lease period is honoured and no spurious `lease.reaped` is written.
+
+  A message for an attempt the step has moved past is now dropped at admission
+  instead of re-running the handler next to the current attempt.
+
+- a564da3: `wf.watchRun` / `wf.watchRuns` now emit `step.canceled` (an aborted or
+  run-canceled step) and `step.reset` (a step reset by `replay({ from })`; on
+  a finished run, the reopen). Exhaustive `switch`
+  statements over `RunEvent` need the two new cases.
+- a564da3: **Breaking:** `worker.runUntilEmpty({ deadline })` is now `worker.runUntilEmpty({ timeoutMs })`. `timeoutMs` is a duration, measured on the injected clock from the call. `deadline` was an absolute epoch-ms timestamp, but nothing said so: `{ deadline: 10_000 }` meant 1970 and returned `{ processed: 0 }` at once. Replace `{ deadline: Date.now() + n }` with `{ timeoutMs: n }`. Passing `deadline` is now a type error; untyped callers that still pass it get an unbounded drain.
+- 623c89e: `wf.replay(runId, { mode: "continue", from, scope: "step" })` now reruns any descendant that holds no value — `failed`, `canceled`, or `skipped` — alongside the named step, instead of leaving every descendant untouched. A `completed` descendant still keeps its output from the previous value. On a live run, the descendants to reset are chosen after a `running` `from` step has settled its abort.
+
+  Previously, replaying a failed step with `scope: "step"` could let the run settle "completed" while its transitively-skipped descendants never ran, silently omitting them from the flow output.
+
+- a564da3: Fix a pool deadlock: a task/streaming step body runs inside `store.runStep`'s
+  transaction, which holds one pool connection. After the body returns, core's
+  `settle` used to call `store.loadRunState(runId)` on the **pool**, so each
+  in-flight step needed a **second** connection while holding the first. With
+  worker concurrency ≥ pool max (or several workers sharing one pool), every
+  connection could end up held by a step's transaction whose `settle` was
+  waiting on another connection that would never free — a permanent deadlock,
+  since `pg.Pool`'s default `connectionTimeoutMillis` is 0 (wait forever).
+
+  `settle` now reads run state on the step's own transaction instead, which
+  sees the same committed facts (READ COMMITTED) without needing a second
+  connection.
+
+  `Store.loadRunState` gains an optional second parameter:
+  `loadRunState(runId: RunId, tx?: Tx): Promise<RunState>`. Custom stores
+  should honour `tx` when supplied — read on that transaction rather than the
+  pool — to get the same fix.
+
+- a564da3: A start's first steps are now enqueued inside the start's own transaction,
+  alongside the run row and `flow.started` fact, instead of after it commits.
+  Previously a crash, deploy or queue error between that commit and the
+  post-commit enqueue left a `running` run with nothing queued, no lease and no
+  timer — never picked up by any worker.
+
+  `Store.tryStartRun` takes an optional `seed` (`{ queue, flowId, steps }`) as
+  its last parameter; a custom `Store` implementation should enqueue `seed`'s
+  steps in the same transaction as the start, only when `started` is true.
+
+  Because the seed is visible to workers as soon as the start commits, a worker
+  can dequeue and start a root step before the starting process fires
+  `onFlowStart`. A custom `onStepStart` hook can therefore fire before the
+  run's `onFlowStart`; hooks that correlate the two must not assume the flow
+  event comes first.
+
+  A subflow re-attach (a redelivered `sub` step meeting an already-started
+  child) now re-seeds the child via `dispatcher.advance`, so a child whose first
+  message was lost before this fix is recovered instead of staying stranded.
+
+- a564da3: A streaming step's channel now reopens for its rerun. Previously, once a
+  streaming step's channel closed (`step.completed`/`step.failed`), the hub
+  remembered the key as closed forever: a later reset by `replay({ from })`
+  (either scope) dropped the rerun's chunks and
+  handed a new `subscribeStream` an already-closed empty stream, even though
+  the step ran and completed again.
+
+  `step.reset` now declares a `reopen` stream effect, carried over Postgres
+  NOTIFY like the other stream effects, that clears the closed-key marker (and
+  any stale replay buffer) so the rerun streams normally to whoever is
+  currently subscribed.
+
+  Also: a lease reap (`lease.reaped`, written when the reaper re-enqueues a
+  step whose worker died mid-stream) now declares the same `retry` stream
+  effect a normal `step.retried` does, so subscribers see a `retry` marker
+  between the superseded attempt's partial chunks and the next attempt's
+  output, instead of the two attempts running together with no marker.
+
 ## 0.1.1-rc.23
 
 ### Patch Changes
