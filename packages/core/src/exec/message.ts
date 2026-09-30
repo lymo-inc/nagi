@@ -221,10 +221,17 @@ export function makeMessage(
       preStep.tag === "failed" ||
       preStep.tag === "skipped"
     ) {
-      // Settled step on a live run: re-drive. On a settled run there is nothing
-      // to drive — but do NOT skip non-terminal steps of a completed/failed run:
-      // replay({ from }) resets steps on such runs and re-dispatches them.
-      return isTerminalRun(preState) ? { tag: "skip" } : { tag: "recover" };
+      // Settled step on a live run, REDELIVERED: its advance may have been
+      // lost, so re-drive. A first delivery is a duplicate — advance() enqueues
+      // every pending runnable step, including ones already queued — and the
+      // settle that beat it already advanced; re-driving from it would enqueue
+      // the still-queued steps again, and each of those copies would do the
+      // same. On a settled run there is nothing to drive — but do NOT skip
+      // non-terminal steps of a completed/failed run: replay({ from }) resets
+      // steps on such runs and re-dispatches them.
+      return isTerminalRun(preState) || message.readCount <= 1
+        ? { tag: "skip" }
+        : { tag: "recover" };
     }
 
     // Aborted on a live run: only replay({ from }) re-drives it.
