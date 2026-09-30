@@ -1,5 +1,12 @@
 # @nagi-js/postgres
 
+## 0.1.1-rc.26
+
+### Patch Changes
+
+- Updated dependencies [10d80fe]
+  - @nagi-js/core@0.1.1-rc.25
+
 ## 0.1.1-rc.25
 
 ### Patch Changes
