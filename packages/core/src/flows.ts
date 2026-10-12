@@ -308,14 +308,20 @@ function synthesizeReplayFlow(dag: CanonicalDag, liveFlow: Flow): Flow {
       needs[alias] = { step: upstreamShell, optional: ref.optional };
     }
 
-    const liveNeedIds = new Set(
-      Object.values(liveDef.needs).map((ref) => ref.step.id),
-    );
+    // A dropped need is safe: the live handler no longer reads it. An added
+    // optional need is safe too: the handler already tolerates its absence,
+    // and a step dispatched before the new upstream finished just runs without
+    // it (resolveNeeds hands it `{ tag: "value", value: null }`). Only an added
+    // required need breaks the in-flight run — the handler would unwrap a value
+    // the pinned run never ordered before it.
     const canonNeedIds = new Set(canonStep.needs);
-    const sameNeeds =
-      liveNeedIds.size === canonNeedIds.size &&
-      [...liveNeedIds].every((id) => canonNeedIds.has(id));
-    if (!sameNeeds) {
+    const addsRequiredNeed = Object.values(liveDef.needs).some(
+      (ref) => !ref.optional && !canonNeedIds.has(ref.step.id),
+    );
+    if (addsRequiredNeed) {
+      const liveNeedIds = new Set(
+        Object.values(liveDef.needs).map((ref) => ref.step.id),
+      );
       throw new NagiRuntimeError(
         `Drift-allowed replay: step "${canonStep.id}" needs [${[...canonNeedIds].sort().join(", ")}] ` +
           `in the snapshot but [${[...liveNeedIds].sort().join(", ")}] live.`,
