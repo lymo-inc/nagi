@@ -28,6 +28,7 @@
     "diff-covers-all-hashed-fields",
     "dispatch-throw-backoff",
     "drift-policy-synthesize",
+    "drift-synthesis-additive-needs",
     "drift-synthesis-needs",
     "drive-quiet-runs",
     "durable-advance",
@@ -121,6 +122,7 @@
     "worker-as-test-surface",
     "worker-dequeue-backoff",
     "worker-owns-lease-reaping",
-    "worker-visibility-heartbeat"
+    "worker-visibility-heartbeat",
+    "worker-wake-and-hold"
   ]
 }
