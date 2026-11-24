@@ -67,6 +67,11 @@ describe("the worker loop survives the database failing at any await", () => {
         maxConcurrencyPerFlow: 2,
         timerSweepIntervalMs: 5,
         reaperIntervalMs: 5,
+        // A retry whose enqueue failed after step.retried was written leaves
+        // the step in backoff with no message; the quiet-run sweep re-queues
+        // it. Prod's default is 2 min, so give it room inside this window.
+        quietRunSweepIntervalMs: 50,
+        quietRunMs: 300,
         signal: ac.signal,
       })
       .run()
