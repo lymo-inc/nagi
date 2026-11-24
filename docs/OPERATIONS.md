@@ -151,8 +151,10 @@ new code does with a live run pinned to an old hash is `nagi({ driftPolicy })`:
   outputs and the interrupted step re-runs. Choose this when nothing keeps old
   code running after a deploy (one task, rolling replace) — under `"freeze"`
   such a deploy strands every in-flight run. Falls through to the
-  snapshot-gone handling below only when the snapshot is missing or a pinned
-  step no longer exists live (grep `drift synthesis failed`).
+  snapshot-gone handling below only when the snapshot is missing, a pinned
+  step no longer exists live, changed kind, or gained a **required** need
+  (grep `drift synthesis failed`). Dropped needs and added `optional(...)`
+  needs on pinned steps synthesize fine.
 - `"freeze"` (default) — the run is **snapshot-gone**: the worker nacks its
   messages with backoff so a still-running old-code worker can claim them,
   then **terminally fails the run** with `NagiFlowSnapshotGoneError` in

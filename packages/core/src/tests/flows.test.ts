@@ -117,6 +117,43 @@ function edgeMovedV2() {
   });
 }
 
+// V1 b needs a; V2 b also needs c, optionally — an edge added as optional.
+function edgeAddedOptionalV2() {
+  return flow({
+    id: "e",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({}) });
+      const c = b.task({ when: () => false, run: async () => ({}) });
+      return {
+        a,
+        c,
+        b: b.task({
+          needs: { up: a, maybe: optional(c) },
+          run: async () => ({}),
+        }),
+      };
+    },
+  });
+}
+
+// V1 b needs a and c; V2 b needs only a — an edge dropped.
+function edgeDroppedV1() {
+  return flow({
+    id: "e",
+    input: passthroughSchema<Record<string, never>>(),
+    build: (b) => {
+      const a = b.task({ run: async () => ({}) });
+      const c = b.task({ when: () => false, run: async () => ({}) });
+      return {
+        a,
+        c,
+        b: b.task({ needs: { up: a, also: c }, run: async () => ({}) }),
+      };
+    },
+  });
+}
+
 // V1 s is a task; V2 s is a signal — the step's kind changed.
 function kindChangedV1() {
   return flow({
@@ -389,7 +426,32 @@ describe("registry.synthesize — drift-allowed replay flow", () => {
     expect(needs["maybe"]!.optional).toBe(true);
   });
 
-  it("throws NagiRuntimeError when live needs disagree with the snapshot", async () => {
+  it("accepts a need added as optional to an upstream the snapshot declares", async () => {
+    const store = new InMemoryStore();
+    const { registry: old } = await register([edgeMovedV1()], store);
+    const pinned = old.hashOf("e");
+    const { registry } = await register([edgeAddedOptionalV2()], store);
+    const g = gone(registry.resolve(foldRun(RUN, [started("e", pinned)])));
+
+    const synth = await registry.synthesize(g);
+    const needs = getDef(asStepMapWithDefs(synth.steps)["b"]!).needs;
+    expect(needs["maybe"]!.step.id).toBe("c");
+    expect(needs["maybe"]!.optional).toBe(true);
+  });
+
+  it("accepts a need the live flow dropped", async () => {
+    const store = new InMemoryStore();
+    const { registry: old } = await register([edgeDroppedV1()], store);
+    const pinned = old.hashOf("e");
+    const { registry } = await register([edgeMovedV1()], store);
+    const g = gone(registry.resolve(foldRun(RUN, [started("e", pinned)])));
+
+    const synth = await registry.synthesize(g);
+    const needs = getDef(asStepMapWithDefs(synth.steps)["b"]!).needs;
+    expect(Object.keys(needs)).toEqual(["up"]);
+  });
+
+  it("throws NagiRuntimeError when the live flow adds a required need", async () => {
     const store = new InMemoryStore();
     const { registry: old } = await register([edgeMovedV1()], store);
     const pinned = old.hashOf("e");
