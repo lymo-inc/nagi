@@ -440,7 +440,9 @@ export interface WorkerConfig {
   // Cap on worker slots any single flow may occupy at once. Bounds blast
   // radius: without it, one wedged flow's steps can hold every slot and
   // starve all other flows (an observed multi-day outage shape). Over-cap
-  // messages are deferred with a delayed nack, not dropped. Unset = no cap
+  // messages are held in memory (at most `concurrency` of them) and run as
+  // soon as a slot of their flow frees; past that they are deferred with a
+  // delayed nack. Never dropped. Unset = no cap
   // (correct for single-flow deployments, where a cap only wastes slots);
   // multi-flow deployments should set it to at most concurrency - 1 so one
   // flow can never occupy the whole pool.

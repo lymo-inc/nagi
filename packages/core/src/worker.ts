@@ -102,8 +102,8 @@ class WorkerImpl implements Worker {
   }
 
   // Per-flow blast-radius bound (maxConcurrencyPerFlow). A message over its
-  // flow's cap is DEFERRED — delayed nack, redelivered after ~pollIntervalMs —
-  // not dropped. Messages without flowId (enqueued pre-upgrade) are exempt.
+  // flow's cap is HELD (run(), up to `concurrency`) or DEFERRED — delayed
+  // nack, redelivered after ~pollIntervalMs — never dropped. Messages without flowId (enqueued pre-upgrade) are exempt.
   // Deferral does raise pgmq read_ct, which the snapshot-gone policy reads;
   // that only matters if the same flow later goes snapshot-gone, where an
   // earlier fail is acceptable.
