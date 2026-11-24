@@ -814,6 +814,33 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "listQuietRuns: lists a live run with no lease, timer or recent fact, and only that run",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const quiet = rid();
+      const leased = rid();
+      const timed = rid();
+      for (const r of [quiet, leased, timed]) await startRun(s, r);
+      await startStep(s, leased, "a");
+      ok((await s.claimStep(leased, "a", A1)) !== null, "claim");
+      await startStep(s, timed, "gate", { kind: "signal" });
+      await s.upsertTimer(timed, "gate", new Date(Date.now() + HOUR_MS));
+
+      const later = new Date(Date.now() + HOUR_MS);
+      const listed = await s.listQuietRuns({ quietSince: later, limit: 1000 });
+      ok(listed.includes(quiet), "the quiet run is listed");
+      ok(!listed.includes(leased), "a leased run is not quiet");
+      ok(!listed.includes(timed), "a run with a timer is not quiet");
+      const earlier = new Date(Date.now() - HOUR_MS);
+      ok(
+        !(await s.listQuietRuns({ quietSince: earlier, limit: 1000 })).includes(
+          quiet,
+        ),
+        "a run with a fact after quietSince is not quiet",
+      );
+    },
+  },
+  {
     name: "sweepSignalTimeouts: fails an awaiting step past its deadline with NagiSignalTimeoutError, releases its lease, consumes the timer",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });

@@ -429,6 +429,14 @@ export interface WorkerConfig {
   // store lease TTL so a crashed worker's step is re-dispatched within one TTL.
   // 0 disables it (external/cron-driven reaping).
   readonly reaperIntervalMs?: Millis;
+  // Cadence for the in-worker quiet-run sweep: a live run with no lease, no
+  // timer, no queued message and no live child is re-driven, and failed with
+  // NagiRunStrandedError when re-driving cannot move it. Default 60s; 0
+  // disables it.
+  readonly quietRunSweepIntervalMs?: Millis;
+  // How long a run must have written no fact before the sweep treats it as
+  // quiet. Default 120s — above the gap between any settle and its enqueue.
+  readonly quietRunMs?: Millis;
   // Decides retry-vs-fail for a message whose run's flow snapshot is gone
   // (deploy replaced the flow while the run was in flight). Defaults to
   // defaultSnapshotGonePolicy. "retry" keeps the message alive for a
@@ -670,6 +678,15 @@ export interface Store {
     readonly now: Date;
     readonly limit?: number;
   }): Promise<readonly TimedOutSignal[]>;
+
+  // Live (pending/running) runs that nothing will move again on its own: no
+  // lease row, no timer row, no live child run, and no fact written at or
+  // after `quietSince`. Queue presence is the caller's check (Queue.inspect),
+  // since a Store cannot see the broker. Read-only; oldest start first.
+  listQuietRuns(args: {
+    readonly quietSince: Date;
+    readonly limit?: number;
+  }): Promise<readonly RunId[]>;
 
   // MUST be first-write-wins per (runId, stepId, scope); a later value is
   // ignored, never overwritten.
