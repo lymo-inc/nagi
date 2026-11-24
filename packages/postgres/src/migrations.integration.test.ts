@@ -57,4 +57,54 @@ d("@nagi-js/postgres — concurrent migrate()", () => {
       await other.end();
     }
   }, 30_000);
+
+  // Staging 2026-10-13: the deploy's bootstrap died on a 57014 statement
+  // timeout inside pg_advisory_lock('nagi:migrate:nagi'), held by a
+  // connection a cancelled deploy left behind. The wait had no bound and
+  // named no holder.
+  it("gives up waiting for the migrate lock and names who holds it", async () => {
+    const holder = new pg.Client({
+      connectionString: url,
+      application_name: "stale-deploy",
+    });
+    await holder.connect();
+    try {
+      await holder.query("SELECT pg_advisory_lock(hashtext($1))", [
+        `nagi:migrate:${schema}`,
+      ]);
+      const t0 = Date.now();
+      await expect(migrate(db, { schema, lockWaitMs: 300 })).rejects.toThrow(
+        /stale-deploy/,
+      );
+      expect(Date.now() - t0).toBeLessThan(3_000);
+    } finally {
+      await holder.end();
+    }
+  }, 30_000);
+
+  // A DDL that queues behind a long transaction takes every later query on
+  // that table down with it (they queue behind its ACCESS EXCLUSIVE request).
+  // Boot must fail fast instead.
+  it("a migration that cannot get its table lock fails fast instead of queueing", async () => {
+    await migrate(db, { schema });
+    await sql
+      .raw(`DELETE FROM ${schema}.schema_migrations WHERE id = '0011_fact_seq'`)
+      .execute(db);
+    const reader = new pg.Client({ connectionString: url });
+    await reader.connect();
+    try {
+      await reader.query("BEGIN");
+      await reader.query(`LOCK TABLE ${schema}.fact IN ACCESS SHARE MODE`);
+      const t0 = Date.now();
+      await expect(migrate(db, { schema, lockTimeoutMs: 200 })).rejects.toThrow(
+        /lock timeout/,
+      );
+      expect(Date.now() - t0).toBeLessThan(3_000);
+    } finally {
+      await reader.query("ROLLBACK");
+      await reader.end();
+    }
+    // Nothing half-applied: the retry after the reader is gone succeeds.
+    expect((await migrate(db, { schema })).applied).toEqual(["0011_fact_seq"]);
+  }, 30_000);
 });
