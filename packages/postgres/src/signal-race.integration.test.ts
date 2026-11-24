@@ -112,7 +112,11 @@ d("@nagi-js/postgres — settleSignal races sweepSignalTimeouts", () => {
          WHERE run_id = ${runId}
       `.execute(db);
       expect(timers.rows[0]?.n).toBe(0);
-      expect(await store.claimStep(runId, "gate", 1)).not.toBeNull();
+      const leases = await sql<{ n: number }>`
+        SELECT count(*)::int AS n FROM ${sql.raw(`${schema}.lease`)}
+         WHERE run_id = ${runId}
+      `.execute(db);
+      expect(leases.rows[0]?.n).toBe(0);
     }
   }, 60_000);
 });

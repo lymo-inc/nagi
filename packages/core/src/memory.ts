@@ -11,6 +11,7 @@ import {
   nextRunRow,
   nextStepRow,
   type RunRow,
+  SETTLED,
   type StepRow,
 } from "./read-model";
 import { InMemoryRunEventHub } from "./run-events";
@@ -297,6 +298,8 @@ export class InMemoryStore implements Store {
     stepId: StepId,
     attempt: AttemptNumber,
   ): Promise<ClaimToken | null> {
+    const status = this.stepRows.get(runId)?.get(stepId)?.status;
+    if (status !== undefined && SETTLED.has(status)) return null;
     const key = leaseKey(runId, stepId, attempt);
     const now = Date.now();
     const existing = this.leases.get(key);
