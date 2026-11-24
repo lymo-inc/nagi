@@ -50,8 +50,8 @@
   "devDependencies": {
     "@nagi-js/core": "workspace:*",
     "@types/pg": "^8.23.1",
-    "kysely": "^0.29.0",
-    "pg": "^8.23.0"
+    "kysely": "^0.29.9",
+    "pg": "^8.23.1"
   },
   "repository": {
     "type": "git",
