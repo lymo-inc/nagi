@@ -32,8 +32,14 @@ type StepSettlement =
   | { readonly kind: "complete"; readonly output: Json }
   | { readonly kind: "fail"; readonly error: SerializedError };
 
+// requeue: queue every runnable step even when it already has a message —
+// replay({ from }), whose reset strands the old attempt's message.
+export interface AdvanceOpts {
+  readonly requeue?: boolean;
+}
+
 export interface Progression {
-  advance(runId: RunId): Promise<void>;
+  advance(runId: RunId, opts?: AdvanceOpts): Promise<void>;
   terminate(run: EndingRun, end: RunEnd): Promise<void>;
   settleSuperseded(
     run: EndingRun,
@@ -108,7 +114,7 @@ export function endingRunOf(
 export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
   const { fireHook } = hooks;
 
-  async function advance(runId: RunId): Promise<void> {
+  async function advance(runId: RunId, opts?: AdvanceOpts): Promise<void> {
     const { store, queue } = deps;
     const flow = requireCurrent(await deps.flowOf(runId));
 
@@ -146,8 +152,21 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
             await recordSkips(runId, t.skip);
             continue;
           }
-          for (const stepId of t.runnable)
-            await queue.enqueue(runId, stepId, { flowId: flow.id });
+          {
+            // A sibling's settle re-scans steps that an earlier advance
+            // already queued and that still wait for a slot. Any message for a
+            // pending step runs it, so queue only the steps with none. Two
+            // advances racing can still both queue one; claimStep keeps that
+            // copy from running it twice.
+            const queued = new Set(
+              opts?.requeue
+                ? []
+                : (await queue.inspect?.(runId))?.map((m) => m.stepId),
+            );
+            for (const stepId of t.runnable)
+              if (!queued.has(stepId))
+                await queue.enqueue(runId, stepId, { flowId: flow.id });
+          }
           return;
         case "skip":
           await recordSkips(runId, t.skip);

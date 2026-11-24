@@ -114,7 +114,9 @@ export function makeReplay(deps: ReplayDeps): {
       if (opts.from !== undefined) {
         await resetFrom(flow, runState, opts.from, opts.scope, dispatcher);
       }
-      await dispatcher.advance(runId);
+      // The reset step's old attempt still holds its message while it
+      // aborts, and that message will not run the reset step.
+      await dispatcher.advance(runId, { requeue: true });
       if (inline !== undefined) await drainInline(dispatcher, inline);
     } finally {
       await inline?.handOff();

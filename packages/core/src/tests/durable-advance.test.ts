@@ -108,10 +108,10 @@ describe("durable advance after settle", () => {
     const processed = await h.drain();
 
     expect((await h.result(runId)).status).toBe("completed");
-    // 6 steps, plus one duplicate per branch still queued when an earlier one
-    // settles (3 + 2 + 1). A duplicate of a settled step used to re-drive the
-    // run, which enqueued every still-queued step again.
-    expect(processed).toBe(12);
+    // One message per step. advance() used to queue a branch again each time
+    // an earlier sibling settled (12 messages for 6 steps), and a duplicate of
+    // a settled step used to re-drive the run on top of that.
+    expect(processed).toBe(6);
   });
 
   it("redelivery on a terminal run is acked without advancing", async () => {
