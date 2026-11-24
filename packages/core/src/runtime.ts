@@ -540,17 +540,22 @@ export const nagi: typeof nagiImpl & { run: typeof nagiRun } = Object.assign(
 
 async function noop(): Promise<void> {}
 
-// The adapter's methods, bound, so a wrapper can override one without losing
-// `this` on the rest (and without copying absent optional capabilities).
+// The adapter's methods, delegated per call (not bound once), so a wrapper
+// can override one without losing `this` on the rest, a later patch or spy on
+// the adapter still takes effect, and absent optional capabilities stay absent.
 function bindQueue(q: Queue): Queue {
   return {
-    enqueue: q.enqueue.bind(q),
-    dequeue: q.dequeue.bind(q),
-    ack: q.ack.bind(q),
-    nack: q.nack.bind(q),
-    extend: q.extend.bind(q),
-    ...(q.ensureSchema ? { ensureSchema: q.ensureSchema.bind(q) } : {}),
-    ...(q.inspect ? { inspect: q.inspect.bind(q) } : {}),
-    ...(q.withTx ? { withTx: q.withTx.bind(q) } : {}),
+    enqueue: (...a) => q.enqueue(...a),
+    dequeue: (...a) => q.dequeue(...a),
+    ack: (...a) => q.ack(...a),
+    nack: (...a) => q.nack(...a),
+    extend: (...a) => q.extend(...a),
+    ...(q.ensureSchema
+      ? { ensureSchema: () => q.ensureSchema?.() ?? Promise.resolve() }
+      : {}),
+    ...(q.inspect
+      ? { inspect: (runId: RunId) => q.inspect?.(runId) ?? Promise.resolve([]) }
+      : {}),
+    ...(q.withTx ? { withTx: (tx: Tx) => q.withTx?.(tx) ?? q } : {}),
   };
 }
