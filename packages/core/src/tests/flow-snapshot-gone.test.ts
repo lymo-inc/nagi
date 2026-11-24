@@ -372,35 +372,18 @@ describe("snapshot-gone poison handling", () => {
     }
   });
 
-  it("defaultSnapshotGonePolicy: quadratic backoff capped at 5min, fails past 60 deliveries", async () => {
+  it("defaultSnapshotGonePolicy: one retry a minute, fails on the 10th delivery", async () => {
     const { defaultSnapshotGonePolicy } = await import("../retry");
-    expect(defaultSnapshotGonePolicy(1)).toEqual({
-      action: "retry",
-      delayMs: 1_000,
-    });
-    expect(defaultSnapshotGonePolicy(10)).toEqual({
-      action: "retry",
-      delayMs: 100_000,
-    });
-    // Cap: 18² = 324s exceeds the 300s ceiling.
-    expect(defaultSnapshotGonePolicy(18)).toEqual({
-      action: "retry",
-      delayMs: 300_000,
-    });
-    expect(defaultSnapshotGonePolicy(60)).toEqual({
-      action: "retry",
-      delayMs: 300_000,
-    });
-    expect(defaultSnapshotGonePolicy(61)).toEqual({ action: "fail" });
-    // The whole window is ~4.2h — above the 4h signal-timeout house constant,
-    // below 6h stuck-run alerting. Pin it so a tweak is a conscious choice.
-    let totalMs = 0;
-    for (let readCount = 1; readCount <= 60; readCount++) {
-      const d = defaultSnapshotGonePolicy(readCount);
-      if (d.action === "retry") totalMs += d.delayMs;
+    for (let readCount = 1; readCount < 10; readCount++) {
+      expect(defaultSnapshotGonePolicy(readCount)).toEqual({
+        action: "retry",
+        delayMs: 60_000,
+      });
     }
-    expect(totalMs).toBeGreaterThan(4 * 3_600_000);
-    expect(totalMs).toBeLessThan(6 * 3_600_000);
+    // No message is read more than 10 times, and a deploy that orphaned the
+    // run ends it typed within ~9 minutes instead of 4.2 hours.
+    expect(defaultSnapshotGonePolicy(10)).toEqual({ action: "fail" });
+    expect(defaultSnapshotGonePolicy(11)).toEqual({ action: "fail" });
   });
 
   it("a failing policy falls back to a delayed nack instead of crashing or tight-looping", async () => {
