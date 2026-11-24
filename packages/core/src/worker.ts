@@ -4,12 +4,17 @@ import {
   type DispatchResult,
   makeDispatcher,
 } from "./dispatch";
-import { type NagiFlowSnapshotGoneError, serializeError } from "./errors";
+import {
+  NagiDeliveryExhaustedError,
+  type NagiFlowSnapshotGoneError,
+  serializeError,
+} from "./errors";
 import { DEFAULT_REAPER_INTERVAL_MS } from "./lease-reaper";
 import {
   type Backoff,
   defaultSnapshotGonePolicy,
   dequeueBackoff,
+  MAX_DELIVERIES,
 } from "./retry";
 import { isTerminalRun } from "./state";
 import type {
@@ -251,6 +256,10 @@ class WorkerImpl implements Worker {
     try {
       result = await this.dispatcher.dispatchMessage(msg);
     } catch (err) {
+      if (msg.readCount >= MAX_DELIVERIES) {
+        await this.failExhausted(msg, err);
+        return;
+      }
       // Same curve as a failing dequeue: whatever threw (a database outage,
       // or a bug that throws on every delivery) must not redeliver at once.
       const delayMs = this.dequeueBackoffMs(msg.readCount);
@@ -292,6 +301,55 @@ class WorkerImpl implements Worker {
           } catch {}
         }
         return;
+    }
+  }
+
+  // The last delivery threw too: end the run typed instead of looping. If even
+  // that write fails (the database is what is down), the message is nacked
+  // and the next delivery tries again — it is past the budget, so it fails
+  // the run as soon as the store answers.
+  private async failExhausted(
+    msg: QueueMessage,
+    cause: unknown,
+  ): Promise<void> {
+    const flowId = msg.flowId ?? "unknown";
+    const error = new NagiDeliveryExhaustedError({
+      runId: msg.runId,
+      flowId,
+      stepId: msg.stepId,
+      attempt: msg.attempt,
+      readCount: msg.readCount,
+      cause,
+    });
+    this.deps.emitLog({
+      level: "error",
+      msg: "worker.dispatch: delivery budget exhausted, failing run",
+      attrs: {
+        runId: msg.runId,
+        flowId,
+        stepId: msg.stepId,
+        attempt: msg.attempt,
+        readCount: msg.readCount,
+        error: String(cause),
+      },
+    });
+    try {
+      await this.dispatcher.terminate(
+        { kind: "gone", runId: msg.runId, flowId },
+        { tag: "failed", error: serializeError(error) },
+      );
+      await this.deps.queue.ack(msg.receipt);
+    } catch (writeErr) {
+      this.deps.emitLog({
+        level: "error",
+        msg: "worker.dispatch: could not fail an exhausted run; will retry",
+        attrs: { runId: msg.runId, error: String(writeErr) },
+      });
+      try {
+        await this.deps.queue.nack(msg.receipt, {
+          delayMs: this.dequeueBackoffMs(msg.readCount),
+        });
+      } catch {}
     }
   }
 

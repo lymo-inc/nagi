@@ -1,5 +1,5 @@
 import { compact } from "./internal";
-import type { RunId, SerializedError, StandardSchemaV1 } from "./types";
+import type { Json, RunId, SerializedError, StandardSchemaV1 } from "./types";
 
 export class NagiValidationError extends Error {
   readonly issues: ReadonlyArray<StandardSchemaV1.Issue>;
@@ -101,6 +101,41 @@ export class NagiSignalTimeoutError extends Error {
 // classifyFailure as an ordinary error and retry under the step's policy. The
 // name is NOT "AbortError" for the same reason — that name is how an abort is
 // recognized once it has been unwrapped from the signal's reason.
+// A message that could not be dispatched MAX_DELIVERIES times in a row. The
+// run ends with this rather than redelivering forever; `cause` is the error
+// the last delivery threw.
+export class NagiDeliveryExhaustedError extends Error {
+  readonly runId: RunId;
+  readonly stepId: string;
+  readonly attempt: number;
+  readonly readCount: number;
+  constructor({
+    runId,
+    flowId,
+    stepId,
+    attempt,
+    readCount,
+    cause,
+  }: {
+    readonly runId: RunId;
+    readonly flowId: string;
+    readonly stepId: string;
+    readonly attempt: number;
+    readonly readCount: number;
+    readonly cause: unknown;
+  }) {
+    super(
+      `Step "${stepId}" (attempt ${attempt}, run ${runId}, flow "${flowId}") could not be dispatched in ${readCount} deliveries: ${cause instanceof Error ? cause.message : String(cause)}`,
+      { cause },
+    );
+    this.name = "NagiDeliveryExhaustedError";
+    this.runId = runId;
+    this.stepId = stepId;
+    this.attempt = attempt;
+    this.readCount = readCount;
+  }
+}
+
 export class NagiStepTimeoutError extends Error {
   readonly runId: RunId;
   readonly stepId: string;
@@ -226,8 +261,27 @@ export function serializeError(err: unknown): SerializedError {
     return {
       name: err.name,
       message: err.message,
-      ...compact({ stack: err.stack }),
+      ...compact({ stack: err.stack, cause: serializeCause(err.cause, 3) }),
     };
   }
   return { name: "Error", message: String(err) };
+}
+
+// The cause chain is where wrapped SDK errors keep the real reason (an
+// AI_RetryError's last attempt, a pg error under a driver wrapper). Kept
+// without stacks and bounded in depth so a fact never balloons.
+function serializeCause(cause: unknown, depth: number): Json | undefined {
+  if (cause === undefined || cause === null || depth === 0) return undefined;
+  if (cause instanceof Error) {
+    return {
+      name: cause.name,
+      message: cause.message,
+      ...compact({ cause: serializeCause(cause.cause, depth - 1) }),
+    };
+  }
+  try {
+    return JSON.parse(JSON.stringify(cause)) as Json;
+  } catch {
+    return String(cause);
+  }
 }

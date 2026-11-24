@@ -52,20 +52,17 @@ export function dequeueBackoff(pollIntervalMs: Millis): Backoff {
     Math.min(base * 2 ** (consecutiveFailures - 1), MAX_DEQUEUE_BACKOFF_MS);
 }
 
-// Quadratic backoff capped at 5 min, budget 60 deliveries ≈ a 4.2h retry
-// window. Rationale: the window must comfortably exceed the longest plausible
-// old/new worker overlap (a rolling deploy is minutes, but a wedged draining
-// task has been observed hanging on for hours), and 4h matches the house
-// signal-timeout constant while staying under typical stuck-run alerting
-// thresholds (6h) — so a run that is GOING to fail fails before it pages as
-// stuck. Within the window: fast redelivery early (sub-minute, when a frozen
-// worker most likely still exists), quiet later (5 min cadence, ~60 log lines
-// total for a run that never recovers — vs 660k at set_vt(0)).
-const SNAPSHOT_GONE_DELIVERY_BUDGET = 60;
-const MAX_SNAPSHOT_GONE_BACKOFF_MS: Millis = 300_000;
+// Every message is read at most MAX_DELIVERIES times: past that, whatever
+// keeps it from settling is not transient, and the run ends typed instead of
+// looping. Observed without a bound: snapshot-gone at set_vt(0), read_ct
+// 660,576 over 8 days (staging, 2026-07); a throwing drift synthesis, ~80k
+// reads per run (dev, 2026-09-30).
+export const MAX_DELIVERIES = 10;
 
-export const snapshotGoneBackoff: Backoff = (readCount) =>
-  Math.min(readCount * readCount * 1_000, MAX_SNAPSHOT_GONE_BACKOFF_MS);
+// One redelivery a minute: 9 retries span ~9 minutes, which covers a rolling
+// deploy's old/new worker overlap. A run that is not picked up by a
+// frozen-version worker in that window fails typed and can be replayed.
+const SNAPSHOT_GONE_RETRY_DELAY_MS: Millis = 60_000;
 
 // Bounds redelivery of a message whose run is pinned to a flow snapshot no
 // longer in any live registry. "retry" exists ONLY for the rolling-deploy
@@ -76,9 +73,9 @@ export const snapshotGoneBackoff: Backoff = (readCount) =>
 // the run cannot advance on any current code — and unlike the old behavior it
 // leaves a workflow_run.error a human can triage, then admin-restart.
 export const defaultSnapshotGonePolicy: SnapshotGonePolicy = (readCount) =>
-  readCount > SNAPSHOT_GONE_DELIVERY_BUDGET
+  readCount >= MAX_DELIVERIES
     ? { action: "fail" }
-    : { action: "retry", delayMs: snapshotGoneBackoff(readCount) };
+    : { action: "retry", delayMs: SNAPSHOT_GONE_RETRY_DELAY_MS };
 
 // A reaped step re-dispatches immediately: its body already paid wall-clock
 // waiting for the dead worker's lease to expire.
