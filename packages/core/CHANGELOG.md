@@ -1,5 +1,34 @@
 # @nagi-js/core
 
+## 0.1.1-rc.26
+
+### Patch Changes
+
+- 7d26a0f: No message is read more than 10 times (`MAX_DELIVERIES`). A dispatch that throws on its 10th delivery now fails the run with the typed `NagiDeliveryExhaustedError`, which names the flow, step, run, attempt and delivery count and keeps the last error as `cause`. Before, it redelivered forever on a capped backoff. `defaultSnapshotGonePolicy` retries once a minute and fails on the 10th delivery: about 9 minutes, where it used to be 60 deliveries over about 4.2 hours. `snapshotGoneBackoff` is removed. `serializeError` now keeps the error's `cause` chain, 3 levels deep, without stacks.
+- f9fea50: The cancel watcher no longer re-reads the run's whole fact log every 250 ms while a step runs. A store may implement the new optional `Store.probeAbort(runId, stepId, attempt)`. `postgresStore` answers the common case, a live run with no abort request, with one query that returns two scalars, and uses the fold only when an abort request exists. Stores without `probeAbort` keep the old fold. `storeContract` checks that a probe agrees with the fold.
+- d8a6b09: Fix a step running twice when two copies of its message are dispatched at once.
+  `advance()` enqueues every pending runnable step, so a step can sit in the
+  queue twice; admission reads the run before it claims, and settling a step
+  deletes its lease. A copy that read the step as pending, then claimed just
+  after the other copy settled it, got a fresh lease and ran the step again.
+
+  `Store.claimStep` MUST now return `null` once the step has settled (completed,
+  failed, canceled or skipped), judged after any settle racing the claim has
+  committed, and leave no lease behind. `InMemoryStore` checks the step row;
+  `postgresStore` takes the lease, then gives it back if `step_run` shows the
+  step settled — a guard inside the INSERT would read `step_run` from a snapshot
+  taken before a settle the INSERT waited on. `storeContract` checks the new
+  rule, and its lease-release cases for settled steps now read `describe()`
+  instead of re-claiming.
+
+  Third-party Store adapters must apply the same refusal.
+
+- 58df7ac: The worker drives stranded runs to an end by itself. A live run with no lease, no timer, no queued message, no live child and no fact for `quietRunMs` (default 2 min) is re-driven: each in-flight step gets its message back and the run is advanced. If that enqueues nothing, the run fails with the new typed `NagiRunStrandedError`. A run pinned to a snapshot that is gone fails with `NagiFlowSnapshotGoneError` instead of sitting. A signal step with `timeoutMs: "unbounded"` is left waiting.
+
+  New `Store.listQuietRuns({ quietSince, limit })`, covered by `storeContract`; custom stores must implement it. New `WorkerConfig.quietRunSweepIntervalMs` (default 60 s, `0` disables) and `quietRunMs`. The sweep needs `Queue.inspect`; without it the sweep does nothing.
+
+- 1b0c5bd: `InMemoryQueue` now redelivers a read whose visibility timeout lapsed without an ack or nack, as pgmq does. Before, a message whose ack failed or whose consumer died stayed leased forever, so a test running on the in-memory pair could report a stranded run that cannot happen on Postgres + pgmq.
+
 ## 0.1.1-rc.25
 
 ### Patch Changes
