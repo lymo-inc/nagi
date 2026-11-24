@@ -94,13 +94,6 @@ export class NagiSignalTimeoutError extends Error {
   }
 }
 
-// A handler step (task / activity / streaming) blew its declared timeoutMs.
-// Distinct from NagiAbortError on purpose: an abort means someone canceled the
-// run or a replay reset the step, and classifyFailure settles those as
-// `canceled`. A deadline is the step's own failure, so it must reach
-// classifyFailure as an ordinary error and retry under the step's policy. The
-// name is NOT "AbortError" for the same reason — that name is how an abort is
-// recognized once it has been unwrapped from the signal's reason.
 // A live run that nothing could move: no lease, timer, queued message or live
 // child, and re-driving it enqueued nothing. Ending it typed beats leaving it
 // `running` forever. `cause` names what the run was stuck on.
@@ -129,6 +122,13 @@ export class NagiRunStrandedError extends Error {
   }
 }
 
+// A handler step (task / activity / streaming) blew its declared timeoutMs.
+// Distinct from NagiAbortError on purpose: an abort means someone canceled the
+// run or a replay reset the step, and classifyFailure settles those as
+// `canceled`. A deadline is the step's own failure, so it must reach
+// classifyFailure as an ordinary error and retry under the step's policy. The
+// name is NOT "AbortError" for the same reason — that name is how an abort is
+// recognized once it has been unwrapped from the signal's reason.
 export class NagiStepTimeoutError extends Error {
   readonly runId: RunId;
   readonly stepId: string;
