@@ -561,6 +561,17 @@ export interface Store {
   // worker's concurrency.
   loadRunState(runId: RunId, tx?: Tx): Promise<RunState>;
 
+  // Optional cheap probe for the cancel watcher, which asks it every 250 ms
+  // for every running step: "run" when the run is terminal, "step" when this
+  // attempt has an outstanding abort request, else null. MUST agree with
+  // isTerminalRun / isAbortRequested over loadRunState. Absent → the watcher
+  // folds loadRunState instead.
+  probeAbort?(
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+  ): Promise<"run" | "step" | null>;
+
   // Atomically reconcile a signal with its target step under a per-run lock.
   // With `incoming` (a wf.signal call): deliver when the step is awaitingSignal,
   // buffer when it has not started yet, no-op when it already resolved. Without
