@@ -241,6 +241,9 @@ export function makeMessage(
     // of a failed or reaped attempt): running it would duplicate the current one.
     if (isSupersededAttempt(preStep, attempt)) return { tag: "skip" };
 
+    // preState may be stale by now: a copy of this step can settle it, and
+    // delete its lease, before this claim lands. claimStep refuses a settled
+    // step, which is what keeps this copy from running it a second time.
     const claim = await store.claimStep(runId, stepId, attempt);
     if (claim === null) return { tag: "skip" };
 

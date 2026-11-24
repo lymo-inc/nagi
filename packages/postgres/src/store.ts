@@ -573,7 +573,24 @@ class PostgresStore<DB = unknown> implements Store {
     `.execute(this.db);
 
     const row = result.rows[0];
-    return row ? (row.token as ClaimToken) : null;
+    if (!row) return null;
+
+    // Settled is judged in a second statement: an INSERT racing a settle waits
+    // on the lease row the settle deletes, but a guard inside the INSERT would
+    // read step_run from a snapshot taken before that settle committed. This
+    // one starts after it, so it sees the settle and takes the lease back.
+    const settled = await sql`
+      DELETE FROM ${sql.raw(this.t("lease"))} l
+       WHERE l.run_id = ${runId} AND l.step_id = ${stepId}
+         AND l.attempt = ${attempt} AND l.token = ${row.token}
+         AND EXISTS (
+           SELECT 1 FROM ${sql.raw(this.t("step_run"))} s
+            WHERE s.run_id = ${runId} AND s.step_id = ${stepId}
+              AND s.status IN ('completed', 'failed', 'canceled', 'skipped')
+         )
+      RETURNING 1
+    `.execute(this.db);
+    return settled.rows.length > 0 ? null : (row.token as ClaimToken);
   }
 
   async extendLease(

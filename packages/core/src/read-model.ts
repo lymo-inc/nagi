@@ -41,7 +41,7 @@ export interface StepRow {
   readonly error: SerializedError | null;
 }
 
-const SETTLED: ReadonlySet<StepRowStatus> = new Set([
+export const SETTLED: ReadonlySet<StepRowStatus> = new Set([
   "completed",
   "failed",
   "canceled",

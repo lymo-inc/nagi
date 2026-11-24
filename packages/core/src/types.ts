@@ -622,6 +622,12 @@ export interface Store {
     }>;
   }>;
 
+  // MUST return null while the attempt's lease is live, and MUST return null
+  // once the step has settled (completed, failed, canceled or skipped) — judged
+  // after any settle racing the claim has committed, and leaving no lease
+  // behind. advance() can queue a step twice; admission reads the run before it
+  // claims, and settling deletes the lease, so this is what stops a copy that
+  // read the step as pending from running it again.
   claimStep(
     runId: RunId,
     stepId: StepId,
