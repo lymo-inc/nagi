@@ -49,8 +49,10 @@ import {
   InMemoryRunEventHub,
   InMemoryStreamHub,
   isRunEnd,
+  isTerminalRun,
   NagiConcurrencyConflictError,
   projectRunState,
+  stepStateOf,
   streamEndOf,
   supersede,
 } from "@nagi-js/core";
@@ -512,6 +514,36 @@ class PostgresStore<DB = unknown> implements Store {
       reviveFact(r.kind, r.at, r.payload),
     );
     return projectRunState(runId, facts);
+  }
+
+  // The common answer (live run, no abort request) from one indexed probe
+  // that returns two scalars, instead of every fact of the run with its
+  // payloads. An abort request is rare; then the fold decides, so the answer
+  // is exactly isAbortRequested's.
+  async probeAbort(
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+  ): Promise<"run" | "step" | null> {
+    const { rows } = await sql<{ status: string | null; abort: boolean }>`
+      SELECT
+        (SELECT status FROM ${sql.raw(this.t("workflow_run"))} WHERE run_id = ${runId}) AS status,
+        EXISTS (
+          SELECT 1 FROM ${sql.raw(this.t("fact"))}
+           WHERE run_id = ${runId}
+             AND kind = 'step.abort-requested'
+             AND payload->>'stepId' = ${stepId}
+             AND (payload->>'attempt')::int = ${attempt}
+        ) AS abort
+    `.execute(this.db);
+    const row = rows[0];
+    if (row?.status != null && !["pending", "running"].includes(row.status))
+      return "run";
+    if (row?.abort !== true) return null;
+    const state = await this.loadRunState(runId);
+    if (isTerminalRun(state)) return "run";
+    const step = stepStateOf(state, stepId);
+    return step.tag === "aborting" && step.attempt === attempt ? "step" : null;
   }
 
   async settleSignal(args: {

@@ -733,6 +733,44 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "probeAbort (when implemented): agrees with the fold for live, abort-requested and ended runs",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.probeAbort === undefined) return;
+      const live = rid();
+      await startRun(s, live);
+      await startStep(s, live, "s");
+      eq(await s.probeAbort(live, "s", A1), null, "live, no abort");
+      await s.appendFact(
+        live,
+        Facts.stepAbortRequested({
+          runId: live,
+          stepId: "s",
+          attempt: A1,
+          at: new Date(),
+        }),
+      );
+      eq(await s.probeAbort(live, "s", A1), "step", "abort requested");
+      eq(
+        await s.probeAbort(live, "s", A2),
+        null,
+        "another attempt is not aborted",
+      );
+      const ended = rid();
+      await startRun(s, ended);
+      await startStep(s, ended, "s");
+      await s.endRun(
+        ended,
+        Facts.flowCanceled(
+          ended,
+          { cause: "explicit", reason: "contract" },
+          new Date(),
+        ),
+      );
+      eq(await s.probeAbort(ended, "s", A1), "run", "ended run");
+    },
+  },
+  {
     name: "runStep: the body reads run state on its tx and sees committed facts",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
