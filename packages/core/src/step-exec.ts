@@ -139,13 +139,9 @@ export function startCancelWatcher(args: {
   const { store, runId, stepId, attempt, ac, intervalMs } = args;
   return every(intervalMs, async () => {
     try {
-      const s = await store.loadRunState(runId);
-      if (isTerminalRun(s)) {
-        if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "run"));
-        return "stop";
-      }
-      if (isAbortRequested(stepStateOf(s, stepId), attempt)) {
-        if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, "step"));
+      const cause = await probe(store, runId, stepId, attempt);
+      if (cause !== null) {
+        if (!ac.signal.aborted) ac.abort(new NagiAbortError(runId, cause));
         return "stop";
       }
     } catch {
@@ -155,6 +151,21 @@ export function startCancelWatcher(args: {
     }
     return undefined;
   });
+}
+
+async function probe(
+  store: Store,
+  runId: RunId,
+  stepId: string,
+  attempt: number,
+): Promise<"run" | "step" | null> {
+  if (store.probeAbort !== undefined)
+    return store.probeAbort(runId, stepId, attempt as AttemptNumber);
+  const s = await store.loadRunState(runId);
+  if (isTerminalRun(s)) return "run";
+  return isAbortRequested(stepStateOf(s, stepId), attempt as AttemptNumber)
+    ? "step"
+    : null;
 }
 
 // Arms a handler step's deadline. Aborts the SAME AbortController the cancel

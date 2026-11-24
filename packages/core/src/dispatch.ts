@@ -1,5 +1,6 @@
 import {
   type NagiFlowSnapshotGoneError,
+  NagiRunStrandedError,
   NagiSignalTimeoutError,
   serializeError,
 } from "./errors";
@@ -7,8 +8,13 @@ import { makeHooks } from "./exec/hooks";
 import { makeMessage } from "./exec/message";
 import { makeProgression } from "./exec/progression";
 import { type FlowOf, requireCurrent } from "./flows";
-import type { EmitLog } from "./internal";
-import type { RunCancelCause, TerminalPhase } from "./state";
+import { asStepMapWithDefs, type EmitLog, getDef } from "./internal";
+import {
+  isTerminalRun,
+  type RunCancelCause,
+  type RunState,
+  type TerminalPhase,
+} from "./state";
 import type {
   CancelArgs,
   Clock,
@@ -93,6 +99,10 @@ export interface Dispatcher {
   // store does the atomic fail+delete under its per-run lock; advance runs here,
   // outside that lock, exactly as wf.signal() advances after settleSignal.
   sweepTimers(now: Date): Promise<number>;
+  // Re-drive every quiet run (Store.listQuietRuns, then no queued message), and
+  // fail with NagiRunStrandedError a run that re-driving cannot move. Returns
+  // the number of runs it moved or ended.
+  sweepQuietRuns(now: Date, quietMs: Millis): Promise<number>;
 }
 
 export function makeDispatcher(deps: DispatchDeps): Dispatcher {
@@ -140,7 +150,126 @@ export function makeDispatcher(deps: DispatchDeps): Dispatcher {
     return timedOut.length;
   }
 
+  // A quiet run's only way forward is a message for each step that was in
+  // flight when its driver vanished, plus an advance for everything after.
+  async function redrive(flow: Flow, state: RunState): Promise<boolean> {
+    const { queue } = deps;
+    const defs = asStepMapWithDefs(flow.steps);
+    let deliberateWait = false;
+    for (const [stepId, step] of Object.entries(state.steps)) {
+      const def = defs[stepId] === undefined ? undefined : getDef(defs[stepId]);
+      switch (step.tag) {
+        case "awaitingSignal":
+          // timeoutMs: "unbounded" is the explicit opt-in to park forever.
+          if (def?.kind === "signal" && def.timeoutMs === "unbounded") {
+            deliberateWait = true;
+            break;
+          }
+          await queue.enqueue(state.runId, stepId, {
+            attempt: step.attempt,
+            flowId: flow.id,
+          });
+          break;
+        case "running":
+        case "awaitingChild":
+        case "aborting":
+          await queue.enqueue(state.runId, stepId, {
+            attempt: step.attempt,
+            flowId: flow.id,
+          });
+          break;
+        case "backoff":
+          await queue.enqueue(state.runId, stepId, {
+            attempt: step.failedAttempt + 1,
+            delayMs: Math.max(0, step.retryAt.getTime() - Date.now()),
+            flowId: flow.id,
+          });
+          break;
+        default:
+          break;
+      }
+    }
+    await progression.advance(state.runId);
+    return deliberateWait;
+  }
+
+  async function driveQuietRun(runId: RunId): Promise<boolean> {
+    const { store, queue } = deps;
+    const inspect = queue.inspect?.bind(queue);
+    if (inspect === undefined) return false;
+    if ((await inspect(runId)).length > 0) return false; // backlog, not strand
+    const state = await store.loadRunState(runId);
+    if (isTerminalRun(state)) return false;
+
+    const resolution = await deps.flowOf(runId);
+    switch (resolution.kind) {
+      case "gone-terminal":
+        return false;
+      case "gone-live":
+        // No message will ever reach the worker's snapshot-gone policy.
+        await progression.terminate(
+          { kind: "gone", runId, flowId: resolution.error.flowId },
+          { tag: "failed", error: serializeError(resolution.error) },
+        );
+        return true;
+      case "current":
+        break;
+    }
+
+    const deliberateWait = await redrive(resolution.flow, state);
+    const after = await store.loadRunState(runId);
+    if (isTerminalRun(after) || (await inspect(runId)).length > 0) return true;
+    if (deliberateWait) return false;
+
+    const open = Object.entries(after.steps)
+      .filter(([, s]) => !["completed", "skipped", "failed"].includes(s.tag))
+      .map(([id]) => id);
+    await progression.terminate(
+      { kind: "resolved", runId, flow: resolution.flow },
+      {
+        tag: "failed",
+        error: serializeError(
+          new NagiRunStrandedError({
+            runId,
+            flowId: resolution.flow.id,
+            stepIds: open,
+            reason: "re-driving it enqueued nothing",
+          }),
+        ),
+      },
+    );
+    return true;
+  }
+
+  async function sweepQuietRuns(now: Date, quietMs: Millis): Promise<number> {
+    const quiet = await deps.store.listQuietRuns({
+      quietSince: new Date(now.getTime() - quietMs),
+    });
+    let moved = 0;
+    for (const runId of quiet) {
+      try {
+        if (await driveQuietRun(runId)) {
+          moved++;
+          deps.emitLog({
+            level: "warn",
+            msg: "nagi: quiet run re-driven",
+            attrs: { runId },
+          });
+        }
+      } catch (err) {
+        // The run stays quiet, so the next sweep tries again.
+        deps.emitLog({
+          level: "error",
+          msg: "nagi: quiet run could not be re-driven",
+          attrs: { runId, error: String(err) },
+        });
+      }
+    }
+    return moved;
+  }
+
   return {
+    sweepQuietRuns,
     dispatchMessage: message.dispatchMessage,
     advance: progression.advance,
     terminate: progression.terminate,

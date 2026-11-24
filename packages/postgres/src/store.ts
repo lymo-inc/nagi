@@ -49,8 +49,10 @@ import {
   InMemoryRunEventHub,
   InMemoryStreamHub,
   isRunEnd,
+  isTerminalRun,
   NagiConcurrencyConflictError,
   projectRunState,
+  stepStateOf,
   streamEndOf,
   supersede,
 } from "@nagi-js/core";
@@ -514,6 +516,36 @@ class PostgresStore<DB = unknown> implements Store {
     return projectRunState(runId, facts);
   }
 
+  // The common answer (live run, no abort request) from one indexed probe
+  // that returns two scalars, instead of every fact of the run with its
+  // payloads. An abort request is rare; then the fold decides, so the answer
+  // is exactly isAbortRequested's.
+  async probeAbort(
+    runId: RunId,
+    stepId: StepId,
+    attempt: AttemptNumber,
+  ): Promise<"run" | "step" | null> {
+    const { rows } = await sql<{ status: string | null; abort: boolean }>`
+      SELECT
+        (SELECT status FROM ${sql.raw(this.t("workflow_run"))} WHERE run_id = ${runId}) AS status,
+        EXISTS (
+          SELECT 1 FROM ${sql.raw(this.t("fact"))}
+           WHERE run_id = ${runId}
+             AND kind = 'step.abort-requested'
+             AND payload->>'stepId' = ${stepId}
+             AND (payload->>'attempt')::int = ${attempt}
+        ) AS abort
+    `.execute(this.db);
+    const row = rows[0];
+    if (row?.status != null && !["pending", "running"].includes(row.status))
+      return "run";
+    if (row?.abort !== true) return null;
+    const state = await this.loadRunState(runId);
+    if (isTerminalRun(state)) return "run";
+    const step = stepStateOf(state, stepId);
+    return step.tag === "aborting" && step.attempt === attempt ? "step" : null;
+  }
+
   async settleSignal(args: {
     readonly runId: RunId;
     readonly stepId: StepId;
@@ -573,7 +605,24 @@ class PostgresStore<DB = unknown> implements Store {
     `.execute(this.db);
 
     const row = result.rows[0];
-    return row ? (row.token as ClaimToken) : null;
+    if (!row) return null;
+
+    // Settled is judged in a second statement: an INSERT racing a settle waits
+    // on the lease row the settle deletes, but a guard inside the INSERT would
+    // read step_run from a snapshot taken before that settle committed. This
+    // one starts after it, so it sees the settle and takes the lease back.
+    const settled = await sql`
+      DELETE FROM ${sql.raw(this.t("lease"))} l
+       WHERE l.run_id = ${runId} AND l.step_id = ${stepId}
+         AND l.attempt = ${attempt} AND l.token = ${row.token}
+         AND EXISTS (
+           SELECT 1 FROM ${sql.raw(this.t("step_run"))} s
+            WHERE s.run_id = ${runId} AND s.step_id = ${stepId}
+              AND s.status IN ('completed', 'failed', 'canceled', 'skipped')
+         )
+      RETURNING 1
+    `.execute(this.db);
+    return settled.rows.length > 0 ? null : (row.token as ClaimToken);
   }
 
   async extendLease(
@@ -695,6 +744,31 @@ class PostgresStore<DB = unknown> implements Store {
       VALUES (${runId}, ${stepId}, ${fireAt})
       ON CONFLICT (run_id, step_id) DO NOTHING
     `.execute(this.db);
+  }
+
+  async listQuietRuns(args: {
+    readonly quietSince: Date;
+    readonly limit?: number;
+  }): Promise<readonly RunId[]> {
+    const { quietSince, limit = DEFAULT_SWEEP_LIMIT } = args;
+    // Only live runs are scanned, and each NOT EXISTS probes an indexed
+    // run_id prefix — cheap at any table size while few runs are in flight.
+    const { rows } = await sql<{ run_id: string }>`
+      SELECT r.run_id
+        FROM ${sql.raw(this.t("workflow_run"))} r
+       WHERE r.status IN ('pending', 'running')
+         AND NOT EXISTS (SELECT 1 FROM ${sql.raw(this.t("lease"))} l WHERE l.run_id = r.run_id)
+         AND NOT EXISTS (SELECT 1 FROM ${sql.raw(this.t("timer"))} t WHERE t.run_id = r.run_id)
+         AND NOT EXISTS (
+               SELECT 1 FROM ${sql.raw(this.t("workflow_run"))} c
+                WHERE c.parent_run_id = r.run_id AND c.status IN ('pending', 'running'))
+         AND NOT EXISTS (
+               SELECT 1 FROM ${sql.raw(this.t("fact"))} f
+                WHERE f.run_id = r.run_id AND f.at >= ${quietSince})
+       ORDER BY r.started_at
+       LIMIT ${limit}
+    `.execute(this.db);
+    return rows.map((r) => r.run_id as RunId);
   }
 
   async sweepSignalTimeouts(args: {

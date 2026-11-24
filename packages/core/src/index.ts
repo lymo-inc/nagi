@@ -5,6 +5,7 @@ export {
   NagiDeliveryExhaustedError,
   NagiFlowSnapshotGoneError,
   NagiNonRetryableError,
+  NagiRunStrandedError,
   NagiRuntimeError,
   NagiSignalTimeoutError,
   NagiSnapshotDriftError,
