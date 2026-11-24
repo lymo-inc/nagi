@@ -28,6 +28,8 @@ const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_POLL_INTERVAL_MS: Millis = 1_000;
 const DEFAULT_TIMER_SWEEP_INTERVAL_MS: Millis = 30_000;
 const SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS: Millis = 30_000;
+const DEFAULT_QUIET_RUN_SWEEP_INTERVAL_MS: Millis = 60_000;
+const DEFAULT_QUIET_RUN_MS: Millis = 120_000;
 
 export interface WorkerDeps extends DispatchDeps {
   readonly clock: Clock;
@@ -85,6 +87,18 @@ class WorkerImpl implements Worker {
         label: "lease-reaper",
         intervalMs: config?.reaperIntervalMs ?? DEFAULT_REAPER_INTERVAL_MS,
         run: (now) => deps.store.sweepLeases({ now, queue: deps.queue }),
+        lastAt: bootAt,
+      },
+      {
+        label: "quiet-run",
+        intervalMs:
+          config?.quietRunSweepIntervalMs ??
+          DEFAULT_QUIET_RUN_SWEEP_INTERVAL_MS,
+        run: (now) =>
+          this.dispatcher.sweepQuietRuns(
+            now,
+            config?.quietRunMs ?? DEFAULT_QUIET_RUN_MS,
+          ),
         lastAt: bootAt,
       },
     ];

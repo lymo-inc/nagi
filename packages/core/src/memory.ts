@@ -455,6 +455,28 @@ export class InMemoryStore implements Store {
     return timedOut;
   }
 
+  async listQuietRuns(args: {
+    readonly quietSince: Date;
+    readonly limit?: number;
+  }): Promise<readonly RunId[]> {
+    const { quietSince, limit = DEFAULT_SWEEP_LIMIT } = args;
+    const busy = new Set<string>([
+      ...[...this.leases.values()].map((l) => l.runId),
+      ...[...this.signalTimers.values()].map((t) => t.runId),
+    ]);
+    const live = (status: string) =>
+      status === "pending" || status === "running";
+    return [...this.runRows]
+      .filter(([runId, row]) => {
+        if (!live(row.status) || busy.has(runId)) return false;
+        if (this.childRows(runId).some(([, c]) => live(c.status))) return false;
+        const last = (this.facts.get(runId) ?? []).at(-1);
+        return last === undefined || last.at < quietSince;
+      })
+      .map(([runId]) => runId)
+      .slice(0, limit);
+  }
+
   async recordOnce(
     runId: RunId,
     stepId: StepId,

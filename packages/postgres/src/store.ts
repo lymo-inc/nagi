@@ -746,6 +746,31 @@ class PostgresStore<DB = unknown> implements Store {
     `.execute(this.db);
   }
 
+  async listQuietRuns(args: {
+    readonly quietSince: Date;
+    readonly limit?: number;
+  }): Promise<readonly RunId[]> {
+    const { quietSince, limit = DEFAULT_SWEEP_LIMIT } = args;
+    // Only live runs are scanned, and each NOT EXISTS probes an indexed
+    // run_id prefix — cheap at any table size while few runs are in flight.
+    const { rows } = await sql<{ run_id: string }>`
+      SELECT r.run_id
+        FROM ${sql.raw(this.t("workflow_run"))} r
+       WHERE r.status IN ('pending', 'running')
+         AND NOT EXISTS (SELECT 1 FROM ${sql.raw(this.t("lease"))} l WHERE l.run_id = r.run_id)
+         AND NOT EXISTS (SELECT 1 FROM ${sql.raw(this.t("timer"))} t WHERE t.run_id = r.run_id)
+         AND NOT EXISTS (
+               SELECT 1 FROM ${sql.raw(this.t("workflow_run"))} c
+                WHERE c.parent_run_id = r.run_id AND c.status IN ('pending', 'running'))
+         AND NOT EXISTS (
+               SELECT 1 FROM ${sql.raw(this.t("fact"))} f
+                WHERE f.run_id = r.run_id AND f.at >= ${quietSince})
+       ORDER BY r.started_at
+       LIMIT ${limit}
+    `.execute(this.db);
+    return rows.map((r) => r.run_id as RunId);
+  }
+
   async sweepSignalTimeouts(args: {
     readonly now: Date;
     readonly limit?: number;

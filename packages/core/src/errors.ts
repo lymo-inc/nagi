@@ -94,6 +94,34 @@ export class NagiSignalTimeoutError extends Error {
   }
 }
 
+// A live run that nothing could move: no lease, timer, queued message or live
+// child, and re-driving it enqueued nothing. Ending it typed beats leaving it
+// `running` forever. `cause` names what the run was stuck on.
+export class NagiRunStrandedError extends Error {
+  readonly runId: RunId;
+  readonly flowId: string;
+  readonly stepIds: readonly string[];
+  constructor({
+    runId,
+    flowId,
+    stepIds,
+    reason,
+  }: {
+    readonly runId: RunId;
+    readonly flowId: string;
+    readonly stepIds: readonly string[];
+    readonly reason: string;
+  }) {
+    super(
+      `Run ${runId} (flow "${flowId}") is stranded: ${reason}${stepIds.length > 0 ? ` (steps: ${stepIds.join(", ")})` : ""}.`,
+    );
+    this.name = "NagiRunStrandedError";
+    this.runId = runId;
+    this.flowId = flowId;
+    this.stepIds = stepIds;
+  }
+}
+
 // A handler step (task / activity / streaming) blew its declared timeoutMs.
 // Distinct from NagiAbortError on purpose: an abort means someone canceled the
 // run or a replay reset the step, and classifyFailure settles those as

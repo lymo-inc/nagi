@@ -4,6 +4,7 @@ export {
   NagiConcurrencyConflictError,
   NagiFlowSnapshotGoneError,
   NagiNonRetryableError,
+  NagiRunStrandedError,
   NagiRuntimeError,
   NagiSignalTimeoutError,
   NagiSnapshotDriftError,
