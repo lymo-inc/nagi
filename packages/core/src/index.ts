@@ -2,8 +2,10 @@ export { flow, optional } from "./builder";
 export {
   NagiCanceledError,
   NagiConcurrencyConflictError,
+  NagiDeliveryExhaustedError,
   NagiFlowSnapshotGoneError,
   NagiNonRetryableError,
+  NagiRunStrandedError,
   NagiRuntimeError,
   NagiSignalTimeoutError,
   NagiSnapshotDriftError,

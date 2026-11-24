@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { flow } from "../builder";
 import type { RunId } from "../types";
 import { makeHarness, passthroughSchema, spyOnLog } from "./test-helpers";
@@ -84,5 +84,26 @@ describe("dispatch that throws backs off", () => {
     await new Promise((r) => setTimeout(r, 400));
     await worker.stop();
     expect(uncaught().length).toBeLessThanOrEqual(5);
+  });
+
+  // Dev VPS 2026-09-30: two meetingAnalysis runs redelivered at
+  // settleTranscript ~80k times each because a TypeError in drift synthesis
+  // threw on every delivery and nothing ever ended the run.
+  it("the 10th delivery that throws fails the run with a typed error and acks", async () => {
+    const { h, runId } = await setup();
+    // Skip the backoff waits: only the delivery count matters here.
+    const nack = h.queue.nack.bind(h.queue);
+    vi.spyOn(h.queue, "nack").mockImplementation((r) =>
+      nack(r, { delayMs: 0 }),
+    );
+    const worker = h.wf.worker({ concurrency: 1, pollIntervalMs: 5, ...QUIET });
+    for (let i = 0; i < 12; i++) await worker.runOnce({ maxSteps: 1 });
+    const state = await h.store.loadRunState(runId);
+    expect(state.phase.tag).toBe("failed");
+    if (state.phase.tag !== "failed") return;
+    expect(state.phase.error.name).toBe("NagiDeliveryExhaustedError");
+    expect(state.phase.error.message).toContain("whatever");
+    expect(state.phase.error.message).toContain("10");
+    expect(await h.queue.inspect(runId)).toHaveLength(0);
   });
 });

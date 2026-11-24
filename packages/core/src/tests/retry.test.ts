@@ -6,7 +6,6 @@ import {
   dequeueBackoff,
   reapBackoff,
   resolveRetry,
-  snapshotGoneBackoff,
   stepBackoff,
 } from "../retry";
 import type { RetryPolicy } from "../types";
@@ -67,15 +66,6 @@ describe("backoff curves", () => {
     ["dequeue poll 5ms floors to 50ms, failure 1", dequeueBackoff(5), 1, 50],
     ["dequeue poll 5ms floors to 50ms, failure 3", dequeueBackoff(5), 3, 200],
     ["dequeue poll 0 cannot tight-loop", dequeueBackoff(0), 1, 50],
-    ["snapshot-gone delivery 1", snapshotGoneBackoff, 1, 1_000],
-    ["snapshot-gone delivery 10", snapshotGoneBackoff, 10, 100_000],
-    [
-      "snapshot-gone delivery 18 (capped 5min)",
-      snapshotGoneBackoff,
-      18,
-      300_000,
-    ],
-    ["snapshot-gone delivery 60", snapshotGoneBackoff, 60, 300_000],
     ["reap re-dispatch, any attempt", reapBackoff, 7, 0],
   ])("%s → %d ms", (_label, curve, attempt, expected) => {
     expect(curve(attempt)).toBe(expected);
@@ -83,25 +73,16 @@ describe("backoff curves", () => {
 });
 
 describe("defaultSnapshotGonePolicy", () => {
-  it("retries on the curve through 60 deliveries, then fails", () => {
+  it("retries once a minute, then fails on the 10th delivery", () => {
     expect(defaultSnapshotGonePolicy(1)).toEqual({
       action: "retry",
-      delayMs: 1_000,
+      delayMs: 60_000,
     });
-    expect(defaultSnapshotGonePolicy(60)).toEqual({
+    expect(defaultSnapshotGonePolicy(9)).toEqual({
       action: "retry",
-      delayMs: 300_000,
+      delayMs: 60_000,
     });
-    expect(defaultSnapshotGonePolicy(61)).toEqual({ action: "fail" });
-  });
-
-  it("total window sits between the 4h signal-timeout constant and 6h stuck-run alerting", () => {
-    let totalMs = 0;
-    for (let readCount = 1; readCount <= 60; readCount++) {
-      totalMs += snapshotGoneBackoff(readCount);
-    }
-    expect(totalMs).toBeGreaterThan(4 * 3_600_000);
-    expect(totalMs).toBeLessThan(6 * 3_600_000);
+    expect(defaultSnapshotGonePolicy(10)).toEqual({ action: "fail" });
   });
 });
 

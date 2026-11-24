@@ -252,7 +252,19 @@ export const migrations: readonly Migration[] = [
 
 export interface MigrateOpts {
   readonly schema?: string;
+  // How long to wait for another migrate() (another booting process) to
+  // finish. Past it, migrate() rejects naming the session that holds the
+  // lock. Default 60s.
+  readonly lockWaitMs?: number;
+  // lock_timeout for each migration's statements. A DDL that waits behind a
+  // long transaction makes every later query on its table wait behind it,
+  // so it fails fast and the deploy fails loudly instead. Default 5s.
+  readonly lockTimeoutMs?: number;
 }
+
+const DEFAULT_LOCK_WAIT_MS = 60_000;
+const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
+const LOCK_POLL_MS = 250;
 
 export async function migrate<DB>(
   db: Kysely<DB>,
@@ -264,7 +276,12 @@ export async function migrate<DB>(
   // Session-level lock: it and the migrations must share one connection.
   return db.connection().execute(async (conn) => {
     const key = `nagi:migrate:${schema}`;
-    await sql`SELECT pg_advisory_lock(hashtext(${key}))`.execute(conn);
+    await acquireMigrateLock(
+      conn,
+      key,
+      opts.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS,
+    );
+    const lockTimeout = `${Math.max(1, Math.floor(opts.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS))}ms`;
     try {
       const applied: string[] = [];
       const skipped: string[] = [];
@@ -289,6 +306,9 @@ export async function migrate<DB>(
             skipped.push(m.id);
             return;
           }
+          await sql`SELECT set_config('lock_timeout', ${lockTimeout}, true)`.execute(
+            tx,
+          );
           await sql.raw(m.sql(schema)).execute(tx);
           await sql`
             INSERT INTO ${sql.raw(`${schema}.schema_migrations`)} (id) VALUES (${m.id})
@@ -302,6 +322,47 @@ export async function migrate<DB>(
       await sql`SELECT pg_advisory_unlock(hashtext(${key}))`.execute(conn);
     }
   });
+}
+
+// pg_try_advisory_lock in a loop rather than pg_advisory_lock: the blocking
+// form waits forever, and when it gives up (a statement_timeout) it says
+// nothing about who holds the lock.
+async function acquireMigrateLock<DB>(
+  conn: Kysely<DB>,
+  key: string,
+  waitMs: number,
+): Promise<void> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const { rows } = await sql<{ got: boolean }>`
+      SELECT pg_try_advisory_lock(hashtext(${key})) AS got
+    `.execute(conn);
+    if (rows[0]?.got === true) return;
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, LOCK_POLL_MS));
+  }
+  const { rows: holders } = await sql<{
+    pid: number;
+    application_name: string;
+    state: string;
+    since: string;
+  }>`
+    SELECT a.pid, a.application_name, a.state, a.backend_start::text AS since
+      FROM pg_locks l
+      JOIN pg_stat_activity a ON a.pid = l.pid
+     WHERE l.locktype = 'advisory' AND l.granted
+       AND l.objid = (hashtext(${key})::bigint & 4294967295)::oid
+  `.execute(conn);
+  const who =
+    holders
+      .map(
+        (h) =>
+          `pid ${h.pid} (${h.application_name || "no application_name"}, ${h.state}, connected ${h.since})`,
+      )
+      .join("; ") || "an unknown session";
+  throw new Error(
+    `@nagi-js/postgres: migrate() waited ${waitMs}ms for lock "${key}", held by ${who}. If that session is a leftover from an earlier deploy, end it with pg_terminate_backend(pid).`,
+  );
 }
 
 const MAX_SCHEMA_LEN = 56; // 63-byte identifier limit minus "_stream"/"_events"
