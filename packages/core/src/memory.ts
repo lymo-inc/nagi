@@ -706,6 +706,13 @@ export class InMemoryQueue implements Queue {
 
   async dequeue(opts: QueueDequeueOpts): Promise<readonly QueueMessage[]> {
     const now = Date.now();
+    // Like pgmq: a read whose visibility timeout lapsed without an ack or
+    // nack (the consumer died, or its ack failed) is delivered again.
+    for (const [receipt, item] of this.leased) {
+      if (item.visibleAt > now) continue;
+      this.leased.delete(receipt);
+      this.pending.push(item);
+    }
     const claimed: QueueMessage[] = [];
     for (
       let i = 0;
