@@ -194,6 +194,20 @@ async function claimableAgain(
   );
 }
 
+// A settled step can no longer be claimed, so its release shows in describe().
+async function leaseReleased(
+  s: Store,
+  runId: RunId,
+  stepId: StepId,
+  what: string,
+): Promise<void> {
+  eq(
+    (await stepView(s, runId, stepId))?.lease,
+    undefined,
+    `${what} must release the lease`,
+  );
+}
+
 const TRANSPORT_WAIT_MS = 5_000;
 
 // Transports may deliver asynchronously (Postgres: LISTEN/NOTIFY), so event and
@@ -598,6 +612,33 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "claimStep: returns null once the step has settled, at any attempt, and leaves no lease",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const runId = rid();
+      await startRun(s, runId);
+      const at = new Date();
+      const settles = [
+        Facts.stepCompleted(runId, "done", A1, { v: 1 }, at),
+        Facts.stepFailed(runId, "bad", A1, { name: "E", message: "x" }, at),
+        Facts.stepCanceled(runId, "gone", A1, at),
+      ];
+      for (const fact of settles) {
+        await startStep(s, runId, fact.stepId);
+        await s.appendFact(runId, fact);
+      }
+      await s.appendFact(
+        runId,
+        Facts.stepSkipped({ runId, stepId: "never", reason: "when-false", at }),
+      );
+      for (const stepId of ["done", "bad", "gone", "never"]) {
+        eq(await s.claimStep(runId, stepId, A1), null, `${stepId}: attempt 1`);
+        eq(await s.claimStep(runId, stepId, A2), null, `${stepId}: attempt 2`);
+        await leaseReleased(s, runId, stepId, `${stepId}: refused claim`);
+      }
+    },
+  },
+  {
     name: "extendLease: keeps a live lease claimed past its original expiry",
     async run(h) {
       const s = await h.makeStore({ leaseMs: SHORT_LEASE_MS });
@@ -618,7 +659,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
-    name: "appendFact(step.completed): releases the lease — describe() drops lease.expiresAt and claimStep re-acquires",
+    name: "appendFact(step.completed): releases the lease — describe() drops lease.expiresAt",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
       const runId = rid();
@@ -635,7 +676,6 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       eq(done?.status, "completed", "status");
       eq(done?.output, { ok: 1 }, "output");
       eq(done?.lease, undefined, "lease gone from describe()");
-      await claimableAgain(s, runId, "s", "appendFact(step.completed)");
     },
   },
   {
@@ -658,7 +698,6 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       );
       eq(await stepStatus(s, runId, "s"), "failed", "status");
       eq((await stepView(s, runId, "s"))?.lease, undefined, "lease");
-      await claimableAgain(s, runId, "s", "appendFact(step.failed)");
     },
   },
   {
@@ -704,7 +743,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
           c.status,
           `${c.stepId}: status`,
         );
-        await claimableAgain(s, runId, c.stepId, `runStep(${c.fact.kind})`);
+        await leaseReleased(s, runId, c.stepId, `runStep(${c.fact.kind})`);
       }
     },
   },
@@ -730,6 +769,44 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
         0,
         "no extra fact",
       );
+    },
+  },
+  {
+    name: "probeAbort (when implemented): agrees with the fold for live, abort-requested and ended runs",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      if (s.probeAbort === undefined) return;
+      const live = rid();
+      await startRun(s, live);
+      await startStep(s, live, "s");
+      eq(await s.probeAbort(live, "s", A1), null, "live, no abort");
+      await s.appendFact(
+        live,
+        Facts.stepAbortRequested({
+          runId: live,
+          stepId: "s",
+          attempt: A1,
+          at: new Date(),
+        }),
+      );
+      eq(await s.probeAbort(live, "s", A1), "step", "abort requested");
+      eq(
+        await s.probeAbort(live, "s", A2),
+        null,
+        "another attempt is not aborted",
+      );
+      const ended = rid();
+      await startRun(s, ended);
+      await startStep(s, ended, "s");
+      await s.endRun(
+        ended,
+        Facts.flowCanceled(
+          ended,
+          { cause: "explicit", reason: "contract" },
+          new Date(),
+        ),
+      );
+      eq(await s.probeAbort(ended, "s", A1), "run", "ended run");
     },
   },
   {
@@ -777,7 +854,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       });
       eq(res.tag, "delivered", "delivered");
       eq(await stepStatus(s, runId, "gate"), "completed", "status");
-      await claimableAgain(s, runId, "gate", "settleSignal(deliver)");
+      await leaseReleased(s, runId, "gate", "settleSignal(deliver)");
       eq(
         await s.sweepSignalTimeouts({ now: new Date(Date.now() + HOUR_MS) }),
         [],
@@ -814,6 +891,33 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
     },
   },
   {
+    name: "listQuietRuns: lists a live run with no lease, timer or recent fact, and only that run",
+    async run(h) {
+      const s = await h.makeStore({ leaseMs: LEASE_MS });
+      const quiet = rid();
+      const leased = rid();
+      const timed = rid();
+      for (const r of [quiet, leased, timed]) await startRun(s, r);
+      await startStep(s, leased, "a");
+      ok((await s.claimStep(leased, "a", A1)) !== null, "claim");
+      await startStep(s, timed, "gate", { kind: "signal" });
+      await s.upsertTimer(timed, "gate", new Date(Date.now() + HOUR_MS));
+
+      const later = new Date(Date.now() + HOUR_MS);
+      const listed = await s.listQuietRuns({ quietSince: later, limit: 1000 });
+      ok(listed.includes(quiet), "the quiet run is listed");
+      ok(!listed.includes(leased), "a leased run is not quiet");
+      ok(!listed.includes(timed), "a run with a timer is not quiet");
+      const earlier = new Date(Date.now() - HOUR_MS);
+      ok(
+        !(await s.listQuietRuns({ quietSince: earlier, limit: 1000 })).includes(
+          quiet,
+        ),
+        "a run with a fact after quietSince is not quiet",
+      );
+    },
+  },
+  {
     name: "sweepSignalTimeouts: fails an awaiting step past its deadline with NagiSignalTimeoutError, releases its lease, consumes the timer",
     async run(h) {
       const s = await h.makeStore({ leaseMs: LEASE_MS });
@@ -830,7 +934,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       const step = stepStateOf(await s.loadRunState(runId), "gate");
       ok(step.tag === "failed", "step failed");
       eq(step.error.name, "NagiSignalTimeoutError", "error name");
-      await claimableAgain(s, runId, "gate", "sweepSignalTimeouts");
+      await leaseReleased(s, runId, "gate", "sweepSignalTimeouts");
       eq(
         await s.sweepSignalTimeouts({ now: new Date() }),
         [],
@@ -848,7 +952,7 @@ export const storeContract: ReadonlyArray<StoreContractCase> = [
       ok((await s.claimStep(runId, "s", A1)) !== null, "claim");
       await s.appendFact(runId, Facts.stepCanceled(runId, "s", A1, new Date()));
       eq(await stepStatus(s, runId, "s"), "canceled", "status");
-      await claimableAgain(s, runId, "s", "appendFact(step.canceled)");
+      await leaseReleased(s, runId, "s", "appendFact(step.canceled)");
     },
   },
   {

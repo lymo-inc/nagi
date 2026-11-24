@@ -11,6 +11,7 @@ import {
   nextRunRow,
   nextStepRow,
   type RunRow,
+  SETTLED,
   type StepRow,
 } from "./read-model";
 import { InMemoryRunEventHub } from "./run-events";
@@ -297,6 +298,8 @@ export class InMemoryStore implements Store {
     stepId: StepId,
     attempt: AttemptNumber,
   ): Promise<ClaimToken | null> {
+    const status = this.stepRows.get(runId)?.get(stepId)?.status;
+    if (status !== undefined && SETTLED.has(status)) return null;
     const key = leaseKey(runId, stepId, attempt);
     const now = Date.now();
     const existing = this.leases.get(key);
@@ -450,6 +453,28 @@ export class InMemoryStore implements Store {
     }
 
     return timedOut;
+  }
+
+  async listQuietRuns(args: {
+    readonly quietSince: Date;
+    readonly limit?: number;
+  }): Promise<readonly RunId[]> {
+    const { quietSince, limit = DEFAULT_SWEEP_LIMIT } = args;
+    const busy = new Set<string>([
+      ...[...this.leases.values()].map((l) => l.runId),
+      ...[...this.signalTimers.values()].map((t) => t.runId),
+    ]);
+    const live = (status: string) =>
+      status === "pending" || status === "running";
+    return [...this.runRows]
+      .filter(([runId, row]) => {
+        if (!live(row.status) || busy.has(runId)) return false;
+        if (this.childRows(runId).some(([, c]) => live(c.status))) return false;
+        const last = (this.facts.get(runId) ?? []).at(-1);
+        return last === undefined || last.at < quietSince;
+      })
+      .map(([runId]) => runId)
+      .slice(0, limit);
   }
 
   async recordOnce(
@@ -703,6 +728,13 @@ export class InMemoryQueue implements Queue {
 
   async dequeue(opts: QueueDequeueOpts): Promise<readonly QueueMessage[]> {
     const now = Date.now();
+    // Like pgmq: a read whose visibility timeout lapsed without an ack or
+    // nack (the consumer died, or its ack failed) is delivered again.
+    for (const [receipt, item] of this.leased) {
+      if (item.visibleAt > now) continue;
+      this.leased.delete(receipt);
+      this.pending.push(item);
+    }
     const claimed: QueueMessage[] = [];
     for (
       let i = 0;
