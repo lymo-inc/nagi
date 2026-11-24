@@ -31,6 +31,9 @@ const SNAPSHOT_GONE_FALLBACK_NACK_DELAY_MS: Millis = 30_000;
 
 export interface WorkerDeps extends DispatchDeps {
   readonly clock: Clock;
+  // Subscribes the worker to "this process just enqueued work", so an idle
+  // worker reads at once instead of sleeping out its poll. Returns unsubscribe.
+  readonly onEnqueued?: (wake: () => void) => () => void;
 }
 
 interface Sweep {
@@ -55,6 +58,13 @@ class WorkerImpl implements Worker {
   private readonly snapshotGonePolicy: SnapshotGonePolicy;
   private readonly maxPerFlow: number | undefined;
   private readonly inFlightByFlow = new Map<string, number>();
+  // Messages over their flow's cap, read once and kept invisible until a slot
+  // of that flow frees. At most `concurrency` of them; past that the old
+  // delayed-nack deferral applies, so one capped flow cannot stop the worker
+  // from reading other flows' messages.
+  private readonly held: Array<{ msg: QueueMessage; extendedAt: number }> = [];
+  private wakePending = false;
+  private wakeAc: AbortController | undefined;
 
   constructor(
     private readonly deps: WorkerDeps,
@@ -126,8 +136,20 @@ class WorkerImpl implements Worker {
   // timeout killing the loop, then 37h of fleet-wide stuck runs because
   // nothing restarts it. Every await below is therefore guarded.
   async run(): Promise<void> {
+    const unsubscribe = this.deps.onEnqueued?.(() => this.wake());
+    try {
+      await this.loop();
+    } finally {
+      unsubscribe?.();
+    }
+    await this.drain();
+    await this.returnHeld();
+  }
+
+  private async loop(): Promise<void> {
     let dequeueFailures = 0;
     while (!this.aborted()) {
+      await this.extendHeld();
       // Time-based, not idle-gated: a worker pinned at full concurrency still
       // reaches this each iteration (the slots-full branch loops every ~50ms),
       // so signal timeouts fire and dead leases are reaped on cadence
@@ -135,7 +157,7 @@ class WorkerImpl implements Worker {
       await this.runDueSweeps();
       const slots = this.concurrency - this.inFlight.size;
       if (slots <= 0) {
-        await this.sleep(50);
+        await this.idle(50);
         continue;
       }
 
@@ -159,16 +181,82 @@ class WorkerImpl implements Worker {
       dequeueFailures = 0;
 
       if (messages.length === 0) {
-        await this.sleep(this.pollIntervalMs);
+        await this.idle(this.pollIntervalMs);
         continue;
       }
 
       for (const msg of messages) {
         if (this.admitFlow(msg)) this.fire(msg);
+        else if (this.held.length < this.concurrency)
+          this.held.push({ msg, extendedAt: this.deps.clock.now().getTime() });
         else await this.defer(msg);
       }
     }
-    await this.drain();
+  }
+
+  // Called when this process enqueued work or a slot freed.
+  private wake(): void {
+    this.wakePending = true;
+    this.wakeAc?.abort();
+  }
+
+  // A poll sleep that a wake() cuts short, including one that arrived while
+  // the loop was busy reading.
+  private async idle(ms: Millis): Promise<void> {
+    if (this.wakePending) {
+      this.wakePending = false;
+      return;
+    }
+    const ac = new AbortController();
+    this.wakeAc = ac;
+    const signal =
+      this.signal === undefined
+        ? ac.signal
+        : AbortSignal.any([this.signal, ac.signal]);
+    try {
+      await this.deps.clock.sleep(ms, signal);
+    } catch {}
+    this.wakeAc = undefined;
+    this.wakePending = false;
+  }
+
+  // Fire the oldest held message whose flow is under its cap again.
+  private releaseHeld(): void {
+    if (this.aborted()) return;
+    for (let i = 0; i < this.held.length; i++) {
+      if (this.inFlight.size >= this.concurrency) return;
+      const entry = this.held[i];
+      if (entry === undefined || !this.admitFlow(entry.msg)) continue;
+      this.held.splice(i, 1);
+      i--;
+      this.fire(entry.msg);
+    }
+  }
+
+  // A held message stays invisible on the same cadence as a running step's
+  // heartbeat, so no peer reads it while it waits here.
+  private async extendHeld(): Promise<void> {
+    const now = this.deps.clock.now().getTime();
+    for (const entry of this.held) {
+      if (now - entry.extendedAt < this.deps.heartbeat.intervalMs) continue;
+      entry.extendedAt = now;
+      try {
+        await this.deps.queue.extend(
+          entry.msg.receipt,
+          this.deps.heartbeat.leaseMs,
+        );
+      } catch {}
+    }
+  }
+
+  // On shutdown, hand held messages straight back: a peer reads them now
+  // rather than after the visibility timeout.
+  private async returnHeld(): Promise<void> {
+    for (const { msg } of this.held.splice(0)) {
+      try {
+        await this.deps.queue.nack(msg.receipt, { delayMs: 0 });
+      } catch {}
+    }
   }
 
   async runOnce(opts?: WorkerRunOnceOpts): Promise<WorkerRunResult> {
@@ -242,6 +330,8 @@ class WorkerImpl implements Worker {
     const dispatch = this.dispatchSafely(msg).finally(() => {
       release();
       this.inFlight.delete(dispatch);
+      this.releaseHeld();
+      this.wake();
     });
     this.inFlight.add(dispatch);
   }

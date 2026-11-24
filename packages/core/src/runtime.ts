@@ -170,6 +170,28 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   const emitLog = makeEmit(config.onLog);
   await config.queue.ensureSchema?.();
 
+  // Every enqueue this process makes outside a caller's tx wakes this
+  // process's idle workers, so a hand-off between steps costs a read, not a
+  // poll interval. Enqueues inside a tx are visible only after commit; their
+  // callers (start, applyOnCommit) wake explicitly once that is true.
+  const wakers = new Set<() => void>();
+  const wakeWorkers = () => {
+    for (const wake of wakers) wake();
+  };
+  const onEnqueued = (wake: () => void) => {
+    wakers.add(wake);
+    return () => {
+      wakers.delete(wake);
+    };
+  };
+  const queue: Queue = {
+    ...bindQueue(config.queue),
+    async enqueue(runId, stepId, opts) {
+      await config.queue.enqueue(runId, stepId, opts);
+      wakeWorkers();
+    },
+  };
+
   const streamTransport = config.store.stream;
   // Absent transport is a configuration problem, not an empty stream: a
   // subscription that silently never fires is the worst of both worlds.
@@ -253,7 +275,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
     dispatcher,
     hooks,
     lifecycle,
-  } = makeEngine({ flowOf, queue: config.queue, fireHooks: true });
+  } = makeEngine({ flowOf, queue, fireHooks: true });
 
   const signals = makeSignals({
     dispatcher,
@@ -269,7 +291,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
   });
   const replayer = makeReplay({
     store: config.store,
-    queue: config.queue,
+    queue,
     clock,
     registry,
     driftPolicy,
@@ -278,7 +300,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       makeEngine({
         flowOf: pinRun(scope.run.runId, scope.run.flow, flowOf),
         ...(scope.kind === "enqueue"
-          ? { queue: config.queue, fireHooks: true }
+          ? { queue, fireHooks: true }
           : { queue: scope.queue, fireHooks: false }),
       }).dispatcher,
   });
@@ -305,6 +327,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
       });
       if (staged.kind === "started")
         await lifecycle.applyEffects(staged.effects);
+      wakeWorkers();
       return runId;
     },
 
@@ -342,7 +365,9 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         started: true,
         canceled: staged.effects.superseded.map((e) => e.runId),
         applyOnCommit: () =>
-          (applied ??= lifecycle.applyEffects(staged.effects)),
+          (applied ??= lifecycle
+            .applyEffects(staged.effects)
+            .then(wakeWorkers)),
       };
     },
 
@@ -362,7 +387,7 @@ async function nagiImpl<const TFlows extends ReadonlyArray<Flow>>(
         );
       }
       return makeWorker(
-        { ...dispatchDeps, clock },
+        { ...dispatchDeps, clock, onEnqueued },
         {
           ...workerConfig,
           ...compact({
@@ -514,3 +539,18 @@ export const nagi: typeof nagiImpl & { run: typeof nagiRun } = Object.assign(
 );
 
 async function noop(): Promise<void> {}
+
+// The adapter's methods, bound, so a wrapper can override one without losing
+// `this` on the rest (and without copying absent optional capabilities).
+function bindQueue(q: Queue): Queue {
+  return {
+    enqueue: q.enqueue.bind(q),
+    dequeue: q.dequeue.bind(q),
+    ack: q.ack.bind(q),
+    nack: q.nack.bind(q),
+    extend: q.extend.bind(q),
+    ...(q.ensureSchema ? { ensureSchema: q.ensureSchema.bind(q) } : {}),
+    ...(q.inspect ? { inspect: q.inspect.bind(q) } : {}),
+    ...(q.withTx ? { withTx: q.withTx.bind(q) } : {}),
+  };
+}
