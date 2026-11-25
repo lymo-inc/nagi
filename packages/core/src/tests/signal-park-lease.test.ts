@@ -21,7 +21,9 @@ const f = flow({
 // the reaper has nothing to reap.
 describe("a parked signal step releases its lease", () => {
   it("is not re-dispatched by the reaper while it waits", async () => {
-    const store = new InMemoryStore({ leaseMs: 5 });
+    // Long enough that claim → park never outlasts it on a loaded machine;
+    // short enough that an unreleased lease is reaped several times below.
+    const store = new InMemoryStore({ leaseMs: 50 });
     const queue = new InMemoryQueue();
     const wf = await nagi({
       flows: [f],
@@ -43,7 +45,7 @@ describe("a parked signal step releases its lease", () => {
         expect(stepStateOf(state, "gate").tag).toBe("awaitingSignal");
       });
 
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, 300));
 
       const parked = await store.loadRunState(runId);
       expect(
