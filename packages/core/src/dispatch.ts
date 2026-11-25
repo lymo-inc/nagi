@@ -6,7 +6,7 @@ import {
 } from "./errors";
 import { makeHooks } from "./exec/hooks";
 import { makeMessage } from "./exec/message";
-import { makeProgression } from "./exec/progression";
+import { type AdvanceOpts, makeProgression } from "./exec/progression";
 import { type FlowOf, requireCurrent } from "./flows";
 import { asStepMapWithDefs, type EmitLog, getDef } from "./internal";
 import {
@@ -85,7 +85,7 @@ export type DispatchResult =
 
 export interface Dispatcher {
   dispatchMessage(message: QueueMessage): Promise<DispatchResult>;
-  advance(runId: RunId): Promise<void>;
+  advance(runId: RunId, opts?: AdvanceOpts): Promise<void>;
   terminate(run: EndingRun, end: RunEnd): Promise<void>;
   // The store already committed the flow.canceled fact (tryStartRun's
   // concurrency pass); only the post-terminal effects remain.
