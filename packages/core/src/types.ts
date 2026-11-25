@@ -318,7 +318,11 @@ export interface FlowConfig<
   readonly onComplete?: (
     event: FlowCompleteEvent & { readonly output: NoInfer<Output> },
   ) => void | Promise<void>;
-  readonly onError?: (event: FlowErrorEvent) => void | Promise<void>;
+  readonly onError?: (
+    event: FlowErrorEvent & {
+      readonly input: NoInfer<InferSchemaOutput<InputSchema>>;
+    },
+  ) => void | Promise<void>;
 }
 
 export interface Flow<
@@ -370,6 +374,10 @@ export interface FlowCompleteEvent extends FlowEvent {
 }
 
 export interface FlowErrorEvent extends FlowEvent {
+  // "canceled": wf.cancel, a parent's cancel or concurrency supersession;
+  // `error` is then a NagiCanceledError.
+  readonly status: "failed" | "canceled";
+  readonly input: Json;
   readonly error: SerializedError;
 }
 

@@ -18,6 +18,7 @@ import type {
   FlowCompleteEvent,
   FlowConcurrency,
   FlowConfig,
+  FlowErrorEvent,
   FlowOutput,
   InferSchemaOutput,
   Json,
@@ -156,7 +157,9 @@ export function flow<
       onComplete: config.onComplete as
         | ((event: FlowCompleteEvent) => void | Promise<void>)
         | undefined,
-      onError: config.onError,
+      onError: config.onError as
+        | ((event: FlowErrorEvent) => void | Promise<void>)
+        | undefined,
     }),
     ...(config.concurrency !== undefined
       ? { concurrency: normalizeConcurrency(config.concurrency) }

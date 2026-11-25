@@ -1,5 +1,5 @@
 import type { DispatchDeps, EndingRun, RunEnd } from "../dispatch";
-import { NagiCanceledError } from "../errors";
+import { NagiCanceledError, serializeError } from "../errors";
 import { Facts, runCancelCause } from "../facts";
 import { type FlowResolution, requireCurrent } from "../flows";
 import { currentChildRunId } from "../run-id";
@@ -308,7 +308,32 @@ export function makeProgression(deps: DispatchDeps, hooks: Hooks): Progression {
       await fireHook(deps.hooks?.onFlowComplete, event, "onFlowComplete");
       return;
     }
-    const event = { runId, flowId, error: terminalErrorOf(runId, end), at };
+    if (
+      !deps.fireHooks ||
+      (flow?.onError === undefined && deps.hooks?.onFlowError === undefined)
+    )
+      return;
+    // Swallowed like a throwing hook: the run has ended, and the parent wake
+    // after this must still happen.
+    let input: Json;
+    try {
+      ({ input } = await deps.store.loadRunState(runId));
+    } catch (err) {
+      deps.emitLog({
+        level: "error",
+        msg: "nagi: flow error hooks skipped — run input unreadable",
+        attrs: { runId, error: serializeError(err).message },
+      });
+      return;
+    }
+    const event = {
+      runId,
+      flowId,
+      status: end.tag,
+      input,
+      error: terminalErrorOf(runId, end),
+      at,
+    };
     await fireHook(flow?.onError, event, "flow.onError");
     await fireHook(deps.hooks?.onFlowError, event, "onFlowError");
   }
