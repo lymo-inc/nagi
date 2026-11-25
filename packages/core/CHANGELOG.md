@@ -1,5 +1,12 @@
 # @nagi-js/core
 
+## 0.1.1-rc.28
+
+### Patch Changes
+
+- 7685741: `FlowErrorEvent` (flow `onError` and the global `onFlowError`) now carries `status: "failed" | "canceled"` and the run's `input`. A flow's own `onError` gets `input` typed by its input schema. A handler can tell a cancel from a failure without comparing `error.name` to `"NagiCanceledError"`, and act on the run's input without calling `describe()` and parsing it again. The input is read only when an error hook is registered.
+- 9721648: `advance()` no longer queues a step that already has a message in the queue. Before, every settle re-queued each sibling still waiting for a worker slot, so a wide fan-out under `maxConcurrencyPerFlow` sent several messages per step and every extra copy cost a read, a fold and an ack. Lymo's prod saw 2.06 messages per started step; a 14-step fan-out on Postgres + pgmq with `concurrency: 7, maxConcurrencyPerFlow: 3` sent 7.6–8.9 and now sends 1.00. The check uses `Queue.inspect`; a queue without it keeps the old behaviour. `replay({ from })` still queues the reset step, since the old attempt's message will not run it. `Dispatcher.advance` takes an optional `{ requeue }`.
+
 ## 0.1.1-rc.27
 
 ### Patch Changes
